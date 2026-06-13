@@ -47,9 +47,22 @@ if ($UseDetached) {
 }
 Write-Host ""
 
-cmd.exe /d /c $CmdLine | Tee-Object -FilePath $LogPath -Append
+$PreviousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+  & cmd.exe /d /s /c $CmdLine 2>&1 |
+    ForEach-Object { $_.ToString() } |
+    Tee-Object -FilePath $LogPath -Append
+  $ExitCode = $LASTEXITCODE
+} finally {
+  $ErrorActionPreference = $PreviousErrorActionPreference
+}
 
 Write-Host ""
-Write-Host "Hyak runner command finished."
+if ($ExitCode -and $ExitCode -ne 0) {
+  Write-Host "Hyak runner command exited with code $ExitCode."
+} else {
+  Write-Host "Hyak runner command finished."
+}
 Write-Host "Press Enter to close this window."
 Read-Host | Out-Null
