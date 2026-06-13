@@ -43,11 +43,12 @@ mkdir -p "$(dirname "$VENV_DIR")"
 echo "VENV_DIR=$VENV_DIR"
 
 CACHE_ROOT="${HYAK_CACHE_DIR:-$(dirname "$VENV_DIR")/cache}"
-mkdir -p "$CACHE_ROOT/huggingface" "$CACHE_ROOT/hf_datasets" "$CACHE_ROOT/torch" "$CACHE_ROOT/pip"
+mkdir -p "$CACHE_ROOT/huggingface" "$CACHE_ROOT/hf_datasets" "$CACHE_ROOT/torch" "$CACHE_ROOT/pip" "$CACHE_ROOT/conda_pkgs"
 export HF_HOME="${HF_HOME:-$CACHE_ROOT/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$CACHE_ROOT/hf_datasets}"
 export TORCH_HOME="${TORCH_HOME:-$CACHE_ROOT/torch}"
 export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$CACHE_ROOT/pip}"
+export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-$CACHE_ROOT/conda_pkgs}"
 echo "HF_HOME=$HF_HOME"
 
 python3 --version

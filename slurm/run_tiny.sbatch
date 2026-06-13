@@ -21,10 +21,11 @@ module load foster/python/miniconda/3.8 2>/dev/null || \
 VENV_DIR="${HYAK_VENV_DIR:-.venv-hyak}"
 VENV_REAL="$(readlink -f "$VENV_DIR" 2>/dev/null || echo "$VENV_DIR")"
 CACHE_ROOT="${HYAK_CACHE_DIR:-$(dirname "$VENV_REAL")/cache}"
-mkdir -p "$CACHE_ROOT/huggingface" "$CACHE_ROOT/hf_datasets" "$CACHE_ROOT/torch"
+mkdir -p "$CACHE_ROOT/huggingface" "$CACHE_ROOT/hf_datasets" "$CACHE_ROOT/torch" "$CACHE_ROOT/conda_pkgs"
 export HF_HOME="${HF_HOME:-$CACHE_ROOT/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$CACHE_ROOT/hf_datasets}"
 export TORCH_HOME="${TORCH_HOME:-$CACHE_ROOT/torch}"
+export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-$CACHE_ROOT/conda_pkgs}"
 export WANDB_DISABLED="${WANDB_DISABLED:-true}"
 
 if [ ! -f "$VENV_DIR/bin/activate" ]; then
