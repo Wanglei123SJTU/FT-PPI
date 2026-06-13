@@ -1,2 +1,4 @@
 -r requirements.txt
+accelerate==1.2.1
+peft==0.14.0
 bitsandbytes==0.45.1

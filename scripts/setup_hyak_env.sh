@@ -13,8 +13,9 @@ source .venv/bin/activate
 
 python -m pip install --upgrade pip setuptools wheel
 python -m pip cache purge || true
+python -m pip install --no-cache-dir -r requirements.txt
 python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu124 "torch==2.5.1+cu124"
-python -m pip install --no-cache-dir -r requirements-hyak.txt
+python -m pip install --no-cache-dir --no-deps accelerate==1.2.1 peft==0.14.0 bitsandbytes==0.45.1
 
 python -m pytest tests -q
 
