@@ -71,3 +71,19 @@ sbatch slurm/run_tiny.sbatch
 
 This runs MSE and Var on the `B=500, s=100, v=100` tiny split and writes a
 summary table under `artifacts/tiny/summary/metrics.csv`.
+
+## Persistent Hyak Runner
+
+For longer iterative work, start a persistent runner from Windows:
+
+```powershell
+scripts\start_hyak_runner.bat
+```
+
+Complete UW password and Duo once, then keep the runner window open. The runner
+stays on Hyak, pulls `main`, and executes any new shell task committed under
+`hyak_tasks/*.sh`. It writes its local stream to `artifacts/hyak/hyak_runner.log`.
+
+Task state is stored on Hyak under `.hyak_runner/`. A task filename is the task
+ID, so use a new filename to rerun work. A task can exit with code `99` to stop
+the runner cleanly.

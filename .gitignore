@@ -8,6 +8,7 @@ __pycache__/
 # Runtime outputs and local smoke artifacts
 artifacts/
 logs/
+.hyak_runner/
 
 # LaTeX build products
 *.aux
