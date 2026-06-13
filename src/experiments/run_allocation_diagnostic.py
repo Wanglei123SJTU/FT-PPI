@@ -10,6 +10,7 @@ import pandas as pd
 import yaml
 
 from src.analysis.summarize import summarize
+from src.analysis.prediction_diagnostics import write_prediction_diagnostics
 from src.estimators.mean_ppi import residual_variance_value
 from src.train.train_regression import run_training
 
@@ -367,6 +368,7 @@ def run_allocation_diagnostic(config: dict[str, Any]) -> pd.DataFrame:
     existing_cols = [col for col in diagnostic_cols if col in combined.columns]
     combined[existing_cols].to_csv(summary_dir / "diagnostic_summary.csv", index=False)
     write_summary_tables(combined, summary_dir)
+    write_prediction_diagnostics(output_root, summary_dir)
     _write_quick_figures(combined, summary_dir)
     print(combined[existing_cols], flush=True)
     return combined
