@@ -15,12 +15,14 @@ module purge
 module load coenv/python/3.11.9
 module load cuda/12.4.1
 
-if [ ! -f ".venv/bin/activate" ]; then
-  echo "Missing .venv. Run: bash scripts/setup_hyak_env.sh"
+VENV_DIR="${HYAK_VENV_DIR:-.venv-hyak}"
+
+if [ ! -f "$VENV_DIR/bin/activate" ]; then
+  echo "Missing $VENV_DIR. Run: bash scripts/setup_hyak_env.sh"
   exit 1
 fi
 
-source .venv/bin/activate
+source "$VENV_DIR/bin/activate"
 
 python - <<'PY'
 import torch

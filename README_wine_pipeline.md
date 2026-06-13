@@ -19,6 +19,19 @@ cd ~/FT-PPI
 bash scripts/setup_hyak_env.sh
 ```
 
+Normal logins do not need to reinstall dependencies:
+
+```bash
+cd ~/FT-PPI
+source .venv-hyak/bin/activate
+```
+
+Only rebuild the environment when it is broken or dependencies changed:
+
+```bash
+RESET=1 bash scripts/setup_hyak_env.sh
+```
+
 Then run:
 
 ```bash
