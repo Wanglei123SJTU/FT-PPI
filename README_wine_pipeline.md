@@ -12,8 +12,14 @@ python -m src.data.build_wine --output-dir artifacts/local_sanity --population-s
 
 ## Hyak smoke run
 
-Install the Python dependencies from `requirements.txt` in the Hyak environment,
-then run:
+Create the Hyak Python environment once:
+
+```bash
+cd ~/FT-PPI
+bash scripts/setup_hyak_env.sh
+```
+
+Then run:
 
 ```bash
 sbatch slurm/smoke_lora.sbatch
@@ -30,4 +36,3 @@ sbatch slurm/run_tiny.sbatch
 
 This runs MSE and Var on the `B=500, s=100, v=100` tiny split and writes a
 summary table under `artifacts/tiny/summary/metrics.csv`.
-

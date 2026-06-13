@@ -1,18 +1,33 @@
 #!/bin/bash
 #SBATCH --job-name=wine-smoke
-#SBATCH --gres=gpu:1
+#SBATCH --partition=ckpt
+#SBATCH --gres=gpu:a40:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=00:30:00
 #SBATCH --output=logs/%x-%j.out
 
 set -euo pipefail
+cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs
 
-if [ -f ".venv/bin/activate" ]; then
-  source .venv/bin/activate
+module purge
+module load coenv/python/3.11.9
+module load cuda/12.4.1
+
+if [ ! -f ".venv/bin/activate" ]; then
+  echo "Missing .venv. Run: bash scripts/setup_hyak_env.sh"
+  exit 1
 fi
+
+source .venv/bin/activate
+
+python - <<'PY'
+import torch
+print("torch", torch.__version__)
+print("cuda_available", torch.cuda.is_available())
+print("device", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
+PY
 
 python -m src.train.train_regression --config configs/smoke.yaml --loss mse
 python -m src.train.train_regression --config configs/smoke.yaml --loss var
-
