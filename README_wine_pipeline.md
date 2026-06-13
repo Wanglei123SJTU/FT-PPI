@@ -38,6 +38,14 @@ Then run:
 sbatch slurm/smoke_lora.sbatch
 ```
 
+To request a specific checkpoint GPU, override the Slurm directives at submit
+time. For example:
+
+```bash
+sbatch --partition=ckpt --gres=gpu:h200:1 slurm/smoke_lora.sbatch
+sbatch --partition=ckpt --gres=gpu:a100:1 slurm/smoke_lora.sbatch
+```
+
 The smoke job trains MSE and Var LoRA runs for two steps each and writes
 prediction parquet files under `artifacts/smoke/`.
 

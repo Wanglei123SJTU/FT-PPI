@@ -23,6 +23,29 @@ fi
 
 source "$VENV_DIR/bin/activate"
 
+check_env() {
+  python - <<'PY'
+import importlib.util
+import sys
+
+mods = ["torch", "transformers", "datasets", "accelerate", "peft", "bitsandbytes", "pandas", "pyarrow"]
+missing = [mod for mod in mods if importlib.util.find_spec(mod) is None]
+if missing:
+    print("missing=" + ",".join(missing))
+    sys.exit(1)
+
+import torch
+print("torch", torch.__version__)
+print("cuda_build", torch.version.cuda)
+PY
+}
+
+if [ "${FORCE_INSTALL:-0}" != "1" ] && check_env; then
+  python -m pytest tests -q
+  echo "Hyak environment ready. Activate with: source $VENV_DIR/bin/activate"
+  exit 0
+fi
+
 python -m pip install --upgrade pip setuptools wheel
 python -m pip cache purge || true
 python -m pip install --no-cache-dir -r requirements.txt
@@ -31,11 +54,6 @@ python -m pip install --no-cache-dir --no-deps accelerate==1.2.1 peft==0.14.0 bi
 
 python -m pytest tests -q
 
-python - <<'PY'
-import importlib.util
-mods = ["torch", "transformers", "datasets", "peft", "pandas", "pyarrow"]
-for mod in mods:
-    print(f"{mod}={importlib.util.find_spec(mod) is not None}")
-PY
+check_env
 
 echo "Hyak environment ready. Activate with: source $VENV_DIR/bin/activate"
