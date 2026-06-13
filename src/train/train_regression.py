@@ -127,6 +127,7 @@ def run_training(config: dict[str, Any], loss: str) -> Path:
         lora_alpha=int(config.get("lora_alpha", 4)),
         lora_dropout=float(config.get("lora_dropout", 0.05)),
         target_modules=tuple(config.get("target_modules", ["q_proj", "v_proj"])),
+        zero_init_regression_head=bool(config.get("zero_init_regression_head", True)),
     )
     model, resolved_model_name = load_lora_regression_model(lora_cfg)
     tokenizer = load_tokenizer(resolved_model_name, max_length)

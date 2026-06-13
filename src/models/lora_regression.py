@@ -23,6 +23,7 @@ class LoraRegressionConfig:
     lora_alpha: int = 4
     lora_dropout: float = 0.05
     target_modules: tuple[str, ...] = ("q_proj", "v_proj")
+    zero_init_regression_head: bool = True
 
 
 def format_wine_text(description: str) -> str:
@@ -65,6 +66,19 @@ def load_tokenizer(model_name: str, max_length: int):
     return tokenizer
 
 
+def _zero_init_regression_head(model, torch) -> None:
+    for name in ("score", "classifier"):
+        head = getattr(model, name, None)
+        if head is None:
+            continue
+        weight = getattr(head, "weight", None)
+        if weight is not None:
+            torch.nn.init.zeros_(weight)
+        bias = getattr(head, "bias", None)
+        if bias is not None:
+            torch.nn.init.zeros_(bias)
+
+
 def load_lora_regression_model(config: LoraRegressionConfig):
     mods = _require_hf_modules()
     torch = mods["torch"]
@@ -94,6 +108,8 @@ def load_lora_regression_model(config: LoraRegressionConfig):
             model.config.problem_type = "regression"
             if model.config.pad_token_id is None and getattr(model.config, "eos_token_id", None) is not None:
                 model.config.pad_token_id = model.config.eos_token_id
+            if config.zero_init_regression_head:
+                _zero_init_regression_head(model, torch)
             if config.load_in_4bit:
                 model = mods["prepare_model_for_kbit_training"](model)
 
@@ -114,4 +130,3 @@ def load_lora_regression_model(config: LoraRegressionConfig):
             last_error = exc
             continue
     raise RuntimeError(f"Could not load model candidates: {last_error}") from last_error
-
