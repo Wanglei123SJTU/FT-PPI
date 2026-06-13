@@ -1,0 +1,25 @@
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime outputs and local smoke artifacts
+artifacts/
+logs/
+
+# LaTeX build products
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+
+# Local environment files
+.venv/
+venv/
+.env
+
+# Legacy materials intentionally excluded from the fresh MVP pipeline
+FT PPI Original/

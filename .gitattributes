@@ -1,0 +1,12 @@
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.sh text eol=lf
+*.sbatch text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.tex text eol=lf
+*.csv text eol=lf
+*.pdf binary
+*.parquet binary
+*.png binary
