@@ -42,8 +42,16 @@ Write-Host "Enter UW password and complete Duo if prompted."
 Write-Host "Keep this window open while Codex is using Hyak."
 Write-Host ""
 
-$RemoteScript | ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target 'bash -s' 2>&1 |
-  Tee-Object -FilePath $LogPath -Append
+$PreviousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+  # Remote commands can write normal progress, such as git fetch output, to
+  # stderr. Keep that as log output instead of treating it as a launcher error.
+  $RemoteScript | ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target 'bash -s' 2>&1 |
+    Tee-Object -FilePath $LogPath -Append
+} finally {
+  $ErrorActionPreference = $PreviousErrorActionPreference
+}
 
 Write-Host ""
 Write-Host "Hyak runner command finished."
