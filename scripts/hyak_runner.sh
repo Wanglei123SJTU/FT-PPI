@@ -132,6 +132,10 @@ run_pending_tasks() {
     if [ -e "$STATE_DIR/done/$task_id" ] || [ -e "$STATE_DIR/failed/$task_id" ]; then
       continue
     fi
+    if [ -e "$STATE_DIR/running/$task_id" ]; then
+      log "skipping task $task_id because running marker exists"
+      continue
+    fi
 
     found=1
     run_task "$task_path"
