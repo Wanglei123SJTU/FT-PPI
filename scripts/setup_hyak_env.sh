@@ -107,7 +107,7 @@ PY
 
 if [ "${FORCE_INSTALL:-0}" != "1" ] && check_env; then
   python -m pytest tests -q
-  echo "Hyak environment ready. Activate with: source $VENV_DIR/bin/activate"
+  echo "Hyak environment ready at: $VENV_DIR"
   exit 0
 fi
 
@@ -121,4 +121,4 @@ python -m pytest tests -q
 
 check_env
 
-echo "Hyak environment ready. Activate with: source $VENV_DIR/bin/activate"
+echo "Hyak environment ready at: $VENV_DIR"

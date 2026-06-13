@@ -23,13 +23,14 @@ Normal logins do not need to reinstall dependencies:
 
 ```bash
 cd ~/FT-PPI
-source .venv-hyak/bin/activate
+bash scripts/setup_hyak_env.sh
 ```
 
 On Hyak, `.venv-hyak` is a symlink into scratch/group storage when available,
 so the large PyTorch environment does not live in the repo or home directory.
 The setup script also puts Hugging Face, datasets, Torch, and pip caches under
 the same scratch area by default.
+The Slurm scripts activate the environment automatically.
 
 Only rebuild the environment when it is broken or dependencies changed:
 

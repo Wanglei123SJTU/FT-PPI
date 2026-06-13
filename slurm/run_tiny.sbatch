@@ -28,14 +28,14 @@ export TORCH_HOME="${TORCH_HOME:-$CACHE_ROOT/torch}"
 export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-$CACHE_ROOT/conda_pkgs}"
 export WANDB_DISABLED="${WANDB_DISABLED:-true}"
 
-if [ ! -f "$VENV_DIR/bin/activate" ]; then
+if [ ! -x "$VENV_DIR/bin/python" ]; then
   echo "Missing $VENV_DIR. Run: bash scripts/setup_hyak_env.sh"
   exit 1
 fi
 
 if [ -d "$VENV_DIR/conda-meta" ] && command -v conda >/dev/null 2>&1; then
   source "$(conda info --base)/etc/profile.d/conda.sh"
-  conda activate "$VENV_DIR"
+  conda activate "$VENV_REAL"
 else
   source "$VENV_DIR/bin/activate"
 fi
