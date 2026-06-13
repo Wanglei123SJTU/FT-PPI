@@ -98,6 +98,17 @@ def summarize_rampup_allocation_regret(
         oracle_variance = float(oracle["mean_estimated_variance"])
         selected_variance = float(selected["mean_estimated_variance"])
         sample_mean_variance = float(selected["sample_mean_variance"])
+        selected_y_variance = sample_mean_variance * float(budget)
+        selected_residual_ratio = (
+            float(selected["mean_residual_variance"]) / selected_y_variance if selected_y_variance > 0 else np.nan
+        )
+        selected_prediction_r2 = 1.0 - selected_residual_ratio
+        selected_label_cost_ratio = (float(selected["train_size"]) + float(selected["validation_size"])) / float(budget)
+        oracle_residual_ratio = (
+            float(oracle["mean_residual_variance"]) / selected_y_variance if selected_y_variance > 0 else np.nan
+        )
+        oracle_prediction_r2 = 1.0 - oracle_residual_ratio
+        oracle_label_cost_ratio = (float(oracle["train_size"]) + float(oracle["validation_size"])) / float(budget)
 
         rows.append(
             {
@@ -117,6 +128,9 @@ def summarize_rampup_allocation_regret(
                 "selected_sample_savings": 1.0 - selected_variance / sample_mean_variance
                 if sample_mean_variance > 0
                 else np.nan,
+                "selected_approx_prediction_r2": selected_prediction_r2,
+                "selected_label_cost_ratio": selected_label_cost_ratio,
+                "selected_efficiency_margin": selected_prediction_r2 - selected_label_cost_ratio,
                 "oracle_train_size": int(oracle["train_size"]),
                 "oracle_allocation_ratio": float(oracle["allocation_ratio"]),
                 "oracle_estimated_variance": oracle_variance,
@@ -124,6 +138,9 @@ def summarize_rampup_allocation_regret(
                 "oracle_sample_savings": 1.0 - oracle_variance / sample_mean_variance
                 if sample_mean_variance > 0
                 else np.nan,
+                "oracle_approx_prediction_r2": oracle_prediction_r2,
+                "oracle_label_cost_ratio": oracle_label_cost_ratio,
+                "oracle_efficiency_margin": oracle_prediction_r2 - oracle_label_cost_ratio,
                 "relative_regret": selected_variance / oracle_variance - 1.0 if oracle_variance > 0 else np.nan,
                 "beats_sample_mean": bool(selected_variance < sample_mean_variance),
                 "sample_mean_variance": sample_mean_variance,
