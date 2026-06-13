@@ -171,9 +171,10 @@ def run_training(config: dict[str, Any], loss: str) -> Path:
         data_collator=collator,
     )
     trainer.train()
-    adapter_dir = run_dir / "final_adapter"
-    trainer.model.save_pretrained(adapter_dir)
-    tokenizer.save_pretrained(adapter_dir)
+    if bool(config.get("save_adapter", True)):
+        adapter_dir = run_dir / "final_adapter"
+        trainer.model.save_pretrained(adapter_dir)
+        tokenizer.save_pretrained(adapter_dir)
 
     pred = trainer.predict(all_ds).predictions.reshape(-1)
     save_prediction_frame(

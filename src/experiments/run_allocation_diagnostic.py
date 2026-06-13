@@ -284,6 +284,14 @@ def write_summary_tables(metrics: pd.DataFrame, summary_dir: Path) -> None:
     loso.to_csv(summary_dir / "scaling_law_loso.csv", index=False)
 
 
+def _completed_run_metrics(run_dir: Path, losses: list[str]) -> pd.DataFrame | None:
+    metrics_path = run_dir / "summary" / "metrics.csv"
+    prediction_paths = [run_dir / loss / "predictions.parquet" for loss in losses]
+    if metrics_path.exists() and all(path.exists() for path in prediction_paths):
+        return pd.read_csv(metrics_path)
+    return None
+
+
 def _release_cuda_cache() -> None:
     gc.collect()
     try:
@@ -305,6 +313,12 @@ def run_allocation_diagnostic(config: dict[str, Any]) -> pd.DataFrame:
     all_metrics = []
     for run_cfg in build_allocation_runs(config):
         run_dir = Path(run_cfg["output_dir"])
+        if bool(run_cfg.get("resume_completed", False)):
+            completed_metrics = _completed_run_metrics(run_dir, losses)
+            if completed_metrics is not None:
+                all_metrics.append(completed_metrics)
+                print(f"allocation_run_skip_completed tag={run_cfg['allocation_tag']}", flush=True)
+                continue
         print(
             "allocation_run_start",
             f"tag={run_cfg['allocation_tag']}",

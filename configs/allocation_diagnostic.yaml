@@ -2,6 +2,7 @@ input_csv: Code/wine_data.csv
 output_dir: artifacts/allocation_diagnostic
 seed: 20260612
 replication_id: 0
+save_adapter: false
 
 population_size: 10000
 budget: 1000

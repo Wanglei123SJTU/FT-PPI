@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from src.experiments.run_allocation_diagnostic import (
+    _completed_run_metrics,
     add_diagnostic_columns,
     build_allocation_runs,
     summarize_allocation_curve,
@@ -95,6 +96,21 @@ def test_add_diagnostic_columns_maps_loss_and_residual_variance():
     assert pd.isna(out.loc[0, "residual_variance"])
     assert out.loc[1, "residual_variance"] == 1.5
     assert out.loc[2, "estimated_estimator_variance"] == 0.3
+
+
+def test_completed_run_metrics_requires_metrics_and_predictions(tmp_path):
+    run_dir = tmp_path / "run"
+    (run_dir / "summary").mkdir(parents=True)
+    (run_dir / "mse").mkdir()
+    (run_dir / "var").mkdir()
+    pd.DataFrame({"method": ["sample_mean"]}).to_csv(run_dir / "summary" / "metrics.csv", index=False)
+    assert _completed_run_metrics(run_dir, ["mse", "var"]) is None
+
+    pd.DataFrame({"x": [1]}).to_parquet(run_dir / "mse" / "predictions.parquet")
+    pd.DataFrame({"x": [1]}).to_parquet(run_dir / "var" / "predictions.parquet")
+    completed = _completed_run_metrics(run_dir, ["mse", "var"])
+    assert completed is not None
+    assert completed["method"].tolist() == ["sample_mean"]
 
 
 def test_allocation_summary_tables_average_replications_and_find_oracle():

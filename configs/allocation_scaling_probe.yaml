@@ -4,6 +4,8 @@ seed: 20260612
 population_seed: 20260612
 split_seed: 20261612
 replication_ids: [0, 1, 2]
+resume_completed: true
+save_adapter: false
 
 population_size: 10000
 budget: 1000

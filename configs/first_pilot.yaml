@@ -2,6 +2,7 @@ input_csv: Code/wine_data.csv
 output_dir: artifacts/first_pilot
 seed: 20260612
 replication_id: 0
+save_adapter: false
 
 population_size: 20000
 budgets: [500, 1000]
