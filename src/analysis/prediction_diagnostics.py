@@ -7,7 +7,11 @@ import numpy as np
 import pandas as pd
 
 
-TAG_RE = re.compile(r"r(?P<replication_id>\d+)_s(?P<train_size>\d+)_v(?P<validation_size>\d+)")
+TAG_RE = re.compile(
+    r"(?:(?:r(?P<replication_id>\d+)_))?"
+    r"(?:(?:B(?P<budget>\d+)_))?"
+    r"s(?P<train_size>\d+)_v(?P<validation_size>\d+)"
+)
 
 
 def _safe_corr(y_true: pd.Series, pred: pd.Series) -> float:
@@ -35,9 +39,12 @@ def _parse_prediction_path(path: Path) -> dict[str, int | str]:
     match = TAG_RE.fullmatch(tag)
     if not match:
         raise ValueError(f"prediction path does not include allocation tag: {path}")
+    replication_id = match.group("replication_id")
+    budget = match.group("budget")
     return {
         "allocation_tag": tag,
-        "replication_id": int(match.group("replication_id")),
+        "replication_id": int(replication_id) if replication_id is not None else 0,
+        "budget": int(budget) if budget is not None else np.nan,
         "train_size": int(match.group("train_size")),
         "validation_size": int(match.group("validation_size")),
         "loss": path.parent.name,
@@ -79,7 +86,7 @@ def summarize_prediction_quality(predictions: pd.DataFrame, metadata: dict[str, 
 def build_prediction_diagnostics(root_dir: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     root = Path(root_dir)
     rows: list[dict[str, float | int | str]] = []
-    for path in sorted(root.glob("r*_s*_v*/*/predictions.parquet")):
+    for path in sorted(root.glob("*/*/predictions.parquet")):
         metadata = _parse_prediction_path(path)
         predictions = pd.read_parquet(path)
         rows.extend(summarize_prediction_quality(predictions, metadata))
@@ -87,7 +94,7 @@ def build_prediction_diagnostics(root_dir: str | Path) -> tuple[pd.DataFrame, pd
     if per_run.empty:
         return per_run, per_run
 
-    group_cols = ["loss", "train_size", "role"]
+    group_cols = ["loss", "budget", "train_size", "role"]
     grouped = per_run.groupby(group_cols, dropna=False)
     summary = grouped.agg(
         n_replications=("replication_id", "nunique"),
@@ -101,7 +108,7 @@ def build_prediction_diagnostics(root_dir: str | Path) -> tuple[pd.DataFrame, pd
         mean_residual_variance=("residual_variance", "mean"),
     ).reset_index()
     summary["sd_corr"] = summary["sd_corr"].fillna(0.0)
-    return per_run, summary.sort_values(["loss", "role", "train_size"]).reset_index(drop=True)
+    return per_run, summary.sort_values(["loss", "budget", "role", "train_size"]).reset_index(drop=True)
 
 
 def write_prediction_diagnostics(root_dir: str | Path, output_dir: str | Path | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:

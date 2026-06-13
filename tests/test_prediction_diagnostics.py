@@ -26,3 +26,25 @@ def test_build_prediction_diagnostics_groups_by_loss_train_size_and_role(tmp_pat
     assert pop["n_replications"] == 1
     assert pop["mean_rmse"] == pytest.approx(1.0)
     assert pop["mean_pred_std"] > 0
+
+
+def test_build_prediction_diagnostics_parses_multi_budget_tags(tmp_path):
+    for tag, point in [
+        ("r000_B0500_s0025_v0100", 88.0),
+        ("r001_B1000_s0050_v0100", 91.0),
+    ]:
+        pred_dir = tmp_path / tag / "mse"
+        pred_dir.mkdir(parents=True)
+        pd.DataFrame(
+            {
+                "sample_id": [1, 2],
+                "split_role": ["correction", "unlabeled"],
+                "y_true": [point, point + 1.0],
+                "pred_mean": [point + 0.5, point + 0.5],
+            }
+        ).to_parquet(pred_dir / "predictions.parquet")
+
+    per_run, summary = build_prediction_diagnostics(tmp_path)
+    assert set(per_run["budget"].astype(int)) == {500, 1000}
+    assert set(summary["budget"].astype(int)) == {500, 1000}
+    assert set(summary["train_size"].astype(int)) == {25, 50}
