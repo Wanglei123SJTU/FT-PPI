@@ -42,7 +42,7 @@ Write-Host "Enter UW password and complete Duo if prompted."
 Write-Host "Keep this window open while Codex is using Hyak."
 Write-Host ""
 
-($RemoteScript | & ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target 'bash -s' 2>&1) |
+$RemoteScript | ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target 'bash -s' 2>&1 |
   Tee-Object -FilePath $LogPath -Append
 
 Write-Host ""
