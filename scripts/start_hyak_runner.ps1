@@ -51,3 +51,5 @@ cmd.exe /d /c $CmdLine | Tee-Object -FilePath $LogPath -Append
 
 Write-Host ""
 Write-Host "Hyak runner command finished."
+Write-Host "Press Enter to close this window."
+Read-Host | Out-Null
