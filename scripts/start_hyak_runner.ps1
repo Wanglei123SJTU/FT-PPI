@@ -22,15 +22,9 @@ if ([string]::IsNullOrWhiteSpace($LogPath)) {
 
 $Target = "${NetId}@${HostName}"
 $OnceValue = if ($Once) { "1" } else { "0" }
-$RemoteScript = @"
-set -euo pipefail
-cd $RemoteRepo
-git pull --ff-only origin $Branch
-export HYAK_RUNNER_BRANCH="$Branch"
-export HYAK_RUNNER_POLL_SECONDS="$PollSeconds"
-export HYAK_RUNNER_ONCE="$OnceValue"
-exec bash scripts/hyak_runner.sh
-"@ -replace "`r", ""
+$RemoteCommand = "cd $RemoteRepo && git pull --ff-only origin $Branch && HYAK_RUNNER_BRANCH=$Branch HYAK_RUNNER_POLL_SECONDS=$PollSeconds HYAK_RUNNER_ONCE=$OnceValue bash scripts/hyak_runner.sh"
+$EscapedRemoteCommand = $RemoteCommand.Replace('"', '\"')
+$CmdLine = "ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target ""$EscapedRemoteCommand"" 2>&1"
 
 Write-Host "Target: $Target"
 Write-Host "Remote repo: $RemoteRepo"
@@ -42,16 +36,7 @@ Write-Host "Enter UW password and complete Duo if prompted."
 Write-Host "Keep this window open while Codex is using Hyak."
 Write-Host ""
 
-$PreviousErrorActionPreference = $ErrorActionPreference
-$ErrorActionPreference = "Continue"
-try {
-  # Remote commands can write normal progress, such as git fetch output, to
-  # stderr. Keep that as log output instead of treating it as a launcher error.
-  $RemoteScript | ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target 'bash -s' 2>&1 |
-    Tee-Object -FilePath $LogPath -Append
-} finally {
-  $ErrorActionPreference = $PreviousErrorActionPreference
-}
+cmd.exe /d /c $CmdLine | Tee-Object -FilePath $LogPath -Append
 
 Write-Host ""
 Write-Host "Hyak runner command finished."
