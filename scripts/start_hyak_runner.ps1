@@ -22,7 +22,15 @@ if ([string]::IsNullOrWhiteSpace($LogPath)) {
 
 $Target = "${NetId}@${HostName}"
 $OnceValue = if ($Once) { "1" } else { "0" }
-$RemoteCommand = "cd $RemoteRepo && git pull --ff-only origin $Branch && HYAK_RUNNER_BRANCH=$Branch HYAK_RUNNER_POLL_SECONDS=$PollSeconds HYAK_RUNNER_ONCE=$OnceValue bash scripts/hyak_runner.sh"
+$RemoteScript = @"
+set -euo pipefail
+cd $RemoteRepo
+git pull --ff-only origin $Branch
+export HYAK_RUNNER_BRANCH="$Branch"
+export HYAK_RUNNER_POLL_SECONDS="$PollSeconds"
+export HYAK_RUNNER_ONCE="$OnceValue"
+exec bash scripts/hyak_runner.sh
+"@ -replace "`r`n", "`n"
 
 Write-Host "Target: $Target"
 Write-Host "Remote repo: $RemoteRepo"
@@ -34,7 +42,7 @@ Write-Host "Enter UW password and complete Duo if prompted."
 Write-Host "Keep this window open while Codex is using Hyak."
 Write-Host ""
 
-& ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target $RemoteCommand 2>&1 |
+($RemoteScript | & ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target 'bash -s' 2>&1) |
   Tee-Object -FilePath $LogPath -Append
 
 Write-Host ""
