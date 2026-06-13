@@ -25,7 +25,7 @@ $Target = "${NetId}@${HostName}"
 $OnceValue = if ($Once) { "1" } else { "0" }
 $UseDetached = -not $Foreground -and -not $Once
 if ($UseDetached) {
-  $RemoteCommand = "set -e; cd $RemoteRepo; git pull --ff-only origin $Branch; mkdir -p .hyak_runner; RUNNER_LOG=.hyak_runner/runner.out; RUNNER_PID=.hyak_runner/runner.pid; if [ -s `$RUNNER_PID ] && kill -0 `$(cat `$RUNNER_PID) 2>/dev/null; then echo detached runner already running pid=`$(cat `$RUNNER_PID); else echo starting detached runner; nohup env HYAK_RUNNER_BRANCH=$Branch HYAK_RUNNER_POLL_SECONDS=$PollSeconds HYAK_RUNNER_ONCE=$OnceValue bash scripts/hyak_runner.sh >> `$RUNNER_LOG 2>&1 < /dev/null & echo `$! > .hyak_runner/launcher.pid; fi; echo remote runner log: `$RUNNER_LOG; sleep 2; tail -n 120 -f `$RUNNER_LOG"
+  $RemoteCommand = "cd $RemoteRepo && git pull --ff-only origin $Branch && bash scripts/start_hyak_runner_remote.sh $Branch $PollSeconds $OnceValue"
 } else {
   $RemoteCommand = "cd $RemoteRepo && git pull --ff-only origin $Branch && HYAK_RUNNER_BRANCH=$Branch HYAK_RUNNER_POLL_SECONDS=$PollSeconds HYAK_RUNNER_ONCE=$OnceValue bash scripts/hyak_runner.sh"
 }
