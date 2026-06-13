@@ -20,6 +20,24 @@ def test_build_allocation_runs_sets_train_sizes_and_output_dirs():
     assert runs[0]["output_dir"].endswith("s0050_v0100")
 
 
+def test_build_allocation_runs_supports_multiple_budgets():
+    config = {
+        "output_dir": "artifacts/first_pilot",
+        "budgets": [500, 1000],
+        "population_size": 20000,
+        "validation_size": 100,
+        "allocation_ratios": [0.1, 0.2],
+    }
+    runs = build_allocation_runs(config)
+    assert [run["allocation_tag"] for run in runs] == [
+        "B0500_s0050_v0100",
+        "B0500_s0100_v0100",
+        "B1000_s0100_v0100",
+        "B1000_s0200_v0100",
+    ]
+    assert [run["budget"] for run in runs] == [500, 500, 1000, 1000]
+
+
 def test_add_diagnostic_columns_maps_loss_and_residual_variance():
     metrics = pd.DataFrame(
         {

@@ -25,29 +25,43 @@ def allocation_train_size(budget: int, ratio: float) -> int:
 
 
 def build_allocation_runs(config: dict[str, Any]) -> list[dict[str, Any]]:
-    budget = int(config["budget"])
+    budget_values = config.get("budgets")
+    if budget_values is None:
+        if "budget" not in config:
+            raise ValueError("config must include budget or budgets")
+        budget_values = [config["budget"]]
+    budgets = [int(x) for x in budget_values]
+    if not budgets:
+        raise ValueError("config must include budget or budgets")
+    multi_budget = "budgets" in config or len(budgets) > 1
     ratios = [float(x) for x in config.get("allocation_ratios", [])]
     if not ratios:
         raise ValueError("config must include allocation_ratios")
 
-    validation_size = int(config.get("validation_size", max(1, round(0.1 * budget))))
     output_root = Path(config.get("output_dir", "artifacts/allocation_diagnostic"))
     runs = []
-    for ratio in ratios:
-        train_size = allocation_train_size(budget, ratio)
-        if train_size + validation_size > budget:
-            raise ValueError(
-                f"train_size + validation_size exceeds budget for ratio={ratio}: "
-                f"{train_size} + {validation_size} > {budget}"
-            )
-        tag = f"s{train_size:04d}_v{validation_size:04d}"
-        run_cfg = dict(config)
-        run_cfg["output_dir"] = str(output_root / tag)
-        run_cfg["train_size"] = train_size
-        run_cfg["validation_size"] = validation_size
-        run_cfg["allocation_ratio"] = ratio
-        run_cfg["allocation_tag"] = tag
-        runs.append(run_cfg)
+    for budget in budgets:
+        if budget <= 0:
+            raise ValueError("budget must be positive")
+        validation_size = int(config.get("validation_size", max(1, round(0.1 * budget))))
+        for ratio in ratios:
+            train_size = allocation_train_size(budget, ratio)
+            if train_size + validation_size > budget:
+                raise ValueError(
+                    f"train_size + validation_size exceeds budget for ratio={ratio}: "
+                    f"{train_size} + {validation_size} > {budget}"
+                )
+            tag = f"s{train_size:04d}_v{validation_size:04d}"
+            if multi_budget:
+                tag = f"B{budget:04d}_{tag}"
+            run_cfg = dict(config)
+            run_cfg["budget"] = budget
+            run_cfg["output_dir"] = str(output_root / tag)
+            run_cfg["train_size"] = train_size
+            run_cfg["validation_size"] = validation_size
+            run_cfg["allocation_ratio"] = ratio
+            run_cfg["allocation_tag"] = tag
+            runs.append(run_cfg)
     return runs
 
 
