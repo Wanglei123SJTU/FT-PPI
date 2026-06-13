@@ -45,6 +45,8 @@ def summarize(population_path: str | Path, prediction_paths: list[str | Path], o
             row["prediction_file"] = str(pred_path)
         all_rows.extend(rows)
     metrics = pd.DataFrame(all_rows)
+    if "estimated_se" in metrics.columns and "standard_error" not in metrics.columns:
+        metrics["standard_error"] = metrics["estimated_se"]
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     metrics.to_csv(out / "metrics.csv", index=False)
@@ -83,4 +85,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
