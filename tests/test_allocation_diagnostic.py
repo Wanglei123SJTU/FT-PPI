@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
-from src.experiments.run_allocation_diagnostic import add_diagnostic_columns, build_allocation_runs
+from src.experiments.run_allocation_diagnostic import (
+    add_diagnostic_columns,
+    build_allocation_runs,
+    summarize_allocation_curve,
+    summarize_oracle_allocations,
+    summarize_scaling_laws,
+)
 
 
 def test_build_allocation_runs_sets_train_sizes_and_output_dirs():
@@ -38,6 +45,31 @@ def test_build_allocation_runs_supports_multiple_budgets():
     assert [run["budget"] for run in runs] == [500, 500, 1000, 1000]
 
 
+def test_build_allocation_runs_supports_replications_and_split_seed():
+    config = {
+        "output_dir": "artifacts/allocation_scaling_probe",
+        "seed": 1,
+        "population_seed": 10,
+        "split_seed": 20,
+        "replication_ids": [0, 1, 2],
+        "budget": 1000,
+        "population_size": 10000,
+        "validation_size": 100,
+        "allocation_ratios": [0.05, 0.075],
+    }
+    runs = build_allocation_runs(config)
+    assert [run["allocation_tag"] for run in runs] == [
+        "r000_s0050_v0100",
+        "r000_s0075_v0100",
+        "r001_s0050_v0100",
+        "r001_s0075_v0100",
+        "r002_s0050_v0100",
+        "r002_s0075_v0100",
+    ]
+    assert {run["population_seed"] for run in runs} == {10}
+    assert [run["split_seed"] for run in runs] == [20, 20, 21, 21, 22, 22]
+
+
 def test_add_diagnostic_columns_maps_loss_and_residual_variance():
     metrics = pd.DataFrame(
         {
@@ -63,3 +95,41 @@ def test_add_diagnostic_columns_maps_loss_and_residual_variance():
     assert pd.isna(out.loc[0, "residual_variance"])
     assert out.loc[1, "residual_variance"] == 1.5
     assert out.loc[2, "estimated_estimator_variance"] == 0.3
+
+
+def test_allocation_summary_tables_average_replications_and_find_oracle():
+    metrics = pd.DataFrame(
+        {
+            "budget": [1000] * 6,
+            "allocation_ratio": [0.05, 0.05, 0.1, 0.1, 0.2, 0.2],
+            "train_size": [50, 50, 100, 100, 200, 200],
+            "validation_size": [100] * 6,
+            "loss": ["sample_mean", "mse", "sample_mean", "mse", "sample_mean", "mse"],
+            "method": [
+                "sample_mean",
+                "lora_mse+ppi_plus",
+                "sample_mean",
+                "lora_mse+ppi_plus",
+                "sample_mean",
+                "lora_mse+ppi_plus",
+            ],
+            "replication_id": [0, 0, 0, 0, 0, 0],
+            "estimated_estimator_variance": [0.10, 0.05, 0.10, 0.04, 0.10, 0.06],
+            "ci_length": [1.0, 0.7, 1.0, 0.6, 1.0, 0.8],
+            "residual_variance": [None, 2.0, None, 1.5, None, 1.4],
+            "sample_savings": [0.0, 0.5, 0.0, 0.6, 0.0, 0.4],
+            "bias": [0.0] * 6,
+            "rmse": [0.1] * 6,
+        }
+    )
+    curve = summarize_allocation_curve(metrics)
+    ppi_curve = curve[curve["method"] == "lora_mse+ppi_plus"]
+    assert ppi_curve["normalized_estimated_variance"].tolist() == pytest.approx([0.5, 0.4, 0.6])
+
+    oracle = summarize_oracle_allocations(curve)
+    assert oracle.loc[0, "oracle_train_size"] == 100
+    assert oracle.loc[0, "oracle_normalized_variance"] == pytest.approx(0.4)
+
+    scaling, loso = summarize_scaling_laws(curve)
+    assert scaling.loc[0, "loss"] == "mse"
+    assert set(loso["heldout_train_size"]) == {50, 100, 200}

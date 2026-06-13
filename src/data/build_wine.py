@@ -107,13 +107,22 @@ def build_artifacts(
     validation_size: int,
     seed: int,
     replication_id: int = 0,
+    population_seed: int | None = None,
+    split_seed: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Build and save population and split-role artifacts."""
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     clean = clean_wine(input_csv)
-    population = sample_population(clean, population_size, seed)
-    roles = make_split_roles(population, budget, train_size, validation_size, seed, replication_id)
+    population = sample_population(clean, population_size, seed if population_seed is None else population_seed)
+    roles = make_split_roles(
+        population,
+        budget,
+        train_size,
+        validation_size,
+        seed if split_seed is None else split_seed,
+        replication_id,
+    )
     population.to_csv(output / "population.csv", index=False)
     roles.to_csv(output / "split_roles.csv", index=False)
     return population, roles
@@ -150,4 +159,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

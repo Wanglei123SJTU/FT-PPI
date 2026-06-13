@@ -104,6 +104,8 @@ def run_training(config: dict[str, Any], loss: str) -> Path:
         validation_size=int(config["validation_size"]),
         seed=int(config.get("seed", 20260612)),
         replication_id=int(config.get("replication_id", 0)),
+        population_seed=int(config["population_seed"]) if "population_seed" in config else None,
+        split_seed=int(config["split_seed"]) if "split_seed" in config else None,
     )
     df = _merge_population_roles(population, roles)
     df, label_mean, label_std = _standardize_labels(df)
