@@ -28,6 +28,8 @@ source .venv-hyak/bin/activate
 
 On Hyak, `.venv-hyak` is a symlink into scratch/group storage when available,
 so the large PyTorch environment does not live in the repo or home directory.
+The setup script also puts Hugging Face, datasets, Torch, and pip caches under
+the same scratch area by default.
 
 Only rebuild the environment when it is broken or dependencies changed:
 
@@ -41,12 +43,20 @@ Then run:
 sbatch slurm/smoke_lora.sbatch
 ```
 
-To request a specific checkpoint GPU, override the Slurm directives at submit
-time. For example:
+Check the currently idle GPU resources before submitting:
 
 ```bash
+sinfo -o "%P %G %D %t %N" | egrep "gpu|ckpt|h200|a100|l40|a40"
+```
+
+To request a specific GPU, override the Slurm directives at submit time. Use
+the partition that is idle and accessible at that moment. For example:
+
+```bash
+sbatch --partition=gpu-h200 --gres=gpu:h200:1 slurm/smoke_lora.sbatch
 sbatch --partition=ckpt --gres=gpu:h200:1 slurm/smoke_lora.sbatch
-sbatch --partition=ckpt --gres=gpu:a100:1 slurm/smoke_lora.sbatch
+sbatch --partition=ckpt --gres=gpu:l40s:1 slurm/smoke_lora.sbatch
+sbatch --partition=ckpt --gres=gpu:a40:1 slurm/smoke_lora.sbatch
 ```
 
 The smoke job trains MSE and Var LoRA runs for two steps each and writes
