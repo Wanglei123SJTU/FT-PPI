@@ -6,7 +6,7 @@ import pandas as pd
 from src.data.build_wine import clean_wine, make_split_roles, sample_population
 from src.estimators.mean_ppi import estimate_ppi_plus_lambda, ppi_estimate, ppi_plus_estimate
 from src.eval.predict import save_prediction_frame
-from src.train.loss_utils import residual_variance_loss_numpy
+from src.train.loss_utils import anchored_residual_variance_loss_numpy, residual_variance_loss_numpy
 
 
 def test_clean_wine_deduplicates_description(tmp_path):
@@ -67,6 +67,14 @@ def test_residual_variance_loss_numpy_matches_formula():
     residual = y - pred
     expected = np.mean((residual - residual.mean()) ** 2)
     assert residual_variance_loss_numpy(y, pred) == expected
+
+
+def test_anchored_residual_variance_adds_mean_penalty():
+    y = np.array([1.0, 2.0, 4.0])
+    pred = np.array([0.0, 1.0, 5.0])
+    residual = y - pred
+    expected = np.mean((residual - residual.mean()) ** 2) + 0.25 * residual.mean() ** 2
+    assert anchored_residual_variance_loss_numpy(y, pred, mean_penalty_weight=0.25) == expected
 
 
 def test_prediction_parquet_contains_required_columns(tmp_path):

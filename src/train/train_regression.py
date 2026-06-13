@@ -18,12 +18,16 @@ from src.models.lora_regression import LoraRegressionConfig, format_wine_text, l
 class VarianceRegressionTrainerMixin:
     """Trainer mixin that replaces MSE with residual batch variance."""
 
+    variance_mean_penalty_weight = 0.0
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):  # pragma: no cover - needs torch
         labels = inputs.pop("labels").reshape(-1)
         outputs = model(**inputs)
         pred = outputs.logits.reshape(-1)
         residual = labels - pred
         loss = ((residual - residual.mean()) ** 2).mean()
+        if self.variance_mean_penalty_weight:
+            loss = loss + float(self.variance_mean_penalty_weight) * residual.mean().pow(2)
         return (loss, outputs) if return_outputs else loss
 
 
@@ -162,7 +166,15 @@ def run_training(config: dict[str, Any], loss: str) -> Path:
     )
 
     base_trainer = mods["Trainer"]
-    trainer_cls = type("VarianceRegressionTrainer", (VarianceRegressionTrainerMixin, base_trainer), {}) if loss == "var" else base_trainer
+    trainer_cls = (
+        type(
+            "VarianceRegressionTrainer",
+            (VarianceRegressionTrainerMixin, base_trainer),
+            {"variance_mean_penalty_weight": float(config.get("variance_mean_penalty_weight", 0.0))},
+        )
+        if loss == "var"
+        else base_trainer
+    )
     trainer = trainer_cls(
         model=model,
         args=args,
