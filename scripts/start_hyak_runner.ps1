@@ -30,7 +30,7 @@ export HYAK_RUNNER_BRANCH="$Branch"
 export HYAK_RUNNER_POLL_SECONDS="$PollSeconds"
 export HYAK_RUNNER_ONCE="$OnceValue"
 exec bash scripts/hyak_runner.sh
-"@ -replace "`r`n", "`n"
+"@ -replace "`r", ""
 
 Write-Host "Target: $Target"
 Write-Host "Remote repo: $RemoteRepo"
