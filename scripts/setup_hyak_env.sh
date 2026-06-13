@@ -7,8 +7,8 @@ module purge
 module load coenv/python/3.11.9
 module load cuda/12.4.1
 
-python --version
-python -m venv .venv
+python3 --version
+python3 -m venv .venv
 source .venv/bin/activate
 
 python -m pip install --upgrade pip setuptools wheel
