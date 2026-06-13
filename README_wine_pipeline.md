@@ -26,6 +26,9 @@ cd ~/FT-PPI
 source .venv-hyak/bin/activate
 ```
 
+On Hyak, `.venv-hyak` is a symlink into scratch/group storage when available,
+so the large PyTorch environment does not live in the repo or home directory.
+
 Only rebuild the environment when it is broken or dependencies changed:
 
 ```bash

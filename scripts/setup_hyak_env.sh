@@ -7,7 +7,37 @@ module purge
 module load coenv/python/3.11.9
 module load cuda/12.4.1
 
-VENV_DIR="${HYAK_VENV_DIR:-.venv-hyak}"
+choose_venv_dir() {
+  if [ -n "${HYAK_VENV_DIR:-}" ]; then
+    echo "$HYAK_VENV_DIR"
+    return
+  fi
+
+  for base in \
+    "${SCRATCH:-}" \
+    "/gscratch/scrubbed/$USER" \
+    "/gscratch/foster/$USER" \
+    "$HOME/ft_ppi_envs"
+  do
+    [ -n "$base" ] || continue
+    if mkdir -p "$base/ft-ppi" 2>/dev/null && [ -w "$base/ft-ppi" ]; then
+      echo "$base/ft-ppi/.venv-hyak"
+      return
+    fi
+  done
+
+  echo ".venv-hyak"
+}
+
+VENV_DIR="$(choose_venv_dir)"
+if [ "$VENV_DIR" != ".venv-hyak" ]; then
+  if [ -e ".venv-hyak" ] && [ ! -L ".venv-hyak" ]; then
+    mv ".venv-hyak" ".venv-hyak.home.old.$(date +%Y%m%d_%H%M%S)"
+  fi
+  ln -sfn "$VENV_DIR" ".venv-hyak"
+fi
+mkdir -p "$(dirname "$VENV_DIR")"
+echo "VENV_DIR=$VENV_DIR"
 
 python3 --version
 
