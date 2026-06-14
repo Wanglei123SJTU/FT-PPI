@@ -22,9 +22,9 @@ head_lr: 5.0e-4
 weight_decay: 0.01
 max_grad_norm: 1.0
 
-batch_size: 256
-oom_fallback_batch_size: 128
-eval_batch_size: 128
+batch_size: 128
+oom_fallback_batch_sizes: [64, 32]
+eval_batch_size: 64
 log_every: 20
 log_every_epochs: 1
 max_epochs: 20
@@ -32,5 +32,5 @@ min_epochs: 4
 early_stopping_patience: 4
 early_stopping_min_delta: 0.0
 common_train_seed_within_rep: true
-gradient_checkpointing: false
+gradient_checkpointing: true
 save_predictions: false

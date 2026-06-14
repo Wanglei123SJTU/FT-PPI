@@ -659,12 +659,18 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_n
 
     requested_batch = int(config["batch_size"])
     batch_candidates = [requested_batch]
-    fallback_batch = int(config.get("oom_fallback_batch_size", 64))
-    if fallback_batch != requested_batch:
-        batch_candidates.append(fallback_batch)
+    fallback_values = config.get("oom_fallback_batch_sizes", None)
+    if fallback_values is None:
+        fallback_values = [config.get("oom_fallback_batch_size", 64)]
+    if not isinstance(fallback_values, list):
+        fallback_values = [fallback_values]
+    for fallback_value in fallback_values:
+        fallback_batch = int(fallback_value)
+        if fallback_batch > 0 and fallback_batch not in batch_candidates:
+            batch_candidates.append(fallback_batch)
     last_error: str | None = None
     used_oom_fallback = False
-    for batch_size in batch_candidates:
+    for batch_index, batch_size in enumerate(batch_candidates):
         try:
             print(
                 "train_cell_start",
@@ -695,10 +701,11 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_n
             break
         except RuntimeError as exc:
             last_error = repr(exc)
-            if not is_cuda_oom(exc) or batch_size == batch_candidates[-1]:
+            if not is_cuda_oom(exc) or batch_index == len(batch_candidates) - 1:
                 raise
             used_oom_fallback = True
-            print(f"cuda_oom_retry rep={replication_id} s={s_train} next_batch={fallback_batch}", flush=True)
+            next_batch = batch_candidates[batch_index + 1]
+            print(f"cuda_oom_retry rep={replication_id} s={s_train} next_batch={next_batch}", flush=True)
             exc.__traceback__ = None
             del exc
             gc.collect()
