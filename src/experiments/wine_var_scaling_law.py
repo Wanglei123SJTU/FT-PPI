@@ -74,6 +74,20 @@ def n_effective_labeled(config: dict[str, Any]) -> int:
     return int(config["budget_B"]) - validation_stop_size(config) - validation_scale_size(config)
 
 
+def configured_losses(config: dict[str, Any]) -> list[str]:
+    raw_losses = config.get("losses", [config.get("loss", "var")])
+    if isinstance(raw_losses, str):
+        raw_losses = [raw_losses]
+    losses = [str(loss).lower() for loss in raw_losses]
+    allowed = {"var", "mse"}
+    unknown = sorted(set(losses) - allowed)
+    if unknown:
+        raise ValueError(f"unsupported losses: {unknown}; expected subset of {sorted(allowed)}")
+    if not losses:
+        raise ValueError("at least one loss is required")
+    return losses
+
+
 def build_replication_splits(clean: pd.DataFrame, config: dict[str, Any], replication_id: int) -> SplitBundle:
     l_size = int(config["budget_B"])
     v_stop_size = validation_stop_size(config)
@@ -171,6 +185,19 @@ def subset_by_ids(clean: pd.DataFrame, ids: np.ndarray, role: str) -> pd.DataFra
 
 def var_loss_from_residuals(residual: Any) -> Any:
     return ((residual - residual.mean()) ** 2).mean()
+
+
+def mse_loss_from_residuals(residual: Any) -> Any:
+    return (residual**2).mean()
+
+
+def training_loss_from_residuals(residual: Any, loss_name: str) -> Any:
+    loss_name = str(loss_name).lower()
+    if loss_name == "var":
+        return var_loss_from_residuals(residual)
+    if loss_name == "mse":
+        return mse_loss_from_residuals(residual)
+    raise ValueError(f"unsupported loss: {loss_name}")
 
 
 def steps_per_epoch_for_s(s_train: int, batch_size: int) -> int:
@@ -334,6 +361,7 @@ def train_once(
     eval_df: pd.DataFrame | None,
     batch_size: int,
     seed: int,
+    loss_name: str,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
     mods = _require_training_modules()
     torch = mods["torch"]
@@ -392,7 +420,7 @@ def train_once(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 pred = model(**inputs)
             residual = labels.float() - pred.float()
-            loss = var_loss_from_residuals(residual)
+            loss = training_loss_from_residuals(residual, loss_name)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["max_grad_norm"]))
             optimizer.step()
@@ -430,6 +458,7 @@ def train_once(
                 f"epoch={epoch}",
                 f"max_epochs={max_epochs}",
                 f"steps={total_steps}",
+                f"loss={loss_name}",
                 f"train_loss={epoch_history[-1]['train_loss_mean']:.6f}",
                 f"v_stop_var={stop_var:.6f}",
                 f"best_epoch={best_epoch}",
@@ -549,8 +578,14 @@ def prediction_metrics(predictions: pd.DataFrame) -> dict[str, float]:
     }
 
 
-def cell_dir(config: dict[str, Any], replication_id: int, s_train: int) -> Path:
-    return Path(config["output_dir"]) / f"rep_{int(replication_id):02d}" / f"s_{int(s_train):04d}"
+def cell_dir(config: dict[str, Any], replication_id: int, s_train: int, loss_name: str | None = None) -> Path:
+    base = Path(config["output_dir"])
+    losses = configured_losses(config)
+    if loss_name is None:
+        loss_name = losses[0]
+    if len(losses) > 1:
+        base = base / str(loss_name).lower()
+    return base / f"rep_{int(replication_id):02d}" / f"s_{int(s_train):04d}"
 
 
 def write_cell_manifest(
@@ -558,11 +593,13 @@ def write_cell_manifest(
     config: dict[str, Any],
     replication_id: int,
     s_train: int,
+    loss_name: str,
     bundle: SplitBundle,
 ) -> None:
     manifest = {
         "replication_id": int(replication_id),
         "s_train": int(s_train),
+        "loss": str(loss_name).lower(),
         "counts": {
             "L": int(len(bundle.l_ids)),
             "V_stop": int(len(bundle.v_stop_ids)),
@@ -600,8 +637,11 @@ def cleanup_training_artifacts(output_dir: Path) -> None:
             shutil.rmtree(path)
 
 
-def train_cell(config: dict[str, Any], replication_id: int, s_train: int) -> Path:
-    output_dir = cell_dir(config, replication_id, s_train)
+def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_name: str = "var") -> Path:
+    loss_name = str(loss_name).lower()
+    if loss_name not in configured_losses(config):
+        raise ValueError(f"loss {loss_name!r} is not listed in config losses")
+    output_dir = cell_dir(config, replication_id, s_train, loss_name)
     metrics_path = output_dir / "metrics.json"
     if metrics_path.exists():
         print(f"skip_completed rep={replication_id} s={s_train} metrics={metrics_path}", flush=True)
@@ -615,7 +655,7 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int) -> Pat
     stop_df = subset_by_ids(clean, bundle.v_stop_ids, "validation_stop")
     scale_df = subset_by_ids(clean, bundle.v_scale_ids, "validation_scale")
     eval_df = subset_by_ids(clean, bundle.e_eval_ids, "eval") if len(bundle.e_eval_ids) else None
-    write_cell_manifest(output_dir, config, replication_id, s_train, bundle)
+    write_cell_manifest(output_dir, config, replication_id, s_train, loss_name, bundle)
 
     requested_batch = int(config["batch_size"])
     batch_candidates = [requested_batch]
@@ -628,6 +668,7 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int) -> Pat
         try:
             print(
                 "train_cell_start",
+                f"loss={loss_name}",
                 f"rep={replication_id}",
                 f"s={s_train}",
                 f"batch_size={batch_size}",
@@ -647,6 +688,7 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int) -> Pat
                     replication_id,
                     salt=0 if bool(config.get("common_train_seed_within_rep", True)) else int(s_train),
                 ),
+                loss_name=loss_name,
             )
             runtime["requested_batch_size"] = requested_batch
             runtime["oom_fallback_used"] = bool(used_oom_fallback)
@@ -695,7 +737,7 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int) -> Pat
         "eval_size": int(config["eval_size"]),
         "n_eff": n_effective_labeled(config),
         "model_name": config["model_name"],
-        "loss": "var",
+        "loss": loss_name,
         "population_var_y_scaled": population_var_y_scaled,
         "population_var_y_raw": float(np.var(clean[Y_COL].astype(float), ddof=1)),
         "validation_stop": prediction_metrics(stop_pred),
@@ -705,63 +747,75 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int) -> Pat
     }
     write_json(metrics_path, metrics)
     cleanup_training_artifacts(output_dir)
-    print(f"train_cell_done rep={replication_id} s={s_train} metrics={metrics_path}", flush=True)
+    print(f"train_cell_done loss={loss_name} rep={replication_id} s={s_train} metrics={metrics_path}", flush=True)
     return output_dir
 
 
 def _load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
     rows = []
     missing = []
-    for rep in config["replication_ids"]:
-        for s_train in config["s_grid"]:
-            path = cell_dir(config, int(rep), int(s_train)) / "metrics.json"
-            if not path.exists():
-                missing.append({"replication_id": int(rep), "s_train": int(s_train), "path": str(path)})
-                continue
-            with open(path, "r", encoding="utf-8") as f:
-                metrics = json.load(f)
-            row = {
-                "replication_id": int(metrics["replication_id"]),
-                "s_train": int(metrics["s_train"]),
-                "budget_B": int(metrics["budget_B"]),
-                "validation_stop_size": int(metrics.get("validation_stop_size", metrics.get("validation_size", 0))),
-                "validation_scale_size": int(metrics.get("validation_scale_size", 0)),
-                "eval_size": int(metrics["eval_size"]),
-                "n_eff": int(metrics["n_eff"]),
-                "population_var_y_scaled": float(metrics["population_var_y_scaled"]),
-                "validation_stop_residual_var": float(metrics["validation_stop"]["residual_var_scaled"]),
-                "validation_stop_residual_mean": float(metrics["validation_stop"]["residual_mean_scaled"]),
-                "validation_stop_rmse": float(metrics["validation_stop"]["rmse_scaled"]),
-                "validation_stop_corr": float(metrics["validation_stop"]["correlation"]),
-                "validation_scale_residual_var": float(metrics["validation_scale"]["residual_var_scaled"]),
-                "validation_scale_residual_mean": float(metrics["validation_scale"]["residual_mean_scaled"]),
-                "validation_scale_rmse": float(metrics["validation_scale"]["rmse_scaled"]),
-                "validation_scale_corr": float(metrics["validation_scale"]["correlation"]),
-                "actual_batch_size": int(metrics["runtime"]["actual_batch_size"]),
-                "requested_batch_size": int(metrics["runtime"]["requested_batch_size"]),
-                "oom_fallback_used": bool(metrics["runtime"]["oom_fallback_used"]),
-                "max_steps": int(metrics["runtime"]["max_steps"]),
-                "max_epochs": int(metrics["runtime"].get("max_epochs", 0)),
-                "epochs_trained": int(metrics["runtime"].get("epochs_trained", 0)),
-                "best_epoch": int(metrics["runtime"].get("best_epoch", 0)),
-                "early_stopped": bool(metrics["runtime"].get("early_stopped", False)),
-                "steps_per_epoch": int(metrics["runtime"].get("steps_per_epoch", 0)),
-                "total_train_steps": int(metrics["runtime"].get("total_train_steps", metrics["runtime"]["max_steps"])),
-                "best_validation_stop_residual_var": float(metrics["runtime"].get("best_validation_stop_residual_var", np.nan)),
-                "runtime_seconds": float(metrics["runtime"]["runtime_seconds"]),
-                "device": str(metrics["runtime"]["device"]),
-                "final_train_loss": float(metrics["runtime"]["final_train_loss"]),
-                "mean_train_loss": float(metrics["runtime"]["mean_train_loss"]),
-            }
-            if metrics.get("eval") is not None:
-                row["eval_residual_var"] = float(metrics["eval"]["residual_var_scaled"])
-                row["eval_rmse"] = float(metrics["eval"]["rmse_scaled"])
-                row["eval_corr"] = float(metrics["eval"]["correlation"])
-            rows.append(row)
+    for loss_name in configured_losses(config):
+        for rep in config["replication_ids"]:
+            for s_train in config["s_grid"]:
+                path = cell_dir(config, int(rep), int(s_train), loss_name) / "metrics.json"
+                if not path.exists():
+                    missing.append(
+                        {
+                            "loss": loss_name,
+                            "replication_id": int(rep),
+                            "s_train": int(s_train),
+                            "path": str(path),
+                        }
+                    )
+                    continue
+                with open(path, "r", encoding="utf-8") as f:
+                    metrics = json.load(f)
+                row = {
+                    "loss": str(metrics.get("loss", loss_name)).lower(),
+                    "replication_id": int(metrics["replication_id"]),
+                    "s_train": int(metrics["s_train"]),
+                    "budget_B": int(metrics["budget_B"]),
+                    "validation_stop_size": int(metrics.get("validation_stop_size", metrics.get("validation_size", 0))),
+                    "validation_scale_size": int(metrics.get("validation_scale_size", 0)),
+                    "eval_size": int(metrics["eval_size"]),
+                    "n_eff": int(metrics["n_eff"]),
+                    "population_var_y_scaled": float(metrics["population_var_y_scaled"]),
+                    "validation_stop_residual_var": float(metrics["validation_stop"]["residual_var_scaled"]),
+                    "validation_stop_residual_mean": float(metrics["validation_stop"]["residual_mean_scaled"]),
+                    "validation_stop_rmse": float(metrics["validation_stop"]["rmse_scaled"]),
+                    "validation_stop_corr": float(metrics["validation_stop"]["correlation"]),
+                    "validation_scale_residual_var": float(metrics["validation_scale"]["residual_var_scaled"]),
+                    "validation_scale_residual_mean": float(metrics["validation_scale"]["residual_mean_scaled"]),
+                    "validation_scale_rmse": float(metrics["validation_scale"]["rmse_scaled"]),
+                    "validation_scale_corr": float(metrics["validation_scale"]["correlation"]),
+                    "actual_batch_size": int(metrics["runtime"]["actual_batch_size"]),
+                    "requested_batch_size": int(metrics["runtime"]["requested_batch_size"]),
+                    "oom_fallback_used": bool(metrics["runtime"]["oom_fallback_used"]),
+                    "max_steps": int(metrics["runtime"]["max_steps"]),
+                    "max_epochs": int(metrics["runtime"].get("max_epochs", 0)),
+                    "epochs_trained": int(metrics["runtime"].get("epochs_trained", 0)),
+                    "best_epoch": int(metrics["runtime"].get("best_epoch", 0)),
+                    "early_stopped": bool(metrics["runtime"].get("early_stopped", False)),
+                    "steps_per_epoch": int(metrics["runtime"].get("steps_per_epoch", 0)),
+                    "total_train_steps": int(metrics["runtime"].get("total_train_steps", metrics["runtime"]["max_steps"])),
+                    "best_validation_stop_residual_var": float(metrics["runtime"].get("best_validation_stop_residual_var", np.nan)),
+                    "runtime_seconds": float(metrics["runtime"]["runtime_seconds"]),
+                    "device": str(metrics["runtime"]["device"]),
+                    "final_train_loss": float(metrics["runtime"]["final_train_loss"]),
+                    "mean_train_loss": float(metrics["runtime"]["mean_train_loss"]),
+                }
+                if metrics.get("eval") is not None:
+                    row["eval_residual_var"] = float(metrics["eval"]["residual_var_scaled"])
+                    row["eval_rmse"] = float(metrics["eval"]["rmse_scaled"])
+                    row["eval_corr"] = float(metrics["eval"]["correlation"])
+                rows.append(row)
     if missing:
-        missing_text = "\n".join(f"rep={m['replication_id']} s={m['s_train']} path={m['path']}" for m in missing)
+        missing_text = "\n".join(
+            f"loss={m['loss']} rep={m['replication_id']} s={m['s_train']} path={m['path']}"
+            for m in missing
+        )
         raise FileNotFoundError("missing metrics.json files:\n" + missing_text)
-    return pd.DataFrame(rows).sort_values(["replication_id", "s_train"]).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(["loss", "replication_id", "s_train"]).reset_index(drop=True)
 
 
 def _power_law(s: np.ndarray, a: float, alpha: float, b: float) -> np.ndarray:
@@ -840,8 +894,11 @@ def discrete_objective(residual_var: float, s_train: int, n_eff: int) -> float:
 
 
 def build_scaling_fits(metrics: pd.DataFrame) -> pd.DataFrame:
+    metrics = metrics.copy()
+    if "loss" not in metrics.columns:
+        metrics["loss"] = "var"
     rows = []
-    for rep, group in metrics.groupby("replication_id"):
+    for (loss_name, rep), group in metrics.groupby(["loss", "replication_id"]):
         group = group.sort_values("s_train")
         n_eff = int(group["n_eff"].iloc[0])
         population_var = float(group["population_var_y_scaled"].iloc[0])
@@ -859,6 +916,7 @@ def build_scaling_fits(metrics: pd.DataFrame) -> pd.DataFrame:
             rows.append(
                 {
                     "replication_id": int(rep),
+                    "loss": str(loss_name),
                     "source": source,
                     "a": fit["a"],
                     "alpha": fit["alpha"],
@@ -875,10 +933,13 @@ def build_scaling_fits(metrics: pd.DataFrame) -> pd.DataFrame:
                     "n_eff": n_eff,
                 }
             )
-    return pd.DataFrame(rows).sort_values(["replication_id", "source"]).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(["loss", "replication_id", "source"]).reset_index(drop=True)
 
 
 def replay_rampup(metrics: pd.DataFrame, min_points_for_stop: int = 4) -> pd.DataFrame:
+    metrics = metrics.copy()
+    if "loss" not in metrics.columns:
+        metrics["loss"] = "var"
     rows = []
     oracle_col = (
         "eval_residual_var"
@@ -886,7 +947,7 @@ def replay_rampup(metrics: pd.DataFrame, min_points_for_stop: int = 4) -> pd.Dat
         else "validation_scale_residual_var"
     )
     oracle_source = "eval" if oracle_col == "eval_residual_var" else "validation_scale"
-    for rep, group in metrics.groupby("replication_id"):
+    for (loss_name, rep), group in metrics.groupby(["loss", "replication_id"]):
         group = group.sort_values("s_train").reset_index(drop=True)
         n_eff = int(group["n_eff"].iloc[0])
         population_var = float(group["population_var_y_scaled"].iloc[0])
@@ -921,6 +982,7 @@ def replay_rampup(metrics: pd.DataFrame, min_points_for_stop: int = 4) -> pd.Dat
                 ramp_oracle_source_objective = float(oracle_objectives[ramp_s])
                 stop_record = {
                     "replication_id": int(rep),
+                    "loss": str(loss_name),
                     "oracle_source": oracle_source,
                     "stopped_stage_index": int(stage_idx + 1),
                     "stopped_current_largest_s": int(current_largest),
@@ -945,26 +1007,67 @@ def replay_rampup(metrics: pd.DataFrame, min_points_for_stop: int = 4) -> pd.Dat
         if stop_record is None:
             raise RuntimeError(f"ramp-up replay did not stop for replication {rep}")
         rows.append(stop_record)
-    return pd.DataFrame(rows).sort_values("replication_id").reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(["loss", "replication_id"]).reset_index(drop=True)
 
 
 def summarize_rampup(ramp: pd.DataFrame) -> pd.DataFrame:
-    regrets = pd.to_numeric(ramp["regret"], errors="coerce")
-    return pd.DataFrame(
-        [
-            {
-                "n_replications": int(len(ramp)),
-                "mean_regret": float(regrets.mean()),
-                "median_regret": float(regrets.median()),
-                "sd_regret": float(regrets.std(ddof=1)) if len(regrets) > 1 else 0.0,
-                "min_regret": float(regrets.min()),
-                "max_regret": float(regrets.max()),
-                "exact_oracle_match_rate": float(ramp["exact_oracle_match"].mean()),
-                "mean_ramp_s_best_seen": float(ramp["ramp_s_best_seen"].mean()),
-                "mean_oracle_s": float(ramp["oracle_s"].mean()),
-            }
-        ]
+    rows = []
+    group_keys = ["loss"] if "loss" in ramp.columns else [lambda _: "all"]
+    for key, group in ramp.groupby(group_keys, dropna=False):
+        regrets = pd.to_numeric(group["regret"], errors="coerce")
+        row = {
+            "n_replications": int(len(group)),
+            "mean_regret": float(regrets.mean()),
+            "median_regret": float(regrets.median()),
+            "sd_regret": float(regrets.std(ddof=1)) if len(regrets) > 1 else 0.0,
+            "min_regret": float(regrets.min()),
+            "max_regret": float(regrets.max()),
+            "exact_oracle_match_rate": float(group["exact_oracle_match"].mean()),
+            "mean_ramp_s_best_seen": float(group["ramp_s_best_seen"].mean()),
+            "mean_oracle_s": float(group["oracle_s"].mean()),
+        }
+        if "loss" in ramp.columns:
+            row["loss"] = str(key[0] if isinstance(key, tuple) else key)
+        rows.append(row)
+    cols = ["loss"] + [c for c in rows[0] if c != "loss"] if rows and "loss" in rows[0] else None
+    return pd.DataFrame(rows)[cols] if cols else pd.DataFrame(rows)
+
+
+def build_loss_comparison_summary(metrics: pd.DataFrame) -> pd.DataFrame:
+    metrics = metrics.copy()
+    if "loss" not in metrics.columns:
+        metrics["loss"] = "var"
+    value_cols = [
+        "validation_scale_residual_var",
+        "validation_scale_rmse",
+        "validation_scale_corr",
+        "eval_residual_var",
+        "eval_rmse",
+        "eval_corr",
+        "epochs_trained",
+        "best_epoch",
+        "runtime_seconds",
+    ]
+    present = [col for col in value_cols if col in metrics.columns]
+    summary = (
+        metrics.groupby(["loss", "s_train"], as_index=False)[present]
+        .mean(numeric_only=True)
+        .sort_values(["loss", "s_train"])
+        .reset_index(drop=True)
     )
+    if set(metrics["loss"].unique()) >= {"mse", "var"}:
+        wide = summary.pivot(index="s_train", columns="loss", values="validation_scale_residual_var")
+        if {"mse", "var"}.issubset(wide.columns):
+            deltas = pd.DataFrame(
+                {
+                    "loss": "mse_minus_var",
+                    "s_train": wide.index.astype(int),
+                    "validation_scale_residual_var": (wide["mse"] - wide["var"]).to_numpy(),
+                    "validation_scale_relative_delta": ((wide["mse"] - wide["var"]) / wide["var"]).to_numpy(),
+                }
+            )
+            summary = pd.concat([summary, deltas], ignore_index=True, sort=False)
+    return summary
 
 
 def leakage_check(clean: pd.DataFrame, config: dict[str, Any]) -> dict[str, Any]:
@@ -1015,30 +1118,72 @@ def write_figures(metrics: pd.DataFrame, scaling: pd.DataFrame, ramp: pd.DataFra
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_pdf import PdfPages
 
+    metrics = metrics.copy()
+    scaling = scaling.copy()
+    ramp = ramp.copy()
+    if "loss" not in metrics.columns:
+        metrics["loss"] = "var"
+    if "loss" not in scaling.columns:
+        scaling["loss"] = "var"
+    if "loss" not in ramp.columns:
+        ramp["loss"] = "var"
+
     s_grid = np.sort(metrics["s_train"].unique())
     with PdfPages(output_dir / "scaling_law_full_grid.pdf") as pdf:
         sources = [("validation_scale", "validation_scale_residual_var")]
         if "eval_residual_var" in metrics.columns and metrics["eval_residual_var"].notna().any():
             sources.append(("eval", "eval_residual_var"))
-        for source, col in sources:
+        for loss_name in sorted(metrics["loss"].unique()):
+            loss_metrics = metrics[metrics["loss"] == loss_name]
+            for source, col in sources:
+                if col not in loss_metrics.columns or loss_metrics[col].isna().all():
+                    continue
+                fig, ax = plt.subplots(figsize=(8, 5))
+                for rep, group in loss_metrics.groupby("replication_id"):
+                    group = group.sort_values("s_train")
+                    ax.plot(group["s_train"], group[col], marker="o", alpha=0.35, label=f"rep {rep}" if rep == 0 else None)
+                    fit_row = scaling[
+                        (scaling["loss"] == loss_name)
+                        & (scaling["replication_id"] == rep)
+                        & (scaling["source"] == source)
+                    ].iloc[0]
+                    dense = np.linspace(float(s_grid.min()), float(s_grid.max()), 200)
+                    ax.plot(dense, _power_law(dense, fit_row["a"], fit_row["alpha"], fit_row["b"]), alpha=0.25)
+                ax.set_title(f"{loss_name} {source} residual variance scaling law")
+                ax.set_xlabel("training size s")
+                ax.set_ylabel("scaled residual variance")
+                ax.grid(True, alpha=0.25)
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+
+    comparison_sources = [("validation_scale", "validation_scale_residual_var")]
+    if "eval_residual_var" in metrics.columns and metrics["eval_residual_var"].notna().any():
+        comparison_sources.append(("eval", "eval_residual_var"))
+    with PdfPages(output_dir / "loss_comparison_residual_variance.pdf") as pdf:
+        for source, col in comparison_sources:
+            if col not in metrics.columns or metrics[col].isna().all():
+                continue
             fig, ax = plt.subplots(figsize=(8, 5))
-            for rep, group in metrics.groupby("replication_id"):
-                group = group.sort_values("s_train")
-                ax.plot(group["s_train"], group[col], marker="o", alpha=0.35, label=f"rep {rep}" if rep == 0 else None)
-                fit_row = scaling[(scaling["replication_id"] == rep) & (scaling["source"] == source)].iloc[0]
-                dense = np.linspace(float(s_grid.min()), float(s_grid.max()), 200)
-                ax.plot(dense, _power_law(dense, fit_row["a"], fit_row["alpha"], fit_row["b"]), alpha=0.25)
-            ax.set_title(f"{source} residual variance scaling law")
+            for loss_name, loss_group in metrics.groupby("loss"):
+                loss_group = loss_group.sort_values("s_train")
+                for _, rep_group in loss_group.groupby("replication_id"):
+                    rep_group = rep_group.sort_values("s_train")
+                    ax.plot(rep_group["s_train"], rep_group[col], alpha=0.18)
+                mean_curve = loss_group.groupby("s_train", as_index=False)[col].mean()
+                ax.plot(mean_curve["s_train"], mean_curve[col], marker="o", linewidth=2.5, label=f"{loss_name} mean")
+            ax.set_title(f"{source} residual variance by loss")
             ax.set_xlabel("training size s")
             ax.set_ylabel("scaled residual variance")
             ax.grid(True, alpha=0.25)
+            ax.legend()
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
 
     with PdfPages(output_dir / "rampup_stagewise_fits.pdf") as pdf:
         for _, ramp_row in ramp.iterrows():
             rep = int(ramp_row["replication_id"])
-            group = metrics[metrics["replication_id"] == rep].sort_values("s_train")
+            loss_name = str(ramp_row["loss"])
+            group = metrics[(metrics["loss"] == loss_name) & (metrics["replication_id"] == rep)].sort_values("s_train")
             observed_sizes = [int(x) for x in str(ramp_row["observed_train_sizes"]).split(",") if x]
             observed = group[group["s_train"].isin(observed_sizes)]
             dense = np.linspace(float(group["s_train"].min()), float(group["s_train"].max()), 200)
@@ -1064,7 +1209,7 @@ def write_figures(metrics: pd.DataFrame, scaling: pd.DataFrame, ramp: pd.DataFra
                 linestyle=":",
                 label=f"{ramp_row['oracle_source']} oracle",
             )
-            ax.set_title(f"rep {rep} ramp-up replay")
+            ax.set_title(f"{loss_name} rep {rep} ramp-up replay")
             ax.set_xlabel("training size s")
             ax.set_ylabel("V_scale residual variance")
             ax.grid(True, alpha=0.25)
@@ -1099,6 +1244,8 @@ def aggregate(config: dict[str, Any]) -> Path:
     ramp.to_csv(output_dir / "rampup_recovery_by_rep.csv", index=False)
     ramp_summary = summarize_rampup(ramp)
     ramp_summary.to_csv(output_dir / "rampup_recovery_summary.csv", index=False)
+    loss_summary = build_loss_comparison_summary(metrics)
+    loss_summary.to_csv(output_dir / "loss_comparison_summary.csv", index=False)
     write_figures(metrics, scaling, ramp, output_dir)
     print(f"aggregate_done output_dir={output_dir}", flush=True)
     print(ramp_summary.to_string(index=False), flush=True)
@@ -1116,6 +1263,21 @@ def task_index_to_rep_s(config: dict[str, Any], task_index: int) -> tuple[int, i
     return rep, s_train
 
 
+def task_index_to_loss_rep_s(config: dict[str, Any], task_index: int) -> tuple[str, int, int]:
+    losses = configured_losses(config)
+    s_grid = [int(x) for x in config["s_grid"]]
+    reps = [int(x) for x in config["replication_ids"]]
+    cells_per_loss = len(s_grid) * len(reps)
+    total = len(losses) * cells_per_loss
+    if task_index < 0 or task_index >= total:
+        raise ValueError(f"task_index must be in [0, {total - 1}]")
+    loss_name = losses[task_index // cells_per_loss]
+    within_loss = task_index % cells_per_loss
+    rep = reps[within_loss // len(s_grid)]
+    s_train = s_grid[within_loss % len(s_grid)]
+    return loss_name, rep, s_train
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Wine Reviews LoRA-Var scaling-law experiment.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1125,6 +1287,7 @@ def parse_args() -> argparse.Namespace:
     train_group = train_parser.add_mutually_exclusive_group(required=True)
     train_group.add_argument("--task-index", type=int)
     train_group.add_argument("--rep-s", nargs=2, type=int, metavar=("REP", "S"))
+    train_parser.add_argument("--loss", choices=["var", "mse"])
 
     aggregate_parser = subparsers.add_parser("aggregate")
     aggregate_parser.add_argument("--config", required=True)
@@ -1136,10 +1299,11 @@ def main() -> None:
     config = load_config(args.config)
     if args.command == "train-cell":
         if args.task_index is not None:
-            rep, s_train = task_index_to_rep_s(config, args.task_index)
+            loss_name, rep, s_train = task_index_to_loss_rep_s(config, args.task_index)
         else:
             rep, s_train = int(args.rep_s[0]), int(args.rep_s[1])
-        train_cell(config, rep, s_train)
+            loss_name = args.loss or configured_losses(config)[0]
+        train_cell(config, rep, s_train, loss_name=loss_name)
     elif args.command == "aggregate":
         aggregate(config)
     else:

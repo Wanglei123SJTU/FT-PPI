@@ -6,14 +6,18 @@ import pandas as pd
 from src.experiments.wine_var_scaling_law import (
     SplitBundle,
     build_replication_splits,
+    configured_losses,
     discrete_objective,
     fit_scaling_law,
     max_steps_for_s,
+    mse_loss_from_residuals,
     raw_y,
     replay_rampup,
     scaled_y,
+    task_index_to_loss_rep_s,
     task_index_to_rep_s,
     train_ids_for_s,
+    training_loss_from_residuals,
     validate_split_bundle,
     var_loss_from_residuals,
 )
@@ -91,8 +95,12 @@ def test_fixed_label_scaling_round_trips():
 
 def test_var_loss_matches_batch_residual_variance_mean_form():
     residual = np.array([1.0, 2.0, 4.0, 5.0])
-    expected = np.mean((residual - residual.mean()) ** 2)
-    assert np.isclose(var_loss_from_residuals(residual), expected)
+    expected_var = np.mean((residual - residual.mean()) ** 2)
+    expected_mse = np.mean(residual**2)
+    assert np.isclose(var_loss_from_residuals(residual), expected_var)
+    assert np.isclose(mse_loss_from_residuals(residual), expected_mse)
+    assert np.isclose(training_loss_from_residuals(residual, "var"), expected_var)
+    assert np.isclose(training_loss_from_residuals(residual, "mse"), expected_mse)
 
 
 def test_max_steps_uses_actual_batch_size():
@@ -107,6 +115,14 @@ def test_task_index_mapping():
     assert task_index_to_rep_s(config, 9) == (0, 1000)
     assert task_index_to_rep_s(config, 10) == (1, 100)
     assert task_index_to_rep_s(config, 29) == (2, 1000)
+
+    loss_config = dict(config)
+    loss_config["losses"] = ["var", "mse"]
+    assert configured_losses(loss_config) == ["var", "mse"]
+    assert task_index_to_loss_rep_s(loss_config, 0) == ("var", 0, 100)
+    assert task_index_to_loss_rep_s(loss_config, 29) == ("var", 2, 1000)
+    assert task_index_to_loss_rep_s(loss_config, 30) == ("mse", 0, 100)
+    assert task_index_to_loss_rep_s(loss_config, 59) == ("mse", 2, 1000)
 
 
 def test_scaling_law_fit_respects_bounds_on_synthetic_curve():
