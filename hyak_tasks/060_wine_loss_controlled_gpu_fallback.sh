@@ -32,36 +32,92 @@ sinfo -o "%20P %18G %8D %8t %10C %10m %N" | grep -Ei 'gpu|ckpt|h200|a100|a40|l40
 squeue -u "$USER" || true
 
 echo "== SUBMIT WINE LOSS CONTROLLED ARRAY ON BEST IDLE GPU =="
-gpu_args=$(HYAK_GPU_MIN_IDLE="${HYAK_GPU_MIN_IDLE:-8}" bash scripts/choose_hyak_gpu.sh)
-echo "GPU_ARGS=$gpu_args"
-gpu_partition=$(printf '%s\n' "$gpu_args" | tr ' ' '\n' | awk -F= '$1 == "--partition" {print $2}' | tail -1)
-gpu_gres=$(printf '%s\n' "$gpu_args" | tr ' ' '\n' | awk -F= '$1 == "--gres" {print $2}' | tail -1)
-if [ -z "$gpu_partition" ] || [ -z "$gpu_gres" ]; then
-  echo "Could not parse partition/gres from GPU_ARGS=$gpu_args"
-  exit 1
-fi
-PINNED_SBATCH="$SCRATCH_ROOT/logs/wine-lossctrl-${HYAK_RUNNER_TASK_ID:-manual}-$(date +%Y%m%d_%H%M%S).sbatch"
-{
-  echo "#!/bin/bash"
-  echo "#SBATCH --partition=$gpu_partition"
-  echo "#SBATCH --gres=$gpu_gres"
-  tail -n +2 slurm/run_wine_loss_controlled_b10000.sbatch
-} > "$PINNED_SBATCH"
-chmod +x "$PINNED_SBATCH"
-echo "PINNED_SBATCH=$PINNED_SBATCH"
-echo "Trying: sbatch $PINNED_SBATCH"
-set +e
-submit_output=$(sbatch "$PINNED_SBATCH" 2>&1)
-submit_status=$?
-set -e
-echo "$submit_output"
+MIN_IDLE="${HYAK_GPU_MIN_IDLE:-8}"
+GPU_CANDIDATES=()
+GPU_CANDIDATE_KEYS=""
 
-if [ "$submit_status" -ne 0 ]; then
-  echo "Best-idle GPU submit failed; falling back to ckpt gpu:1."
-  gpu_args="--partition=ckpt --gres=gpu:a40:1"
-  gpu_partition="ckpt"
-  gpu_gres="gpu:a40:1"
-  PINNED_SBATCH="$SCRATCH_ROOT/logs/wine-lossctrl-${HYAK_RUNNER_TASK_ID:-manual}-fallback-$(date +%Y%m%d_%H%M%S).sbatch"
+idle_gpu_count() {
+  local partition="$1"
+  local gpu_type="$2"
+  sinfo -h -p "$partition" -o "%G|%D|%t" 2>/dev/null | awk -F'|' -v gpu="gpu:${gpu_type}:" '
+    index($1, gpu) > 0 && $3 ~ /^idle/ {
+      per_node = 0
+      n = split($1, parts, ":")
+      if (n >= 3) {
+        per_node = parts[3] + 0
+      }
+      total += ($2 + 0) * per_node
+    }
+    END { print total + 0 }
+  '
+}
+
+add_candidate() {
+  local partition="$1"
+  local gres="$2"
+  local reason="$3"
+  local key="${partition} ${gres}"
+  case " $GPU_CANDIDATE_KEYS " in
+    *" $key "*) return 0 ;;
+  esac
+  GPU_CANDIDATE_KEYS="$GPU_CANDIDATE_KEYS $key"
+  GPU_CANDIDATES+=("${partition}|${gres}|${reason}")
+}
+
+add_candidate_from_args() {
+  local args="$1"
+  local reason="$2"
+  local partition gres
+  partition=$(printf '%s\n' "$args" | tr ' ' '\n' | awk -F= '$1 == "--partition" {print $2}' | tail -1)
+  gres=$(printf '%s\n' "$args" | tr ' ' '\n' | awk -F= '$1 == "--gres" {print $2}' | tail -1)
+  if [ -n "$partition" ] && [ -n "$gres" ]; then
+    add_candidate "$partition" "$gres" "$reason"
+  fi
+}
+
+add_candidate_if_idle() {
+  local partition="$1"
+  local gres="$2"
+  local gpu_type="$3"
+  local count
+  count="$(idle_gpu_count "$partition" "$gpu_type")"
+  if [ "$count" -ge "$MIN_IDLE" ]; then
+    add_candidate "$partition" "$gres" "idle_${gpu_type}_${partition}_${count}"
+  fi
+}
+
+gpu_args=$(HYAK_GPU_MIN_IDLE="$MIN_IDLE" bash scripts/choose_hyak_gpu.sh)
+echo "GPU_ARGS=$gpu_args"
+add_candidate_from_args "$gpu_args" "choose_hyak_gpu"
+add_candidate_if_idle "gpu-h200" "gpu:h200:1" "h200"
+add_candidate_if_idle "ckpt-g2" "gpu:h200:1" "h200"
+add_candidate_if_idle "ckpt-all" "gpu:h200:1" "h200"
+add_candidate_if_idle "gpu-a100" "gpu:a100:1" "a100"
+add_candidate_if_idle "ckpt" "gpu:a100:1" "a100"
+add_candidate_if_idle "ckpt-all" "gpu:a100:1" "a100"
+add_candidate_if_idle "gpu-l40s" "gpu:l40s:1" "l40s"
+add_candidate_if_idle "ckpt-g2" "gpu:l40s:1" "l40s"
+add_candidate_if_idle "ckpt-all" "gpu:l40s:1" "l40s"
+add_candidate_if_idle "gpu-l40" "gpu:l40:1" "l40"
+add_candidate_if_idle "ckpt-g2" "gpu:l40:1" "l40"
+add_candidate_if_idle "ckpt-all" "gpu:l40:1" "l40"
+add_candidate_if_idle "gpu-a40" "gpu:a40:1" "a40"
+add_candidate_if_idle "ckpt" "gpu:a40:1" "a40"
+add_candidate_if_idle "ckpt-all" "gpu:a40:1" "a40"
+add_candidate "ckpt" "gpu:a40:1" "last_resort"
+
+echo "GPU_CANDIDATES:"
+printf '  %s\n' "${GPU_CANDIDATES[@]}"
+
+submit_output=""
+submit_status=1
+gpu_partition=""
+gpu_gres=""
+gpu_reason=""
+for candidate in "${GPU_CANDIDATES[@]}"; do
+  IFS='|' read -r gpu_partition gpu_gres gpu_reason <<< "$candidate"
+  gpu_gres_safe="${gpu_gres//:/_}"
+  PINNED_SBATCH="$SCRATCH_ROOT/logs/wine-lossctrl-${HYAK_RUNNER_TASK_ID:-manual}-${gpu_partition}-${gpu_gres_safe}-$(date +%Y%m%d_%H%M%S).sbatch"
   {
     echo "#!/bin/bash"
     echo "#SBATCH --partition=$gpu_partition"
@@ -70,15 +126,21 @@ if [ "$submit_status" -ne 0 ]; then
   } > "$PINNED_SBATCH"
   chmod +x "$PINNED_SBATCH"
   echo "PINNED_SBATCH=$PINNED_SBATCH"
+  echo "Trying candidate: partition=$gpu_partition gres=$gpu_gres reason=$gpu_reason"
   set +e
   submit_output=$(sbatch "$PINNED_SBATCH" 2>&1)
   submit_status=$?
   set -e
   echo "$submit_output"
-  if [ "$submit_status" -ne 0 ]; then
-    echo "Wine loss controlled fallback submit failed."
-    exit 1
+  if [ "$submit_status" -eq 0 ]; then
+    break
   fi
+  echo "candidate_submit_failed partition=$gpu_partition gres=$gpu_gres reason=$gpu_reason"
+done
+
+if [ "$submit_status" -ne 0 ]; then
+  echo "Wine loss controlled submit failed for all GPU candidates."
+  exit 1
 fi
 
 JOB_ID=$(printf '%s\n' "$submit_output" | awk '/Submitted batch job/ {print $4}' | tail -1)
@@ -87,7 +149,7 @@ if [ -z "$JOB_ID" ]; then
   exit 1
 fi
 echo "JOB_ID=$JOB_ID"
-echo "JOB_PROFILE=$gpu_args"
+echo "JOB_PROFILE=--partition=$gpu_partition --gres=$gpu_gres reason=$gpu_reason"
 
 echo "== MONITOR ARRAY =="
 while squeue -j "$JOB_ID" -h >/dev/null 2>&1 && [ -n "$(squeue -j "$JOB_ID" -h)" ]; do
