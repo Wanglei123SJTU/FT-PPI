@@ -556,7 +556,8 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int) -> Pat
     validation_pred["replication_id"] = int(replication_id)
     validation_pred["s_train"] = int(s_train)
     validation_pred["split_role"] = "validation"
-    validation_pred.to_parquet(output_dir / "validation_predictions.parquet", index=False)
+    if bool(config.get("save_predictions", False)):
+        validation_pred.to_parquet(output_dir / "validation_predictions.parquet", index=False)
     eval_metrics = None
     if eval_pred is not None:
         eval_pred["replication_id"] = int(replication_id)

@@ -1,5 +1,5 @@
 input_csv: Code/wine_data.csv
-output_dir: artifacts/wine_var_scaling_b10000
+output_dir: /gscratch/scrubbed/lei0603/ft-ppi/artifacts/wine_var_scaling_b10000
 seed: 20260613
 
 budget_B: 10000
@@ -25,3 +25,4 @@ oom_fallback_batch_size: 64
 eval_batch_size: 128
 log_every: 20
 gradient_checkpointing: false
+save_predictions: false

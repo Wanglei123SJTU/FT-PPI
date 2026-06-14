@@ -6,11 +6,12 @@
 #SBATCH --mem=96G
 #SBATCH --time=06:00:00
 #SBATCH --array=0-7%4
-#SBATCH --output=logs/%x-%A_%a.out
+#SBATCH --output=/gscratch/scrubbed/lei0603/ft-ppi/logs/%x-%A_%a.out
 
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs
+mkdir -p /gscratch/scrubbed/lei0603/ft-ppi/logs
 
 module purge
 module load cuda/12.4.1
