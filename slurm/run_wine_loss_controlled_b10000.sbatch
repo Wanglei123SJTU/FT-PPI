@@ -1,7 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=wine-lossctrl
-#SBATCH --partition=ckpt
-#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
 #SBATCH --time=08:00:00
