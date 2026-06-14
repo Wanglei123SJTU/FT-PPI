@@ -35,8 +35,8 @@ def _config() -> dict:
         "budget_B": 10000,
         "validation_stop_size": 1000,
         "validation_scale_size": 1000,
-        "eval_size": 0,
-        "replication_ids": [0],
+        "eval_size": 2000,
+        "replication_ids": [0, 1, 2],
         "s_grid": [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000],
     }
 
@@ -51,7 +51,7 @@ def test_replication_splits_are_disjoint_and_nested():
     assert len(bundle.v_stop_ids) == 1000
     assert len(bundle.v_scale_ids) == 1000
     assert len(bundle.l_prime_ids) == 8000
-    assert len(bundle.e_eval_ids) == 0
+    assert len(bundle.e_eval_ids) == 2000
     assert set(bundle.e_eval_ids).isdisjoint(set(bundle.l_ids))
     assert set(bundle.v_stop_ids).issubset(set(bundle.l_ids))
     assert set(bundle.v_scale_ids).issubset(set(bundle.l_ids))
@@ -96,15 +96,17 @@ def test_var_loss_matches_batch_residual_variance_mean_form():
 
 
 def test_max_steps_uses_actual_batch_size():
-    assert max_steps_for_s(100, 128, max_epochs=12) == 12
-    assert max_steps_for_s(1000, 128, max_epochs=12) == 96
-    assert max_steps_for_s(1000, 64, max_epochs=12) == 192
+    assert max_steps_for_s(100, 256, max_epochs=20) == 20
+    assert max_steps_for_s(1000, 256, max_epochs=20) == 80
+    assert max_steps_for_s(1000, 128, max_epochs=20) == 160
 
 
 def test_task_index_mapping():
     config = _config()
     assert task_index_to_rep_s(config, 0) == (0, 100)
     assert task_index_to_rep_s(config, 9) == (0, 1000)
+    assert task_index_to_rep_s(config, 10) == (1, 100)
+    assert task_index_to_rep_s(config, 29) == (2, 1000)
 
 
 def test_scaling_law_fit_respects_bounds_on_synthetic_curve():
