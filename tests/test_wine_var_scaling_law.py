@@ -117,12 +117,12 @@ def test_task_index_mapping():
     assert task_index_to_rep_s(config, 29) == (2, 1000)
 
     loss_config = dict(config)
-    loss_config["losses"] = ["var", "mse"]
-    assert configured_losses(loss_config) == ["var", "mse"]
-    assert task_index_to_loss_rep_s(loss_config, 0) == ("var", 0, 100)
-    assert task_index_to_loss_rep_s(loss_config, 29) == ("var", 2, 1000)
-    assert task_index_to_loss_rep_s(loss_config, 30) == ("mse", 0, 100)
-    assert task_index_to_loss_rep_s(loss_config, 59) == ("mse", 2, 1000)
+    loss_config["losses"] = ["mse", "var"]
+    assert configured_losses(loss_config) == ["mse", "var"]
+    assert task_index_to_loss_rep_s(loss_config, 0) == ("mse", 0, 100)
+    assert task_index_to_loss_rep_s(loss_config, 29) == ("mse", 2, 1000)
+    assert task_index_to_loss_rep_s(loss_config, 30) == ("var", 0, 100)
+    assert task_index_to_loss_rep_s(loss_config, 59) == ("var", 2, 1000)
 
 
 def test_scaling_law_fit_respects_bounds_on_synthetic_curve():

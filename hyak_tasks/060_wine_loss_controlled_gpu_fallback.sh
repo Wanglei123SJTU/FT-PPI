@@ -161,6 +161,36 @@ while squeue -j "$JOB_ID" -h >/dev/null 2>&1 && [ -n "$(squeue -j "$JOB_ID" -h)"
     echo "--- tail $log ---"
     tail -100 "$log" || true
   done
+  echo "--- partial MSE metrics ---"
+  .venv-hyak/bin/python - <<'PY' || true
+from pathlib import Path
+import json
+import yaml
+
+with open("configs/wine_loss_controlled_b10000.yaml", "r", encoding="utf-8") as f:
+    config = yaml.safe_load(f)
+root = Path(config["output_dir"]) / "mse"
+rows = []
+for rep in config["replication_ids"]:
+    for s_train in config["s_grid"]:
+        path = root / f"rep_{int(rep):02d}" / f"s_{int(s_train):04d}" / "metrics.json"
+        if not path.exists():
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            metrics = json.load(f)
+        eval_metrics = metrics.get("eval") or {}
+        rows.append(
+            (
+                int(rep),
+                int(s_train),
+                float(metrics["validation_scale"]["residual_var_scaled"]),
+                float(eval_metrics["residual_var_scaled"]) if eval_metrics else float("nan"),
+            )
+        )
+print(f"completed_mse_cells={len(rows)}")
+for rep, s_train, val_var, eval_var in rows[:12]:
+    print(f"mse_partial rep={rep} s={s_train} validation_scale_var={val_var:.6f} eval_var={eval_var:.6f}")
+PY
   sleep 180
 done
 

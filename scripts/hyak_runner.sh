@@ -5,6 +5,13 @@ REPO_DIR="${HYAK_RUNNER_REPO_DIR:-$HOME/FT-PPI}"
 BRANCH="${HYAK_RUNNER_BRANCH:-main}"
 TASK_DIR="${HYAK_RUNNER_TASK_DIR:-hyak_tasks}"
 STATE_DIR="${HYAK_RUNNER_STATE_DIR:-.hyak_runner}"
+if [ -n "${HYAK_RUNNER_LOG_DIR:-}" ]; then
+  LOG_DIR="$HYAK_RUNNER_LOG_DIR"
+elif [ -d "/gscratch/scrubbed/$USER" ]; then
+  LOG_DIR="/gscratch/scrubbed/$USER/ft-ppi/runner_logs"
+else
+  LOG_DIR="$STATE_DIR/logs"
+fi
 POLL_SECONDS="${HYAK_RUNNER_POLL_SECONDS:-60}"
 ONCE="${HYAK_RUNNER_ONCE:-0}"
 STOP_ON_FAILURE="${HYAK_RUNNER_STOP_ON_FAILURE:-0}"
@@ -29,11 +36,12 @@ cd "$REPO_DIR" || {
   exit 1
 }
 
-mkdir -p "$STATE_DIR/done" "$STATE_DIR/failed" "$STATE_DIR/running" "$STATE_DIR/logs"
+mkdir -p "$STATE_DIR/done" "$STATE_DIR/failed" "$STATE_DIR/running" "$LOG_DIR"
 printf '%s\n' "$$" > "$STATE_DIR/runner.pid"
 
 log "runner started"
 log "repo=$REPO_DIR branch=$BRANCH task_dir=$TASK_DIR poll_seconds=$POLL_SECONDS"
+log "state_dir=$STATE_DIR log_dir=$LOG_DIR"
 
 pull_repo() {
   log "pulling origin/$BRANCH"
@@ -93,7 +101,7 @@ run_task() {
   task_path="$1"
   task_id="$(basename "$task_path" .sh)"
   started="$(date +%Y%m%d_%H%M%S)"
-  task_log="$STATE_DIR/logs/${task_id}_${started}.log"
+  task_log="$LOG_DIR/${task_id}_${started}.log"
 
   log "starting task $task_id from $task_path"
   log "task log: $task_log"

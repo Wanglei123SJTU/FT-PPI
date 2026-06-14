@@ -9,7 +9,7 @@ eval_size: 2000
 replication_ids: [0, 1, 2]
 s_grid: [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
 min_points_for_stop: 6
-losses: [var, mse]
+losses: [mse, var]
 
 model_name: Qwen/Qwen2.5-1.5B-Instruct
 max_length: 192
