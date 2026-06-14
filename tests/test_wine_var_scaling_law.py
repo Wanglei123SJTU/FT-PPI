@@ -33,10 +33,11 @@ def _config() -> dict:
     return {
         "seed": 123,
         "budget_B": 10000,
-        "validation_size": 1000,
+        "validation_stop_size": 1000,
+        "validation_scale_size": 1000,
         "eval_size": 0,
         "replication_ids": [0],
-        "s_grid": [100, 200, 400, 700, 1000, 1500, 2500, 4000],
+        "s_grid": [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000],
     }
 
 
@@ -47,11 +48,14 @@ def test_replication_splits_are_disjoint_and_nested():
     validate_split_bundle(bundle, config["s_grid"])
 
     assert len(bundle.l_ids) == 10000
-    assert len(bundle.v_ids) == 1000
-    assert len(bundle.l_prime_ids) == 9000
+    assert len(bundle.v_stop_ids) == 1000
+    assert len(bundle.v_scale_ids) == 1000
+    assert len(bundle.l_prime_ids) == 8000
     assert len(bundle.e_eval_ids) == 0
     assert set(bundle.e_eval_ids).isdisjoint(set(bundle.l_ids))
-    assert set(bundle.v_ids).issubset(set(bundle.l_ids))
+    assert set(bundle.v_stop_ids).issubset(set(bundle.l_ids))
+    assert set(bundle.v_scale_ids).issubset(set(bundle.l_ids))
+    assert set(bundle.v_stop_ids).isdisjoint(set(bundle.v_scale_ids))
 
     previous: set[int] = set()
     for s in config["s_grid"]:
@@ -64,9 +68,10 @@ def test_replication_splits_are_disjoint_and_nested():
 def test_validate_split_bundle_rejects_eval_leakage():
     bundle = SplitBundle(
         l_ids=np.array([1, 2, 3, 4]),
-        v_ids=np.array([1]),
-        l_prime_ids=np.array([2, 3, 4]),
-        train_order_ids=np.array([2, 3, 4]),
+        v_stop_ids=np.array([1]),
+        v_scale_ids=np.array([2]),
+        l_prime_ids=np.array([3, 4]),
+        train_order_ids=np.array([3, 4]),
         e_eval_ids=np.array([4, 5]),
     )
     try:
@@ -91,19 +96,19 @@ def test_var_loss_matches_batch_residual_variance_mean_form():
 
 
 def test_max_steps_uses_actual_batch_size():
-    assert max_steps_for_s(100, 128) == 60
-    assert max_steps_for_s(4000, 128) == 128
-    assert max_steps_for_s(4000, 64) == 160
+    assert max_steps_for_s(100, 128, max_epochs=12) == 12
+    assert max_steps_for_s(1000, 128, max_epochs=12) == 96
+    assert max_steps_for_s(1000, 64, max_epochs=12) == 192
 
 
 def test_task_index_mapping():
     config = _config()
     assert task_index_to_rep_s(config, 0) == (0, 100)
-    assert task_index_to_rep_s(config, 7) == (0, 4000)
+    assert task_index_to_rep_s(config, 9) == (0, 1000)
 
 
 def test_scaling_law_fit_respects_bounds_on_synthetic_curve():
-    s = np.array([100, 200, 400, 700, 1000, 1500, 2500, 4000], dtype=float)
+    s = np.array([100, 200, 300, 400, 500, 600, 700, 800, 900, 1000], dtype=float)
     y = 3.0 * s ** (-0.4) + 0.25
     fit = fit_scaling_law(s, y, population_var_y=2.0)
     assert fit["a"] > 0
@@ -114,26 +119,26 @@ def test_scaling_law_fit_respects_bounds_on_synthetic_curve():
 
 def test_rampup_replay_stops_and_uses_best_seen_not_current_largest():
     rows = []
-    s_grid = [100, 200, 400, 700, 1000, 1500, 2500, 4000]
-    validation_var = [8.0, 5.0, 3.0, 2.2, 2.4, 2.8, 3.5, 4.5]
+    s_grid = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
+    validation_var = [8.0, 5.0, 3.0, 2.2, 2.0, 2.1, 2.3, 2.6, 3.0, 3.6]
     for s, v_var in zip(s_grid, validation_var):
         rows.append(
             {
                 "replication_id": 0,
                 "s_train": s,
-                "n_eff": 9000,
+                "n_eff": 8000,
                 "population_var_y_scaled": 10.0,
-                "validation_residual_var": v_var,
+                "validation_scale_residual_var": v_var,
             }
         )
     metrics = pd.DataFrame(rows)
     ramp = replay_rampup(metrics, min_points_for_stop=4)
     assert len(ramp) == 1
     assert ramp.loc[0, "stopped_stage_index"] >= 4
-    assert ramp.loc[0, "oracle_source"] == "validation"
+    assert ramp.loc[0, "oracle_source"] == "validation_scale"
     assert ramp.loc[0, "ramp_s_best_seen"] in set(s_grid)
     assert ramp.loc[0, "oracle_s"] == min(
         s_grid,
-        key=lambda s: discrete_objective(validation_var[s_grid.index(s)], s, 9000),
+        key=lambda s: discrete_objective(validation_var[s_grid.index(s)], s, 8000),
     )
     assert ramp.loc[0, "regret"] >= 0.0

@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=wine-varscale
+#SBATCH --job-name=wine-varscale-fair
 #SBATCH --partition=ckpt
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
 #SBATCH --time=06:00:00
-#SBATCH --array=0-7%4
+#SBATCH --array=0-9%4
 #SBATCH --output=/gscratch/scrubbed/lei0603/ft-ppi/logs/%x-%A_%a.out
 
 set -euo pipefail

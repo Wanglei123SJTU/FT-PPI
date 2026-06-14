@@ -1,12 +1,13 @@
 input_csv: Code/wine_data.csv
-output_dir: /gscratch/scrubbed/lei0603/ft-ppi/artifacts/wine_var_scaling_b10000
+output_dir: /gscratch/scrubbed/lei0603/ft-ppi/artifacts/wine_var_scaling_b10000_fair_es
 seed: 20260613
 
 budget_B: 10000
-validation_size: 1000
+validation_stop_size: 1000
+validation_scale_size: 1000
 eval_size: 0
 replication_ids: [0]
-s_grid: [100, 200, 400, 700, 1000, 1500, 2500, 4000]
+s_grid: [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
 min_points_for_stop: 4
 
 model_name: Qwen/Qwen2.5-1.5B-Instruct
@@ -24,5 +25,11 @@ batch_size: 128
 oom_fallback_batch_size: 64
 eval_batch_size: 128
 log_every: 20
+log_every_epochs: 1
+max_epochs: 12
+min_epochs: 4
+early_stopping_patience: 3
+early_stopping_min_delta: 0.0
+common_train_seed_within_rep: true
 gradient_checkpointing: false
 save_predictions: false

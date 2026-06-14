@@ -25,7 +25,8 @@ Y_COL = "points"
 @dataclass(frozen=True)
 class SplitBundle:
     l_ids: np.ndarray
-    v_ids: np.ndarray
+    v_stop_ids: np.ndarray
+    v_scale_ids: np.ndarray
     l_prime_ids: np.ndarray
     train_order_ids: np.ndarray
     e_eval_ids: np.ndarray
@@ -61,27 +62,43 @@ def _rep_seed(config: dict[str, Any], replication_id: int, salt: int = 0) -> int
     return base_seed + 100_003 * int(replication_id) + int(salt)
 
 
+def validation_stop_size(config: dict[str, Any]) -> int:
+    return int(config.get("validation_stop_size", config.get("validation_size", 0)))
+
+
+def validation_scale_size(config: dict[str, Any]) -> int:
+    return int(config.get("validation_scale_size", 0))
+
+
+def n_effective_labeled(config: dict[str, Any]) -> int:
+    return int(config["budget_B"]) - validation_stop_size(config) - validation_scale_size(config)
+
+
 def build_replication_splits(clean: pd.DataFrame, config: dict[str, Any], replication_id: int) -> SplitBundle:
     l_size = int(config["budget_B"])
-    v_size = int(config["validation_size"])
+    v_stop_size = validation_stop_size(config)
+    v_scale_size = validation_scale_size(config)
     e_size = int(config["eval_size"])
     s_grid = [int(x) for x in config["s_grid"]]
-    if max(s_grid) > l_size - v_size:
-        raise ValueError("largest train size exceeds |L \\ V|")
+    if max(s_grid) > l_size - v_stop_size - v_scale_size:
+        raise ValueError("largest train size exceeds |L \\ (V_stop union V_scale)|")
     if l_size + e_size > len(clean):
         raise ValueError(f"need at least {l_size + e_size} clean rows, found {len(clean)}")
 
     rng = np.random.default_rng(_rep_seed(config, replication_id))
     all_ids = clean["sample_id"].to_numpy(dtype=np.int64)
     l_ids = rng.choice(all_ids, size=l_size, replace=False)
-    v_ids = rng.choice(l_ids, size=v_size, replace=False)
-    l_prime_ids = np.setdiff1d(l_ids, v_ids, assume_unique=False)
+    v_stop_ids = rng.choice(l_ids, size=v_stop_size, replace=False)
+    remaining_after_stop = np.setdiff1d(l_ids, v_stop_ids, assume_unique=False)
+    v_scale_ids = rng.choice(remaining_after_stop, size=v_scale_size, replace=False)
+    l_prime_ids = np.setdiff1d(remaining_after_stop, v_scale_ids, assume_unique=False)
     train_order_ids = rng.permutation(l_prime_ids)
     outside_l = np.setdiff1d(all_ids, l_ids, assume_unique=False)
     e_eval_ids = rng.choice(outside_l, size=e_size, replace=False)
     bundle = SplitBundle(
         l_ids=np.asarray(l_ids, dtype=np.int64),
-        v_ids=np.asarray(v_ids, dtype=np.int64),
+        v_stop_ids=np.asarray(v_stop_ids, dtype=np.int64),
+        v_scale_ids=np.asarray(v_scale_ids, dtype=np.int64),
         l_prime_ids=np.asarray(l_prime_ids, dtype=np.int64),
         train_order_ids=np.asarray(train_order_ids, dtype=np.int64),
         e_eval_ids=np.asarray(e_eval_ids, dtype=np.int64),
@@ -105,19 +122,26 @@ def ids_hash(ids: Iterable[int]) -> str:
 def validate_split_bundle(bundle: SplitBundle, s_grid: list[int]) -> list[str]:
     failures: list[str] = []
     l = set(map(int, bundle.l_ids))
-    v = set(map(int, bundle.v_ids))
+    v_stop = set(map(int, bundle.v_stop_ids))
+    v_scale = set(map(int, bundle.v_scale_ids))
     l_prime = set(map(int, bundle.l_prime_ids))
     e_eval = set(map(int, bundle.e_eval_ids))
     if len(l) != len(bundle.l_ids):
         failures.append("L has duplicate sample_ids")
-    if len(v) != len(bundle.v_ids):
-        failures.append("V has duplicate sample_ids")
+    if len(v_stop) != len(bundle.v_stop_ids):
+        failures.append("V_stop has duplicate sample_ids")
+    if len(v_scale) != len(bundle.v_scale_ids):
+        failures.append("V_scale has duplicate sample_ids")
     if len(e_eval) != len(bundle.e_eval_ids):
         failures.append("E_eval has duplicate sample_ids")
-    if not v.issubset(l):
-        failures.append("V is not a subset of L")
-    if l_prime != l - v:
-        failures.append("L_prime is not exactly L minus V")
+    if not v_stop.issubset(l):
+        failures.append("V_stop is not a subset of L")
+    if not v_scale.issubset(l):
+        failures.append("V_scale is not a subset of L")
+    if v_stop & v_scale:
+        failures.append("V_stop overlaps V_scale")
+    if l_prime != l - v_stop - v_scale:
+        failures.append("L_prime is not exactly L minus V_stop and V_scale")
     if e_eval & l:
         failures.append("E_eval overlaps L")
     previous: set[int] = set()
@@ -149,8 +173,12 @@ def var_loss_from_residuals(residual: Any) -> Any:
     return ((residual - residual.mean()) ** 2).mean()
 
 
-def max_steps_for_s(s_train: int, batch_size: int) -> int:
-    return min(160, max(60, 4 * math.ceil(int(s_train) / int(batch_size))))
+def steps_per_epoch_for_s(s_train: int, batch_size: int) -> int:
+    return max(1, math.ceil(int(s_train) / int(batch_size)))
+
+
+def max_steps_for_s(s_train: int, batch_size: int, max_epochs: int = 12) -> int:
+    return int(max_epochs) * steps_per_epoch_for_s(s_train, batch_size)
 
 
 def is_cuda_oom(exc: BaseException) -> bool:
@@ -284,14 +312,29 @@ def _move_batch(batch: dict[str, Any], device: Any) -> dict[str, Any]:
     return {key: value.to(device) for key, value in batch.items() if key not in {"sample_id", "y_raw"}}
 
 
+def capture_trainable_state(model: Any) -> dict[str, Any]:
+    return {
+        name: param.detach().cpu().clone()
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
+
+
+def restore_trainable_state(model: Any, state: dict[str, Any]) -> None:
+    params = dict(model.named_parameters())
+    for name, value in state.items():
+        params[name].data.copy_(value.to(device=params[name].device, dtype=params[name].dtype))
+
+
 def train_once(
     config: dict[str, Any],
     train_df: pd.DataFrame,
-    validation_df: pd.DataFrame,
+    stop_df: pd.DataFrame,
+    scale_df: pd.DataFrame,
     eval_df: pd.DataFrame | None,
     batch_size: int,
     seed: int,
-) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame | None]:
+) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
     mods = _require_training_modules()
     torch = mods["torch"]
     set_training_seeds(seed)
@@ -317,7 +360,11 @@ def train_once(
         num_workers=0,
         pin_memory=True,
     )
-    max_steps = max_steps_for_s(len(train_df), batch_size)
+    max_epochs = int(config.get("max_epochs", 12))
+    min_epochs = int(config.get("min_epochs", 4))
+    patience = int(config.get("early_stopping_patience", 3))
+    min_delta = float(config.get("early_stopping_min_delta", 0.0))
+    steps_per_epoch = steps_per_epoch_for_s(len(train_df), batch_size)
     lora_params = [p for p in model.backbone.parameters() if p.requires_grad]
     head_params = list(model.head.parameters())
     optimizer = torch.optim.AdamW(
@@ -327,35 +374,82 @@ def train_once(
         ]
     )
     losses: list[float] = []
+    epoch_history: list[dict[str, float | int | bool]] = []
     start = time.time()
-    iterator = iter(train_loader)
-    for step in range(max_steps):
-        try:
-            batch = next(iterator)
-        except StopIteration:
-            iterator = iter(train_loader)
-            batch = next(iterator)
-        inputs = _move_batch(batch, device)
-        labels = inputs.pop("labels")
-        optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            pred = model(**inputs)
-        residual = labels.float() - pred.float()
-        loss = var_loss_from_residuals(residual)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["max_grad_norm"]))
-        optimizer.step()
-        losses.append(float(loss.detach().cpu()))
-        if (step + 1) % int(config.get("log_every", 20)) == 0 or step + 1 == max_steps:
+    best_state: dict[str, Any] | None = None
+    best_stop_var = float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
+    total_steps = 0
+    early_stopped = False
+    for epoch in range(1, max_epochs + 1):
+        model.train()
+        epoch_losses = []
+        for batch in train_loader:
+            inputs = _move_batch(batch, device)
+            labels = inputs.pop("labels")
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred = model(**inputs)
+            residual = labels.float() - pred.float()
+            loss = var_loss_from_residuals(residual)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["max_grad_norm"]))
+            optimizer.step()
+            loss_value = float(loss.detach().cpu())
+            losses.append(loss_value)
+            epoch_losses.append(loss_value)
+            total_steps += 1
+
+        stop_pred = predict_frame(model, tokenizer, stop_df, config, torch, mods["DataLoader"], batch_size)
+        stop_metrics = prediction_metrics(stop_pred)
+        stop_var = float(stop_metrics["residual_var_scaled"])
+        improved = stop_var < best_stop_var - min_delta
+        if improved:
+            best_stop_var = stop_var
+            best_epoch = epoch
+            best_state = capture_trainable_state(model)
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+        epoch_history.append(
+            {
+                "epoch": int(epoch),
+                "train_loss_mean": float(np.mean(epoch_losses)) if epoch_losses else float("nan"),
+                "train_loss_last": float(epoch_losses[-1]) if epoch_losses else float("nan"),
+                "validation_stop_residual_var": stop_var,
+                "validation_stop_residual_mean": float(stop_metrics["residual_mean_scaled"]),
+                "validation_stop_rmse": float(stop_metrics["rmse_scaled"]),
+                "validation_stop_corr": float(stop_metrics["correlation"]),
+                "is_best": bool(improved),
+            }
+        )
+        if epoch % int(config.get("log_every_epochs", 1)) == 0 or epoch == max_epochs or improved:
             print(
                 "train_progress",
-                f"step={step + 1}",
-                f"max_steps={max_steps}",
-                f"loss={losses[-1]:.6f}",
+                f"epoch={epoch}",
+                f"max_epochs={max_epochs}",
+                f"steps={total_steps}",
+                f"train_loss={epoch_history[-1]['train_loss_mean']:.6f}",
+                f"v_stop_var={stop_var:.6f}",
+                f"best_epoch={best_epoch}",
                 flush=True,
             )
+        if epoch >= min_epochs and epochs_without_improvement >= patience:
+            early_stopped = True
+            print(
+                "early_stop",
+                f"epoch={epoch}",
+                f"best_epoch={best_epoch}",
+                f"best_v_stop_var={best_stop_var:.6f}",
+                flush=True,
+            )
+            break
 
-    validation_pred = predict_frame(model, tokenizer, validation_df, config, torch, mods["DataLoader"], batch_size)
+    if best_state is not None:
+        restore_trainable_state(model, best_state)
+    stop_pred = predict_frame(model, tokenizer, stop_df, config, torch, mods["DataLoader"], batch_size)
+    scale_pred = predict_frame(model, tokenizer, scale_df, config, torch, mods["DataLoader"], batch_size)
     eval_pred = (
         predict_frame(model, tokenizer, eval_df, config, torch, mods["DataLoader"], batch_size)
         if eval_df is not None and len(eval_df) > 0
@@ -364,16 +458,27 @@ def train_once(
     runtime = {
         "runtime_seconds": time.time() - start,
         "actual_batch_size": int(batch_size),
-        "max_steps": int(max_steps),
+        "max_epochs": int(max_epochs),
+        "min_epochs": int(min_epochs),
+        "early_stopping_patience": int(patience),
+        "early_stopping_min_delta": float(min_delta),
+        "epochs_trained": int(epoch_history[-1]["epoch"]) if epoch_history else 0,
+        "best_epoch": int(best_epoch),
+        "early_stopped": bool(early_stopped),
+        "steps_per_epoch": int(steps_per_epoch),
+        "total_train_steps": int(total_steps),
+        "max_steps": int(total_steps),
+        "best_validation_stop_residual_var": float(best_stop_var),
         "final_train_loss": float(losses[-1]) if losses else float("nan"),
         "mean_train_loss": float(np.mean(losses)) if losses else float("nan"),
         "device": torch.cuda.get_device_name(0),
         "torch_version": torch.__version__,
+        "epoch_history": epoch_history,
     }
     del model
     gc.collect()
     torch.cuda.empty_cache()
-    return runtime, validation_pred, eval_pred
+    return runtime, stop_pred, scale_pred, eval_pred
 
 
 def predict_frame(
@@ -460,14 +565,16 @@ def write_cell_manifest(
         "s_train": int(s_train),
         "counts": {
             "L": int(len(bundle.l_ids)),
-            "V": int(len(bundle.v_ids)),
+            "V_stop": int(len(bundle.v_stop_ids)),
+            "V_scale": int(len(bundle.v_scale_ids)),
             "L_prime": int(len(bundle.l_prime_ids)),
             "train": int(s_train),
             "E_eval": int(len(bundle.e_eval_ids)),
         },
         "hashes": {
             "L": ids_hash(bundle.l_ids),
-            "V": ids_hash(bundle.v_ids),
+            "V_stop": ids_hash(bundle.v_stop_ids),
+            "V_scale": ids_hash(bundle.v_scale_ids),
             "L_prime": ids_hash(bundle.l_prime_ids),
             "train": ids_hash(train_ids_for_s(bundle, s_train)),
             "E_eval": ids_hash(bundle.e_eval_ids),
@@ -505,7 +612,8 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int) -> Pat
     population_var_y_scaled = float(np.var(scaled_y(clean[Y_COL]), ddof=1))
     bundle = build_replication_splits(clean, config, replication_id)
     train_df = subset_by_ids(clean, train_ids_for_s(bundle, s_train), "train")
-    validation_df = subset_by_ids(clean, bundle.v_ids, "validation")
+    stop_df = subset_by_ids(clean, bundle.v_stop_ids, "validation_stop")
+    scale_df = subset_by_ids(clean, bundle.v_scale_ids, "validation_scale")
     eval_df = subset_by_ids(clean, bundle.e_eval_ids, "eval") if len(bundle.e_eval_ids) else None
     write_cell_manifest(output_dir, config, replication_id, s_train, bundle)
 
@@ -523,16 +631,22 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int) -> Pat
                 f"rep={replication_id}",
                 f"s={s_train}",
                 f"batch_size={batch_size}",
-                f"max_steps={max_steps_for_s(s_train, batch_size)}",
+                f"max_epochs={int(config.get('max_epochs', 12))}",
+                f"steps_per_epoch={steps_per_epoch_for_s(s_train, batch_size)}",
                 flush=True,
             )
-            runtime, validation_pred, eval_pred = train_once(
+            runtime, stop_pred, scale_pred, eval_pred = train_once(
                 config,
                 train_df,
-                validation_df,
+                stop_df,
+                scale_df,
                 eval_df,
                 batch_size=batch_size,
-                seed=_rep_seed(config, replication_id, salt=int(s_train)),
+                seed=_rep_seed(
+                    config,
+                    replication_id,
+                    salt=0 if bool(config.get("common_train_seed_within_rep", True)) else int(s_train),
+                ),
             )
             runtime["requested_batch_size"] = requested_batch
             runtime["oom_fallback_used"] = bool(used_oom_fallback)
@@ -553,11 +667,18 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int) -> Pat
     else:
         raise RuntimeError(f"training failed: {last_error}") from last_error
 
-    validation_pred["replication_id"] = int(replication_id)
-    validation_pred["s_train"] = int(s_train)
-    validation_pred["split_role"] = "validation"
+    stop_pred["replication_id"] = int(replication_id)
+    stop_pred["s_train"] = int(s_train)
+    stop_pred["split_role"] = "validation_stop"
+    scale_pred["replication_id"] = int(replication_id)
+    scale_pred["s_train"] = int(s_train)
+    scale_pred["split_role"] = "validation_scale"
     if bool(config.get("save_predictions", False)):
-        validation_pred.to_parquet(output_dir / "validation_predictions.parquet", index=False)
+        stop_pred.to_parquet(output_dir / "validation_stop_predictions.parquet", index=False)
+        scale_pred.to_parquet(output_dir / "validation_scale_predictions.parquet", index=False)
+    epoch_history = runtime.pop("epoch_history", [])
+    if epoch_history:
+        pd.DataFrame(epoch_history).to_csv(output_dir / "epoch_history.csv", index=False)
     eval_metrics = None
     if eval_pred is not None:
         eval_pred["replication_id"] = int(replication_id)
@@ -569,14 +690,16 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int) -> Pat
         "replication_id": int(replication_id),
         "s_train": int(s_train),
         "budget_B": int(config["budget_B"]),
-        "validation_size": int(config["validation_size"]),
+        "validation_stop_size": validation_stop_size(config),
+        "validation_scale_size": validation_scale_size(config),
         "eval_size": int(config["eval_size"]),
-        "n_eff": int(config["budget_B"]) - int(config["validation_size"]),
+        "n_eff": n_effective_labeled(config),
         "model_name": config["model_name"],
         "loss": "var",
         "population_var_y_scaled": population_var_y_scaled,
         "population_var_y_raw": float(np.var(clean[Y_COL].astype(float), ddof=1)),
-        "validation": prediction_metrics(validation_pred),
+        "validation_stop": prediction_metrics(stop_pred),
+        "validation_scale": prediction_metrics(scale_pred),
         "eval": eval_metrics,
         "runtime": runtime,
     }
@@ -601,17 +724,30 @@ def _load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
                 "replication_id": int(metrics["replication_id"]),
                 "s_train": int(metrics["s_train"]),
                 "budget_B": int(metrics["budget_B"]),
-                "validation_size": int(metrics["validation_size"]),
+                "validation_stop_size": int(metrics.get("validation_stop_size", metrics.get("validation_size", 0))),
+                "validation_scale_size": int(metrics.get("validation_scale_size", 0)),
                 "eval_size": int(metrics["eval_size"]),
                 "n_eff": int(metrics["n_eff"]),
                 "population_var_y_scaled": float(metrics["population_var_y_scaled"]),
-                "validation_residual_var": float(metrics["validation"]["residual_var_scaled"]),
-                "validation_rmse": float(metrics["validation"]["rmse_scaled"]),
-                "validation_corr": float(metrics["validation"]["correlation"]),
+                "validation_stop_residual_var": float(metrics["validation_stop"]["residual_var_scaled"]),
+                "validation_stop_residual_mean": float(metrics["validation_stop"]["residual_mean_scaled"]),
+                "validation_stop_rmse": float(metrics["validation_stop"]["rmse_scaled"]),
+                "validation_stop_corr": float(metrics["validation_stop"]["correlation"]),
+                "validation_scale_residual_var": float(metrics["validation_scale"]["residual_var_scaled"]),
+                "validation_scale_residual_mean": float(metrics["validation_scale"]["residual_mean_scaled"]),
+                "validation_scale_rmse": float(metrics["validation_scale"]["rmse_scaled"]),
+                "validation_scale_corr": float(metrics["validation_scale"]["correlation"]),
                 "actual_batch_size": int(metrics["runtime"]["actual_batch_size"]),
                 "requested_batch_size": int(metrics["runtime"]["requested_batch_size"]),
                 "oom_fallback_used": bool(metrics["runtime"]["oom_fallback_used"]),
                 "max_steps": int(metrics["runtime"]["max_steps"]),
+                "max_epochs": int(metrics["runtime"].get("max_epochs", 0)),
+                "epochs_trained": int(metrics["runtime"].get("epochs_trained", 0)),
+                "best_epoch": int(metrics["runtime"].get("best_epoch", 0)),
+                "early_stopped": bool(metrics["runtime"].get("early_stopped", False)),
+                "steps_per_epoch": int(metrics["runtime"].get("steps_per_epoch", 0)),
+                "total_train_steps": int(metrics["runtime"].get("total_train_steps", metrics["runtime"]["max_steps"])),
+                "best_validation_stop_residual_var": float(metrics["runtime"].get("best_validation_stop_residual_var", np.nan)),
                 "runtime_seconds": float(metrics["runtime"]["runtime_seconds"]),
                 "device": str(metrics["runtime"]["device"]),
                 "final_train_loss": float(metrics["runtime"]["final_train_loss"]),
@@ -709,7 +845,7 @@ def build_scaling_fits(metrics: pd.DataFrame) -> pd.DataFrame:
         group = group.sort_values("s_train")
         n_eff = int(group["n_eff"].iloc[0])
         population_var = float(group["population_var_y_scaled"].iloc[0])
-        sources = [("validation", "validation_residual_var")]
+        sources = [("validation_scale", "validation_scale_residual_var")]
         if "eval_residual_var" in group.columns and group["eval_residual_var"].notna().any():
             sources.append(("eval", "eval_residual_var"))
         for source, col in sources:
@@ -747,9 +883,9 @@ def replay_rampup(metrics: pd.DataFrame, min_points_for_stop: int = 4) -> pd.Dat
     oracle_col = (
         "eval_residual_var"
         if "eval_residual_var" in metrics.columns and metrics["eval_residual_var"].notna().any()
-        else "validation_residual_var"
+        else "validation_scale_residual_var"
     )
-    oracle_source = "eval" if oracle_col == "eval_residual_var" else "validation"
+    oracle_source = "eval" if oracle_col == "eval_residual_var" else "validation_scale"
     for rep, group in metrics.groupby("replication_id"):
         group = group.sort_values("s_train").reset_index(drop=True)
         n_eff = int(group["n_eff"].iloc[0])
@@ -768,7 +904,7 @@ def replay_rampup(metrics: pd.DataFrame, min_points_for_stop: int = 4) -> pd.Dat
                 continue
             fit = fit_scaling_law(
                 observed["s_train"].to_numpy(),
-                observed["validation_residual_var"].to_numpy(),
+                observed["validation_scale_residual_var"].to_numpy(),
                 population_var,
             )
             optimum = fitted_optimum(fit, n_eff)
@@ -844,13 +980,15 @@ def leakage_check(clean: pd.DataFrame, config: dict[str, Any]) -> dict[str, Any]
                     "replication_id": int(rep),
                     "counts": {
                         "L": len(bundle.l_ids),
-                        "V": len(bundle.v_ids),
+                        "V_stop": len(bundle.v_stop_ids),
+                        "V_scale": len(bundle.v_scale_ids),
                         "L_prime": len(bundle.l_prime_ids),
                         "E_eval": len(bundle.e_eval_ids),
                     },
                     "hashes": {
                         "L": ids_hash(bundle.l_ids),
-                        "V": ids_hash(bundle.v_ids),
+                        "V_stop": ids_hash(bundle.v_stop_ids),
+                        "V_scale": ids_hash(bundle.v_scale_ids),
                         "L_prime": ids_hash(bundle.l_prime_ids),
                         "E_eval": ids_hash(bundle.e_eval_ids),
                     },
@@ -879,7 +1017,7 @@ def write_figures(metrics: pd.DataFrame, scaling: pd.DataFrame, ramp: pd.DataFra
 
     s_grid = np.sort(metrics["s_train"].unique())
     with PdfPages(output_dir / "scaling_law_full_grid.pdf") as pdf:
-        sources = [("validation", "validation_residual_var")]
+        sources = [("validation_scale", "validation_scale_residual_var")]
         if "eval_residual_var" in metrics.columns and metrics["eval_residual_var"].notna().any():
             sources.append(("eval", "eval_residual_var"))
         for source, col in sources:
@@ -905,13 +1043,20 @@ def write_figures(metrics: pd.DataFrame, scaling: pd.DataFrame, ramp: pd.DataFra
             observed = group[group["s_train"].isin(observed_sizes)]
             dense = np.linspace(float(group["s_train"].min()), float(group["s_train"].max()), 200)
             fig, ax = plt.subplots(figsize=(8, 5))
-            ax.plot(group["s_train"], group["validation_residual_var"], marker="o", label="validation full grid")
+            ax.plot(group["s_train"], group["validation_scale_residual_var"], marker="o", label="V_scale full grid")
             ax.plot(
                 dense,
                 _power_law(dense, ramp_row["fit_a"], ramp_row["fit_alpha"], ramp_row["fit_b"]),
                 label="stagewise fit at stop",
             )
-            ax.scatter(observed["s_train"], observed["validation_residual_var"], s=80, facecolors="none", edgecolors="black", label="observed before stop")
+            ax.scatter(
+                observed["s_train"],
+                observed["validation_scale_residual_var"],
+                s=80,
+                facecolors="none",
+                edgecolors="black",
+                label="observed before stop",
+            )
             ax.axvline(ramp_row["ramp_s_best_seen"], color="tab:green", linestyle="--", label="ramp selected")
             ax.axvline(
                 ramp_row["oracle_s"],
@@ -921,7 +1066,7 @@ def write_figures(metrics: pd.DataFrame, scaling: pd.DataFrame, ramp: pd.DataFra
             )
             ax.set_title(f"rep {rep} ramp-up replay")
             ax.set_xlabel("training size s")
-            ax.set_ylabel("validation residual variance")
+            ax.set_ylabel("V_scale residual variance")
             ax.grid(True, alpha=0.25)
             ax.legend(fontsize=8)
             pdf.savefig(fig, bbox_inches="tight")
