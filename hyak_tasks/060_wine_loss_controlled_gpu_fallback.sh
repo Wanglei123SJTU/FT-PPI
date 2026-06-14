@@ -31,34 +31,28 @@ echo "== GPU STATUS =="
 sinfo -o "%20P %18G %8D %8t %10C %10m %N" | grep -Ei 'gpu|ckpt|h200|a100|a40|l40|rtx6k' || true
 squeue -u "$USER" || true
 
-echo "== SUBMIT WINE LOSS CONTROLLED ARRAY WITH START-TIME FALLBACK =="
-submit_output=""
-submit_status=1
-job_profile=""
+echo "== SUBMIT WINE LOSS CONTROLLED ARRAY ON BEST IDLE GPU =="
+gpu_args=$(HYAK_GPU_MIN_IDLE="${HYAK_GPU_MIN_IDLE:-8}" bash scripts/choose_hyak_gpu.sh)
+echo "GPU_ARGS=$gpu_args"
+echo "Trying: sbatch $gpu_args slurm/run_wine_loss_controlled_b10000.sbatch"
+set +e
+submit_output=$(sbatch $gpu_args slurm/run_wine_loss_controlled_b10000.sbatch 2>&1)
+submit_status=$?
+set -e
+echo "$submit_output"
 
-for args in \
-  "--immediate=120 --partition=ckpt-g2 --gres=gpu:h200:1" \
-  "--immediate=120 --partition=gpu-h200 --gres=gpu:h200:1" \
-  "--immediate=120 --partition=ckpt --gres=gpu:l40s:1" \
-  "--immediate=120 --partition=ckpt --gres=gpu:a40:1" \
-  "--immediate=120 --partition=ckpt --gres=gpu:rtx6k:1" \
-  "--partition=ckpt --gres=gpu:1"
-do
-  echo "Trying: sbatch $args slurm/run_wine_loss_controlled_b10000.sbatch"
+if [ "$submit_status" -ne 0 ]; then
+  echo "Best-idle GPU submit failed; falling back to ckpt gpu:1."
+  gpu_args="--partition=ckpt --gres=gpu:1"
   set +e
-  submit_output=$(sbatch $args slurm/run_wine_loss_controlled_b10000.sbatch 2>&1)
+  submit_output=$(sbatch $gpu_args slurm/run_wine_loss_controlled_b10000.sbatch 2>&1)
   submit_status=$?
   set -e
   echo "$submit_output"
-  if [ "$submit_status" -eq 0 ]; then
-    job_profile="$args"
-    break
+  if [ "$submit_status" -ne 0 ]; then
+    echo "Wine loss controlled fallback submit failed."
+    exit 1
   fi
-done
-
-if [ "$submit_status" -ne 0 ]; then
-  echo "All wine loss controlled submit attempts failed."
-  exit 1
 fi
 
 JOB_ID=$(printf '%s\n' "$submit_output" | awk '/Submitted batch job/ {print $4}' | tail -1)
@@ -67,7 +61,7 @@ if [ -z "$JOB_ID" ]; then
   exit 1
 fi
 echo "JOB_ID=$JOB_ID"
-echo "JOB_PROFILE=$job_profile"
+echo "JOB_PROFILE=$gpu_args"
 
 echo "== MONITOR ARRAY =="
 while squeue -j "$JOB_ID" -h >/dev/null 2>&1 && [ -n "$(squeue -j "$JOB_ID" -h)" ]; do

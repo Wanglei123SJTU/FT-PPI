@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
 #SBATCH --time=08:00:00
-#SBATCH --array=0-59%4
+#SBATCH --array=0-59%8
 #SBATCH --output=/gscratch/scrubbed/lei0603/ft-ppi/logs/%x-%A_%a.out
 
 set -euo pipefail
@@ -30,6 +30,7 @@ export TORCH_HOME="${TORCH_HOME:-$CACHE_ROOT/torch}"
 export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-$CACHE_ROOT/conda_pkgs}"
 export WANDB_DISABLED="${WANDB_DISABLED:-true}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 if [ ! -x "$VENV_DIR/bin/python" ]; then
   echo "Missing $VENV_DIR. Run: bash scripts/setup_hyak_env.sh"

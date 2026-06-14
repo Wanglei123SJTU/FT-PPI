@@ -662,7 +662,7 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_n
     fallback_batch = int(config.get("oom_fallback_batch_size", 64))
     if fallback_batch != requested_batch:
         batch_candidates.append(fallback_batch)
-    last_error: BaseException | None = None
+    last_error: str | None = None
     used_oom_fallback = False
     for batch_size in batch_candidates:
         try:
@@ -694,20 +694,23 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_n
             runtime["oom_fallback_used"] = bool(used_oom_fallback)
             break
         except RuntimeError as exc:
-            last_error = exc
+            last_error = repr(exc)
             if not is_cuda_oom(exc) or batch_size == batch_candidates[-1]:
                 raise
             used_oom_fallback = True
             print(f"cuda_oom_retry rep={replication_id} s={s_train} next_batch={fallback_batch}", flush=True)
+            exc.__traceback__ = None
+            del exc
             gc.collect()
             try:
                 import torch
 
                 torch.cuda.empty_cache()
-            except ImportError:
+                torch.cuda.ipc_collect()
+            except Exception:
                 pass
     else:
-        raise RuntimeError(f"training failed: {last_error}") from last_error
+        raise RuntimeError(f"training failed: {last_error}")
 
     stop_pred["replication_id"] = int(replication_id)
     stop_pred["s_train"] = int(s_train)

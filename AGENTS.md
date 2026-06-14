@@ -86,6 +86,7 @@ If a task discovers that a previous job actually completed after a runner discon
 - Avoid writing large unnecessary artifacts. Hyak storage and quota pressure can become a bottleneck; save only the outputs needed for verification or follow-up work.
 - Slurm scripts should write logs to a predictable `logs/` path and artifacts to a predictable `artifacts/<run_name>/` path.
 - If the local runner tail disconnects, do not assume the job failed. Reconnect or inspect remote `.hyak_runner/runner.out`, `.hyak_runner/logs/`, Slurm logs, `squeue`, and `sacct`.
+- Before submitting GPU jobs, first inspect currently idle GPU resources and choose the best idle type rather than waiting indefinitely for one preferred model. Use `scripts/choose_hyak_gpu.sh` when possible. The default priority is `H200 > A100 > L40S > L40 > A40 > RTX6000 > 2080Ti/P100`; use a bare `--gres=gpu:1` only as a last-resort fallback.
 
 ## GitHub and Runner Interaction
 
