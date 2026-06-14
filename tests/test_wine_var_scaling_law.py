@@ -7,6 +7,7 @@ from src.experiments.wine_var_scaling_law import (
     SplitBundle,
     build_replication_splits,
     configured_losses,
+    configured_methods,
     discrete_objective,
     fit_scaling_law,
     max_steps_for_s,
@@ -14,6 +15,7 @@ from src.experiments.wine_var_scaling_law import (
     raw_y,
     replay_rampup,
     scaled_y,
+    stopping_value_from_metrics,
     task_index_to_loss_rep_s,
     task_index_to_rep_s,
     train_ids_for_s,
@@ -103,6 +105,12 @@ def test_var_loss_matches_batch_residual_variance_mean_form():
     assert np.isclose(training_loss_from_residuals(residual, "mse"), expected_mse)
 
 
+def test_stopping_value_can_use_variance_or_mse():
+    metrics = {"residual_var_scaled": 2.0, "rmse_scaled": 3.0}
+    assert stopping_value_from_metrics(metrics, "var") == 2.0
+    assert stopping_value_from_metrics(metrics, "mse") == 9.0
+
+
 def test_max_steps_uses_actual_batch_size():
     assert max_steps_for_s(100, 256, max_epochs=20) == 20
     assert max_steps_for_s(1000, 256, max_epochs=20) == 80
@@ -123,6 +131,23 @@ def test_task_index_mapping():
     assert task_index_to_loss_rep_s(loss_config, 29) == ("mse", 2, 1000)
     assert task_index_to_loss_rep_s(loss_config, 30) == ("var", 0, 100)
     assert task_index_to_loss_rep_s(loss_config, 59) == ("var", 2, 1000)
+
+    method_config = dict(config)
+    method_config["methods"] = [
+        {"name": "mse_stop_mse", "loss": "mse", "early_stopping_metric": "mse"},
+        {"name": "mse_stop_var", "loss": "mse", "early_stopping_metric": "var"},
+        {"name": "var_stop_var", "loss": "var", "early_stopping_metric": "var"},
+    ]
+    methods = configured_methods(method_config)
+    assert [method.name for method in methods] == ["mse_stop_mse", "mse_stop_var", "var_stop_var"]
+    assert [method.training_loss for method in methods] == ["mse", "mse", "var"]
+    assert [method.early_stopping_metric for method in methods] == ["mse", "var", "var"]
+    assert task_index_to_loss_rep_s(method_config, 0) == ("mse_stop_mse", 0, 100)
+    assert task_index_to_loss_rep_s(method_config, 29) == ("mse_stop_mse", 2, 1000)
+    assert task_index_to_loss_rep_s(method_config, 30) == ("mse_stop_var", 0, 100)
+    assert task_index_to_loss_rep_s(method_config, 59) == ("mse_stop_var", 2, 1000)
+    assert task_index_to_loss_rep_s(method_config, 60) == ("var_stop_var", 0, 100)
+    assert task_index_to_loss_rep_s(method_config, 89) == ("var_stop_var", 2, 1000)
 
 
 def test_scaling_law_fit_respects_bounds_on_synthetic_curve():

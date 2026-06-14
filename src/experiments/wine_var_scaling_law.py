@@ -32,6 +32,13 @@ class SplitBundle:
     e_eval_ids: np.ndarray
 
 
+@dataclass(frozen=True)
+class MethodSpec:
+    name: str
+    training_loss: str
+    early_stopping_metric: str
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
@@ -86,6 +93,54 @@ def configured_losses(config: dict[str, Any]) -> list[str]:
     if not losses:
         raise ValueError("at least one loss is required")
     return losses
+
+
+def _validate_method_name(name: str) -> str:
+    clean = str(name).lower()
+    allowed_chars = set("abcdefghijklmnopqrstuvwxyz0123456789_-")
+    if not clean or any(ch not in allowed_chars for ch in clean):
+        raise ValueError(f"invalid method name {name!r}; use lowercase letters, digits, '_' or '-'")
+    return clean
+
+
+def configured_methods(config: dict[str, Any]) -> list[MethodSpec]:
+    raw_methods = config.get("methods")
+    if raw_methods is None:
+        stop_metric = str(config.get("early_stopping_metric", "var")).lower()
+        if stop_metric not in {"var", "mse"}:
+            raise ValueError("early_stopping_metric must be 'var' or 'mse'")
+        return [
+            MethodSpec(name=loss_name, training_loss=loss_name, early_stopping_metric=stop_metric)
+            for loss_name in configured_losses(config)
+        ]
+    if not isinstance(raw_methods, list) or not raw_methods:
+        raise ValueError("methods must be a non-empty list")
+
+    methods: list[MethodSpec] = []
+    seen: set[str] = set()
+    for raw in raw_methods:
+        if not isinstance(raw, dict):
+            raise ValueError("each method entry must be a mapping")
+        training_loss = str(raw.get("loss", raw.get("training_loss", ""))).lower()
+        if training_loss not in {"var", "mse"}:
+            raise ValueError(f"unsupported method loss {training_loss!r}; expected 'var' or 'mse'")
+        stop_metric = str(raw.get("early_stopping_metric", "var")).lower()
+        if stop_metric not in {"var", "mse"}:
+            raise ValueError(f"unsupported early_stopping_metric {stop_metric!r}; expected 'var' or 'mse'")
+        name = _validate_method_name(raw.get("name", f"{training_loss}_stop_{stop_metric}"))
+        if name in seen:
+            raise ValueError(f"duplicate method name: {name}")
+        seen.add(name)
+        methods.append(MethodSpec(name=name, training_loss=training_loss, early_stopping_metric=stop_metric))
+    return methods
+
+
+def method_by_name(config: dict[str, Any], method_name: str) -> MethodSpec:
+    name = _validate_method_name(method_name)
+    methods = {method.name: method for method in configured_methods(config)}
+    if name not in methods:
+        raise ValueError(f"method {name!r} is not listed in config methods")
+    return methods[name]
 
 
 def build_replication_splits(clean: pd.DataFrame, config: dict[str, Any], replication_id: int) -> SplitBundle:
@@ -198,6 +253,15 @@ def training_loss_from_residuals(residual: Any, loss_name: str) -> Any:
     if loss_name == "mse":
         return mse_loss_from_residuals(residual)
     raise ValueError(f"unsupported loss: {loss_name}")
+
+
+def stopping_value_from_metrics(metrics: dict[str, float], early_stopping_metric: str) -> float:
+    metric = str(early_stopping_metric).lower()
+    if metric == "var":
+        return float(metrics["residual_var_scaled"])
+    if metric == "mse":
+        return float(metrics["rmse_scaled"]) ** 2
+    raise ValueError(f"unsupported early stopping metric: {early_stopping_metric}")
 
 
 def steps_per_epoch_for_s(s_train: int, batch_size: int) -> int:
@@ -362,6 +426,7 @@ def train_once(
     batch_size: int,
     seed: int,
     loss_name: str,
+    early_stopping_metric: str = "var",
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
     mods = _require_training_modules()
     torch = mods["torch"]
@@ -405,7 +470,10 @@ def train_once(
     epoch_history: list[dict[str, float | int | bool]] = []
     start = time.time()
     best_state: dict[str, Any] | None = None
+    early_stopping_metric = str(early_stopping_metric).lower()
+    best_stop_value = float("inf")
     best_stop_var = float("inf")
+    best_stop_mse = float("inf")
     best_epoch = 0
     epochs_without_improvement = 0
     total_steps = 0
@@ -432,9 +500,13 @@ def train_once(
         stop_pred = predict_frame(model, tokenizer, stop_df, config, torch, mods["DataLoader"], batch_size)
         stop_metrics = prediction_metrics(stop_pred)
         stop_var = float(stop_metrics["residual_var_scaled"])
-        improved = stop_var < best_stop_var - min_delta
+        stop_mse = float(stop_metrics["rmse_scaled"]) ** 2
+        stop_value = stopping_value_from_metrics(stop_metrics, early_stopping_metric)
+        improved = stop_value < best_stop_value - min_delta
         if improved:
+            best_stop_value = stop_value
             best_stop_var = stop_var
+            best_stop_mse = stop_mse
             best_epoch = epoch
             best_state = capture_trainable_state(model)
             epochs_without_improvement = 0
@@ -446,6 +518,8 @@ def train_once(
                 "train_loss_mean": float(np.mean(epoch_losses)) if epoch_losses else float("nan"),
                 "train_loss_last": float(epoch_losses[-1]) if epoch_losses else float("nan"),
                 "validation_stop_residual_var": stop_var,
+                "validation_stop_mse": stop_mse,
+                "early_stopping_metric_value": stop_value,
                 "validation_stop_residual_mean": float(stop_metrics["residual_mean_scaled"]),
                 "validation_stop_rmse": float(stop_metrics["rmse_scaled"]),
                 "validation_stop_corr": float(stop_metrics["correlation"]),
@@ -459,8 +533,10 @@ def train_once(
                 f"max_epochs={max_epochs}",
                 f"steps={total_steps}",
                 f"loss={loss_name}",
+                f"stop_metric={early_stopping_metric}",
                 f"train_loss={epoch_history[-1]['train_loss_mean']:.6f}",
                 f"v_stop_var={stop_var:.6f}",
+                f"v_stop_mse={stop_mse:.6f}",
                 f"best_epoch={best_epoch}",
                 flush=True,
             )
@@ -470,6 +546,8 @@ def train_once(
                 "early_stop",
                 f"epoch={epoch}",
                 f"best_epoch={best_epoch}",
+                f"stop_metric={early_stopping_metric}",
+                f"best_value={best_stop_value:.6f}",
                 f"best_v_stop_var={best_stop_var:.6f}",
                 flush=True,
             )
@@ -491,13 +569,16 @@ def train_once(
         "min_epochs": int(min_epochs),
         "early_stopping_patience": int(patience),
         "early_stopping_min_delta": float(min_delta),
+        "early_stopping_metric": early_stopping_metric,
         "epochs_trained": int(epoch_history[-1]["epoch"]) if epoch_history else 0,
         "best_epoch": int(best_epoch),
         "early_stopped": bool(early_stopped),
         "steps_per_epoch": int(steps_per_epoch),
         "total_train_steps": int(total_steps),
         "max_steps": int(total_steps),
+        "best_validation_stop_metric_value": float(best_stop_value),
         "best_validation_stop_residual_var": float(best_stop_var),
+        "best_validation_stop_mse": float(best_stop_mse),
         "final_train_loss": float(losses[-1]) if losses else float("nan"),
         "mean_train_loss": float(np.mean(losses)) if losses else float("nan"),
         "device": torch.cuda.get_device_name(0),
@@ -580,10 +661,10 @@ def prediction_metrics(predictions: pd.DataFrame) -> dict[str, float]:
 
 def cell_dir(config: dict[str, Any], replication_id: int, s_train: int, loss_name: str | None = None) -> Path:
     base = Path(config["output_dir"])
-    losses = configured_losses(config)
+    methods = configured_methods(config)
     if loss_name is None:
-        loss_name = losses[0]
-    if len(losses) > 1:
+        loss_name = methods[0].name
+    if len(methods) > 1:
         base = base / str(loss_name).lower()
     return base / f"rep_{int(replication_id):02d}" / f"s_{int(s_train):04d}"
 
@@ -594,12 +675,17 @@ def write_cell_manifest(
     replication_id: int,
     s_train: int,
     loss_name: str,
+    training_loss: str,
+    early_stopping_metric: str,
     bundle: SplitBundle,
 ) -> None:
     manifest = {
         "replication_id": int(replication_id),
         "s_train": int(s_train),
         "loss": str(loss_name).lower(),
+        "method": str(loss_name).lower(),
+        "training_loss": str(training_loss).lower(),
+        "early_stopping_metric": str(early_stopping_metric).lower(),
         "counts": {
             "L": int(len(bundle.l_ids)),
             "V_stop": int(len(bundle.v_stop_ids)),
@@ -638,13 +724,14 @@ def cleanup_training_artifacts(output_dir: Path) -> None:
 
 
 def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_name: str = "var") -> Path:
-    loss_name = str(loss_name).lower()
-    if loss_name not in configured_losses(config):
-        raise ValueError(f"loss {loss_name!r} is not listed in config losses")
-    output_dir = cell_dir(config, replication_id, s_train, loss_name)
+    method = method_by_name(config, loss_name)
+    method_name = method.name
+    training_loss = method.training_loss
+    early_stopping_metric = method.early_stopping_metric
+    output_dir = cell_dir(config, replication_id, s_train, method_name)
     metrics_path = output_dir / "metrics.json"
     if metrics_path.exists():
-        print(f"skip_completed rep={replication_id} s={s_train} metrics={metrics_path}", flush=True)
+        print(f"skip_completed method={method_name} rep={replication_id} s={s_train} metrics={metrics_path}", flush=True)
         return output_dir
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -655,7 +742,7 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_n
     stop_df = subset_by_ids(clean, bundle.v_stop_ids, "validation_stop")
     scale_df = subset_by_ids(clean, bundle.v_scale_ids, "validation_scale")
     eval_df = subset_by_ids(clean, bundle.e_eval_ids, "eval") if len(bundle.e_eval_ids) else None
-    write_cell_manifest(output_dir, config, replication_id, s_train, loss_name, bundle)
+    write_cell_manifest(output_dir, config, replication_id, s_train, method_name, training_loss, early_stopping_metric, bundle)
 
     requested_batch = int(config["batch_size"])
     batch_candidates = [requested_batch]
@@ -674,7 +761,9 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_n
         try:
             print(
                 "train_cell_start",
-                f"loss={loss_name}",
+                f"method={method_name}",
+                f"loss={training_loss}",
+                f"stop_metric={early_stopping_metric}",
                 f"rep={replication_id}",
                 f"s={s_train}",
                 f"batch_size={batch_size}",
@@ -694,7 +783,8 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_n
                     replication_id,
                     salt=0 if bool(config.get("common_train_seed_within_rep", True)) else int(s_train),
                 ),
-                loss_name=loss_name,
+                loss_name=training_loss,
+                early_stopping_metric=early_stopping_metric,
             )
             runtime["requested_batch_size"] = requested_batch
             runtime["oom_fallback_used"] = bool(used_oom_fallback)
@@ -705,7 +795,7 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_n
                 raise
             used_oom_fallback = True
             next_batch = batch_candidates[batch_index + 1]
-            print(f"cuda_oom_retry rep={replication_id} s={s_train} next_batch={next_batch}", flush=True)
+            print(f"cuda_oom_retry method={method_name} rep={replication_id} s={s_train} next_batch={next_batch}", flush=True)
             exc.__traceback__ = None
             del exc
             gc.collect()
@@ -747,7 +837,10 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_n
         "eval_size": int(config["eval_size"]),
         "n_eff": n_effective_labeled(config),
         "model_name": config["model_name"],
-        "loss": loss_name,
+        "loss": method_name,
+        "method": method_name,
+        "training_loss": training_loss,
+        "early_stopping_metric": early_stopping_metric,
         "population_var_y_scaled": population_var_y_scaled,
         "population_var_y_raw": float(np.var(clean[Y_COL].astype(float), ddof=1)),
         "validation_stop": prediction_metrics(stop_pred),
@@ -757,14 +850,15 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_n
     }
     write_json(metrics_path, metrics)
     cleanup_training_artifacts(output_dir)
-    print(f"train_cell_done loss={loss_name} rep={replication_id} s={s_train} metrics={metrics_path}", flush=True)
+    print(f"train_cell_done method={method_name} loss={training_loss} stop_metric={early_stopping_metric} rep={replication_id} s={s_train} metrics={metrics_path}", flush=True)
     return output_dir
 
 
 def _load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
     rows = []
     missing = []
-    for loss_name in configured_losses(config):
+    for method in configured_methods(config):
+        loss_name = method.name
         for rep in config["replication_ids"]:
             for s_train in config["s_grid"]:
                 path = cell_dir(config, int(rep), int(s_train), loss_name) / "metrics.json"
@@ -780,8 +874,14 @@ def _load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
                     continue
                 with open(path, "r", encoding="utf-8") as f:
                     metrics = json.load(f)
+                method_name = str(metrics.get("method", metrics.get("loss", loss_name))).lower()
+                training_loss = str(metrics.get("training_loss", method.training_loss)).lower()
+                early_stopping_metric = str(metrics.get("early_stopping_metric", method.early_stopping_metric)).lower()
                 row = {
-                    "loss": str(metrics.get("loss", loss_name)).lower(),
+                    "loss": method_name,
+                    "method": method_name,
+                    "training_loss": training_loss,
+                    "early_stopping_metric": early_stopping_metric,
                     "replication_id": int(metrics["replication_id"]),
                     "s_train": int(metrics["s_train"]),
                     "budget_B": int(metrics["budget_B"]),
@@ -808,7 +908,10 @@ def _load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
                     "early_stopped": bool(metrics["runtime"].get("early_stopped", False)),
                     "steps_per_epoch": int(metrics["runtime"].get("steps_per_epoch", 0)),
                     "total_train_steps": int(metrics["runtime"].get("total_train_steps", metrics["runtime"]["max_steps"])),
+                    "runtime_early_stopping_metric": str(metrics["runtime"].get("early_stopping_metric", early_stopping_metric)).lower(),
+                    "best_validation_stop_metric_value": float(metrics["runtime"].get("best_validation_stop_metric_value", np.nan)),
                     "best_validation_stop_residual_var": float(metrics["runtime"].get("best_validation_stop_residual_var", np.nan)),
+                    "best_validation_stop_mse": float(metrics["runtime"].get("best_validation_stop_mse", np.nan)),
                     "runtime_seconds": float(metrics["runtime"]["runtime_seconds"]),
                     "device": str(metrics["runtime"]["device"]),
                     "final_train_loss": float(metrics["runtime"]["final_train_loss"]),
@@ -1077,6 +1180,34 @@ def build_loss_comparison_summary(metrics: pd.DataFrame) -> pd.DataFrame:
                 }
             )
             summary = pd.concat([summary, deltas], ignore_index=True, sort=False)
+    named_methods = set(metrics["loss"].unique())
+    comparison_pairs = [
+        ("mse_stop_mse", "var_stop_var"),
+        ("mse_stop_var", "var_stop_var"),
+        ("mse_stop_mse", "mse_stop_var"),
+    ]
+    delta_rows = []
+    for left, right in comparison_pairs:
+        if {left, right}.issubset(named_methods):
+            for s_train in sorted(metrics["s_train"].unique()):
+                row = {
+                    "loss": f"{left}_minus_{right}",
+                    "s_train": int(s_train),
+                }
+                left_rows = metrics[(metrics["loss"] == left) & (metrics["s_train"] == s_train)]
+                right_rows = metrics[(metrics["loss"] == right) & (metrics["s_train"] == s_train)]
+                for col in ["validation_scale_residual_var", "eval_residual_var"]:
+                    if col not in metrics.columns:
+                        continue
+                    left_value = float(left_rows[col].mean())
+                    right_value = float(right_rows[col].mean())
+                    row[col] = left_value - right_value
+                    row[f"{col}_relative_delta"] = (
+                        (left_value - right_value) / right_value if right_value != 0 else float("nan")
+                    )
+                delta_rows.append(row)
+    if delta_rows:
+        summary = pd.concat([summary, pd.DataFrame(delta_rows)], ignore_index=True, sort=False)
     return summary
 
 
@@ -1274,14 +1405,14 @@ def task_index_to_rep_s(config: dict[str, Any], task_index: int) -> tuple[int, i
 
 
 def task_index_to_loss_rep_s(config: dict[str, Any], task_index: int) -> tuple[str, int, int]:
-    losses = configured_losses(config)
+    methods = configured_methods(config)
     s_grid = [int(x) for x in config["s_grid"]]
     reps = [int(x) for x in config["replication_ids"]]
     cells_per_loss = len(s_grid) * len(reps)
-    total = len(losses) * cells_per_loss
+    total = len(methods) * cells_per_loss
     if task_index < 0 or task_index >= total:
         raise ValueError(f"task_index must be in [0, {total - 1}]")
-    loss_name = losses[task_index // cells_per_loss]
+    loss_name = methods[task_index // cells_per_loss].name
     within_loss = task_index % cells_per_loss
     rep = reps[within_loss // len(s_grid)]
     s_train = s_grid[within_loss % len(s_grid)]
@@ -1297,7 +1428,7 @@ def parse_args() -> argparse.Namespace:
     train_group = train_parser.add_mutually_exclusive_group(required=True)
     train_group.add_argument("--task-index", type=int)
     train_group.add_argument("--rep-s", nargs=2, type=int, metavar=("REP", "S"))
-    train_parser.add_argument("--loss", choices=["var", "mse"])
+    train_parser.add_argument("--loss")
 
     aggregate_parser = subparsers.add_parser("aggregate")
     aggregate_parser.add_argument("--config", required=True)
@@ -1312,7 +1443,7 @@ def main() -> None:
             loss_name, rep, s_train = task_index_to_loss_rep_s(config, args.task_index)
         else:
             rep, s_train = int(args.rep_s[0]), int(args.rep_s[1])
-            loss_name = args.loss or configured_losses(config)[0]
+            loss_name = args.loss or configured_methods(config)[0].name
         train_cell(config, rep, s_train, loss_name=loss_name)
     elif args.command == "aggregate":
         aggregate(config)

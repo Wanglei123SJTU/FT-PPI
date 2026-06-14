@@ -6,11 +6,21 @@ hostname
 date
 git rev-parse --short HEAD
 
-CONFIG="configs/wine_loss_controlled_b10000.yaml"
+CONFIG="${CONFIG:-configs/wine_loss_controlled_b10000.yaml}"
+SLURM_TEMPLATE="${SLURM_TEMPLATE:-slurm/run_wine_loss_controlled_b10000.sbatch}"
 SCRATCH_ROOT="/gscratch/scrubbed/$USER/ft-ppi"
 SCRATCH_LOG_DIR="$SCRATCH_ROOT/logs"
-SCRATCH_ARTIFACT_DIR="$SCRATCH_ROOT/artifacts/wine_loss_controlled_b10000_r3_eval2000"
 mkdir -p "$SCRATCH_LOG_DIR" "$SCRATCH_ROOT/artifacts"
+if [ -z "${SCRATCH_ARTIFACT_DIR:-}" ]; then
+  SCRATCH_ARTIFACT_DIR="$(
+    .venv-hyak/bin/python - "$CONFIG" <<'PY'
+import sys
+import yaml
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    print(yaml.safe_load(f)["output_dir"])
+PY
+  )"
+fi
 
 echo "== CANCEL EXISTING WINE-LOSSCTRL JOBS =="
 existing_jobs=$(squeue -u "$USER" -n wine-lossctrl -h -o "%A" 2>/dev/null | sort -u || true)
@@ -26,6 +36,7 @@ echo "== CLEAN OUTPUT FOR CONTROLLED COMPARISON =="
 rm -rf "$SCRATCH_ARTIFACT_DIR"
 echo "scratch_artifact_dir=$SCRATCH_ARTIFACT_DIR"
 echo "scratch_log_dir=$SCRATCH_LOG_DIR"
+export CONFIG_PATH="$CONFIG"
 
 echo "== GPU STATUS =="
 sinfo -o "%20P %18G %8D %8t %10C %10m %N" | grep -Ei 'gpu|ckpt|h200|a100|a40|l40|rtx6k' || true
@@ -122,7 +133,7 @@ for candidate in "${GPU_CANDIDATES[@]}"; do
     echo "#!/bin/bash"
     echo "#SBATCH --partition=$gpu_partition"
     echo "#SBATCH --gres=$gpu_gres"
-    tail -n +2 slurm/run_wine_loss_controlled_b10000.sbatch
+    tail -n +2 "$SLURM_TEMPLATE"
   } > "$PINNED_SBATCH"
   chmod +x "$PINNED_SBATCH"
   echo "PINNED_SBATCH=$PINNED_SBATCH"
@@ -167,29 +178,44 @@ from pathlib import Path
 import json
 import yaml
 
-with open("configs/wine_loss_controlled_b10000.yaml", "r", encoding="utf-8") as f:
+import os
+
+with open(os.environ["CONFIG_PATH"], "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
-root = Path(config["output_dir"]) / "mse"
+methods = config.get("methods")
+if methods is None:
+    raw_losses = config.get("losses", [config.get("loss", "var")])
+    if isinstance(raw_losses, str):
+        raw_losses = [raw_losses]
+    methods = [{"name": str(loss).lower(), "loss": str(loss).lower()} for loss in raw_losses]
+mse_methods = [
+    str(method.get("name", "mse")).lower()
+    for method in methods
+    if str(method.get("loss", method.get("training_loss", method.get("name", "")))).lower() == "mse"
+]
 rows = []
-for rep in config["replication_ids"]:
-    for s_train in config["s_grid"]:
-        path = root / f"rep_{int(rep):02d}" / f"s_{int(s_train):04d}" / "metrics.json"
-        if not path.exists():
-            continue
-        with open(path, "r", encoding="utf-8") as f:
-            metrics = json.load(f)
-        eval_metrics = metrics.get("eval") or {}
-        rows.append(
-            (
-                int(rep),
-                int(s_train),
-                float(metrics["validation_scale"]["residual_var_scaled"]),
-                float(eval_metrics["residual_var_scaled"]) if eval_metrics else float("nan"),
+for method_name in mse_methods:
+    root = Path(config["output_dir"]) / method_name if len(methods) > 1 else Path(config["output_dir"])
+    for rep in config["replication_ids"]:
+        for s_train in config["s_grid"]:
+            path = root / f"rep_{int(rep):02d}" / f"s_{int(s_train):04d}" / "metrics.json"
+            if not path.exists():
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                metrics = json.load(f)
+            eval_metrics = metrics.get("eval") or {}
+            rows.append(
+                (
+                    method_name,
+                    int(rep),
+                    int(s_train),
+                    float(metrics["validation_scale"]["residual_var_scaled"]),
+                    float(eval_metrics["residual_var_scaled"]) if eval_metrics else float("nan"),
+                )
             )
-        )
 print(f"completed_mse_cells={len(rows)}")
-for rep, s_train, val_var, eval_var in rows[:12]:
-    print(f"mse_partial rep={rep} s={s_train} validation_scale_var={val_var:.6f} eval_var={eval_var:.6f}")
+for method_name, rep, s_train, val_var, eval_var in rows[:18]:
+    print(f"mse_partial method={method_name} rep={rep} s={s_train} validation_scale_var={val_var:.6f} eval_var={eval_var:.6f}")
 PY
   sleep 180
 done
@@ -212,7 +238,9 @@ import json
 import pandas as pd
 import yaml
 
-config_path = "configs/wine_loss_controlled_b10000.yaml"
+import os
+
+config_path = os.environ["CONFIG_PATH"]
 with open(config_path, "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 root = Path(config["output_dir"])
@@ -237,7 +265,15 @@ if not leak.get("passed"):
     raise SystemExit("leakage check did not pass")
 
 runtime = pd.read_csv(root / "training_runtime_summary.csv")
-expected_rows = len(config["losses"]) * len(config["replication_ids"]) * len(config["s_grid"])
+methods = config.get("methods")
+if methods is None:
+    raw_losses = config.get("losses", [config.get("loss", "var")])
+    if isinstance(raw_losses, str):
+        raw_losses = [raw_losses]
+    expected_methods = len(raw_losses)
+else:
+    expected_methods = len(methods)
+expected_rows = expected_methods * len(config["replication_ids"]) * len(config["s_grid"])
 if len(runtime) != expected_rows:
     raise SystemExit(f"expected {expected_rows} runtime rows, got {len(runtime)}")
 
