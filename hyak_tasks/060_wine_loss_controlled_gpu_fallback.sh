@@ -34,18 +34,44 @@ squeue -u "$USER" || true
 echo "== SUBMIT WINE LOSS CONTROLLED ARRAY ON BEST IDLE GPU =="
 gpu_args=$(HYAK_GPU_MIN_IDLE="${HYAK_GPU_MIN_IDLE:-8}" bash scripts/choose_hyak_gpu.sh)
 echo "GPU_ARGS=$gpu_args"
-echo "Trying: sbatch $gpu_args slurm/run_wine_loss_controlled_b10000.sbatch"
+gpu_partition=$(printf '%s\n' "$gpu_args" | tr ' ' '\n' | awk -F= '$1 == "--partition" {print $2}' | tail -1)
+gpu_gres=$(printf '%s\n' "$gpu_args" | tr ' ' '\n' | awk -F= '$1 == "--gres" {print $2}' | tail -1)
+if [ -z "$gpu_partition" ] || [ -z "$gpu_gres" ]; then
+  echo "Could not parse partition/gres from GPU_ARGS=$gpu_args"
+  exit 1
+fi
+PINNED_SBATCH="$SCRATCH_ROOT/logs/wine-lossctrl-${HYAK_RUNNER_TASK_ID:-manual}-$(date +%Y%m%d_%H%M%S).sbatch"
+{
+  echo "#!/bin/bash"
+  echo "#SBATCH --partition=$gpu_partition"
+  echo "#SBATCH --gres=$gpu_gres"
+  tail -n +2 slurm/run_wine_loss_controlled_b10000.sbatch
+} > "$PINNED_SBATCH"
+chmod +x "$PINNED_SBATCH"
+echo "PINNED_SBATCH=$PINNED_SBATCH"
+echo "Trying: sbatch $PINNED_SBATCH"
 set +e
-submit_output=$(sbatch $gpu_args slurm/run_wine_loss_controlled_b10000.sbatch 2>&1)
+submit_output=$(sbatch "$PINNED_SBATCH" 2>&1)
 submit_status=$?
 set -e
 echo "$submit_output"
 
 if [ "$submit_status" -ne 0 ]; then
   echo "Best-idle GPU submit failed; falling back to ckpt gpu:1."
-  gpu_args="--partition=ckpt --gres=gpu:1"
+  gpu_args="--partition=ckpt --gres=gpu:a40:1"
+  gpu_partition="ckpt"
+  gpu_gres="gpu:a40:1"
+  PINNED_SBATCH="$SCRATCH_ROOT/logs/wine-lossctrl-${HYAK_RUNNER_TASK_ID:-manual}-fallback-$(date +%Y%m%d_%H%M%S).sbatch"
+  {
+    echo "#!/bin/bash"
+    echo "#SBATCH --partition=$gpu_partition"
+    echo "#SBATCH --gres=$gpu_gres"
+    tail -n +2 slurm/run_wine_loss_controlled_b10000.sbatch
+  } > "$PINNED_SBATCH"
+  chmod +x "$PINNED_SBATCH"
+  echo "PINNED_SBATCH=$PINNED_SBATCH"
   set +e
-  submit_output=$(sbatch $gpu_args slurm/run_wine_loss_controlled_b10000.sbatch 2>&1)
+  submit_output=$(sbatch "$PINNED_SBATCH" 2>&1)
   submit_status=$?
   set -e
   echo "$submit_output"
