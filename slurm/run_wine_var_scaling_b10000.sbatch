@@ -1,11 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=wine-zerohead
+#SBATCH --job-name=wine-varscale
 #SBATCH --partition=ckpt
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=56G
-#SBATCH --time=01:30:00
-#SBATCH --output=logs/%x-%j.out
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=96G
+#SBATCH --time=06:00:00
+#SBATCH --array=0-7%4
+#SBATCH --output=logs/%x-%A_%a.out
 
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
@@ -27,6 +28,7 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$CACHE_ROOT/hf_datasets}"
 export TORCH_HOME="${TORCH_HOME:-$CACHE_ROOT/torch}"
 export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-$CACHE_ROOT/conda_pkgs}"
 export WANDB_DISABLED="${WANDB_DISABLED:-true}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
 if [ ! -x "$VENV_DIR/bin/python" ]; then
   echo "Missing $VENV_DIR. Run: bash scripts/setup_hyak_env.sh"
@@ -45,6 +47,11 @@ import torch
 print("torch", torch.__version__)
 print("cuda_available", torch.cuda.is_available())
 print("device", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
+print("bf16_supported", torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False)
 PY
 
-python -m src.experiments.run_training_signal_probe --config configs/training_signal_probe_zerohead.yaml
+CONFIG="${CONFIG:-configs/wine_var_scaling_b10000.yaml}"
+TASK_ID="${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID is required}"
+echo "wine_var_scaling_cell_start task_index=${TASK_ID} config=${CONFIG}"
+python -m src.experiments.wine_var_scaling_law train-cell --config "$CONFIG" --task-index "$TASK_ID"
+echo "wine_var_scaling_cell_done task_index=${TASK_ID}"

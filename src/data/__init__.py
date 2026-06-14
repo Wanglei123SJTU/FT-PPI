@@ -1,2 +1,1 @@
-"""Data preparation utilities."""
-
+"""Data namespace for Wine Reviews experiments."""

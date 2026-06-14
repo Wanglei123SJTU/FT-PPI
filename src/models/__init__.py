@@ -1,2 +1,1 @@
-"""Model setup utilities."""
-
+"""Model namespace for Wine Reviews experiments."""

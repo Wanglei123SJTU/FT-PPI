@@ -91,7 +91,7 @@ import sys
 
 import _ctypes
 
-mods = ["torch", "transformers", "datasets", "accelerate", "peft", "bitsandbytes", "pandas", "pyarrow"]
+mods = ["torch", "transformers", "datasets", "accelerate", "peft", "bitsandbytes", "pandas", "pyarrow", "scipy", "matplotlib"]
 missing = [mod for mod in mods if importlib.util.find_spec(mod) is None]
 if missing:
     print("missing=" + ",".join(missing))

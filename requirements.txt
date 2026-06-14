@@ -6,5 +6,6 @@ pyarrow>=15,<20
 matplotlib>=3.8,<3.11
 pytest>=8,<9
 psutil>=5.9,<8
+scipy>=1.11,<1.16
 transformers==4.48.3
 datasets==3.2.0

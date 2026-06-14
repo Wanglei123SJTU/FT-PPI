@@ -1,2 +1,1 @@
-"""Prediction output helpers."""
-
+"""Evaluation namespace for Wine Reviews experiments."""

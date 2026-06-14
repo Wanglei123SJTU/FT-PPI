@@ -1,2 +1,1 @@
-"""Minimal Wine FT+PPI pipeline."""
-
+"""Wine Reviews scaling-law experiment package."""

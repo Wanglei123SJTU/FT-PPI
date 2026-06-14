@@ -1,89 +1,59 @@
-# Minimal Wine FT+PPI Pipeline
+# Wine LoRA-Var Scaling-Law Pipeline
 
-This is a fresh MVP pipeline for the Wine Reviews rerun. It only uses
-`Code/wine_data.csv` and intentionally ignores `FT PPI Original`.
+This repository now uses a clean-slate Wine Reviews experiment pipeline. The
+old smoke/tiny/allocation pilot code has been removed. The active experiment is
+the single-purpose LoRA-Var scaling-law and ramp-up timing run.
 
-## Local sanity checks
+## Active Experiment
 
-```bash
-python -m pytest tests
-python -m src.data.build_wine --output-dir artifacts/local_sanity --population-size 5000 --budget 500 --train-size 100 --validation-size 100
-```
+- Data: `Code/wine_data.csv`
+- Config: `configs/wine_var_scaling_b10000.yaml`
+- Entrypoint: `python -m src.experiments.wine_var_scaling_law`
+- Slurm array: `slurm/run_wine_var_scaling_b10000.sbatch`
+- Hyak task: `hyak_tasks/055_wine_var_scaling_b10000.sh`
 
-## Hyak smoke run
+Current timing-first defaults:
 
-Create the Hyak Python environment once:
+- `B = 10000`
+- `R = 1`
+- `V = 1000`
+- `E_eval = 0`
+- `s_grid = [100, 200, 400, 700, 1000, 1500, 2500, 4000]`
+- model: `Qwen/Qwen2.5-1.5B-Instruct`
+- loss: LoRA-Var only
 
-```bash
-cd ~/FT-PPI
-bash scripts/setup_hyak_env.sh
-```
+## Commands
 
-Normal logins do not need to reinstall dependencies:
-
-```bash
-cd ~/FT-PPI
-bash scripts/setup_hyak_env.sh
-```
-
-On Hyak, `.venv-hyak` is a symlink into scratch/group storage when available,
-so the large PyTorch environment does not live in the repo or home directory.
-The setup script also puts Hugging Face, datasets, Torch, and pip caches under
-the same scratch area by default.
-The Slurm scripts activate the environment automatically.
-
-Only rebuild the environment when it is broken or dependencies changed:
+Run one Slurm array cell manually:
 
 ```bash
-RESET=1 bash scripts/setup_hyak_env.sh
+python -m src.experiments.wine_var_scaling_law train-cell \
+  --config configs/wine_var_scaling_b10000.yaml \
+  --task-index 0
 ```
 
-Then run:
+Aggregate after all eight cells complete:
 
 ```bash
-sbatch slurm/smoke_lora.sbatch
+python -m src.experiments.wine_var_scaling_law aggregate \
+  --config configs/wine_var_scaling_b10000.yaml
 ```
 
-Check the currently idle GPU resources before submitting:
+Submit through Slurm:
 
 ```bash
-sinfo -o "%P %G %D %t %N" | egrep "gpu|ckpt|h200|a100|l40|a40"
+sbatch slurm/run_wine_var_scaling_b10000.sbatch
 ```
-
-To request a specific GPU, override the Slurm directives at submit time. Use
-the partition that is idle and accessible at that moment. For example:
-
-```bash
-sbatch --partition=gpu-h200 --gres=gpu:h200:1 slurm/smoke_lora.sbatch
-sbatch --partition=ckpt --gres=gpu:h200:1 slurm/smoke_lora.sbatch
-sbatch --partition=ckpt --gres=gpu:l40s:1 slurm/smoke_lora.sbatch
-sbatch --partition=ckpt --gres=gpu:a40:1 slurm/smoke_lora.sbatch
-```
-
-The smoke job trains MSE and Var LoRA runs for two steps each and writes
-prediction parquet files under `artifacts/smoke/`.
-
-## Tiny run
-
-```bash
-sbatch slurm/run_tiny.sbatch
-```
-
-This runs MSE and Var on the `B=500, s=100, v=100` tiny split and writes a
-summary table under `artifacts/tiny/summary/metrics.csv`.
 
 ## Persistent Hyak Runner
 
-For longer iterative work, start a persistent runner from Windows:
+Start the persistent runner from Windows:
 
 ```powershell
 scripts\start_hyak_runner.bat
 ```
 
-Complete UW password and Duo once, then keep the runner window open. The runner
-stays on Hyak, pulls `main`, and executes any new shell task committed under
-`hyak_tasks/*.sh`. It writes its local stream to `artifacts/hyak/hyak_runner.log`.
-
-Task state is stored on Hyak under `.hyak_runner/`. A task filename is the task
-ID, so use a new filename to rerun work. A task can exit with code `99` to stop
-the runner cleanly.
+The runner pulls `main` and executes new files under `hyak_tasks/*.sh`. The
+current task submits the eight-cell Slurm array, waits for completion, runs the
+aggregate step, and validates required outputs under
+`artifacts/wine_var_scaling_b10000/`.

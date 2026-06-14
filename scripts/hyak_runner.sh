@@ -44,8 +44,23 @@ pull_repo() {
 
 ensure_env() {
   if [ -x ".venv-hyak/bin/python" ]; then
-    log "environment present at .venv-hyak"
-    return 0
+    if ".venv-hyak/bin/python" - <<'PY'
+import importlib.util
+import sys
+
+required = ["torch", "transformers", "datasets", "accelerate", "peft", "pandas", "pyarrow", "scipy", "matplotlib"]
+missing = [name for name in required if importlib.util.find_spec(name) is None]
+if missing:
+    print("missing=" + ",".join(missing))
+    sys.exit(1)
+PY
+    then
+      log "environment present at .venv-hyak"
+      return 0
+    fi
+    log "environment present but dependencies missing; running scripts/setup_hyak_env.sh"
+    bash scripts/setup_hyak_env.sh
+    return $?
   fi
 
   log "environment missing; running scripts/setup_hyak_env.sh"

@@ -1,2 +1,1 @@
-"""Mean, PPI, and PPI++ estimators."""
-
+"""Estimator namespace reserved for future experiments."""

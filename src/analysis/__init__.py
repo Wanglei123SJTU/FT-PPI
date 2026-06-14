@@ -1,2 +1,1 @@
-"""Analysis and summary utilities."""
-
+"""Analysis namespace for Wine Reviews experiments."""
