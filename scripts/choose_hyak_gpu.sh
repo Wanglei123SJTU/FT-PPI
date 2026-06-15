@@ -44,9 +44,9 @@ choose_from_idle() {
   fi
 }
 
-choose_from_idle "gpu-h200" "gpu:h200:1" "h200"
 choose_from_idle "ckpt-g2" "gpu:h200:1" "h200"
 choose_from_idle "ckpt-all" "gpu:h200:1" "h200"
+choose_from_idle "gpu-h200" "gpu:h200:1" "h200"
 choose_from_idle "gpu-a100" "gpu:a100:1" "a100"
 choose_from_idle "ckpt" "gpu:a100:1" "a100"
 choose_from_idle "gpu-l40s" "gpu:l40s:1" "l40s"
