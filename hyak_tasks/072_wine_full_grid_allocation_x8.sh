@@ -41,6 +41,16 @@ else
   echo "no existing wine-fullgrid jobs"
 fi
 
+echo "== CANCEL STALE WINE-VAR JOBS =="
+existing_var_jobs=$(squeue -u "$USER" -n wine-var -h -o "%A" 2>/dev/null | sort -u || true)
+if [ -n "$existing_var_jobs" ]; then
+  echo "$existing_var_jobs" | xargs -r scancel
+  echo "cancelled stale wine-var jobs: $existing_var_jobs"
+  sleep 20
+else
+  echo "no stale wine-var jobs"
+fi
+
 echo "== CLEAN OUTPUT FOR FULL-GRID ALLOCATION =="
 rm -rf "$ROOT"
 mkdir -p "$ROOT"
@@ -50,7 +60,12 @@ sinfo -o "%20P %18G %8D %8t %10C %10m %N" | grep -Ei 'gpu|ckpt|h200|a100|a40|l40
 squeue -u "$USER" || true
 
 echo "== SUBMIT WINE FULL-GRID ARRAY ON BEST IDLE GPU =="
-GPU_ARGS=$(HYAK_GPU_MIN_IDLE="${HYAK_GPU_MIN_IDLE:-8}" bash scripts/choose_hyak_gpu.sh)
+if [ -n "${HYAK_FORCE_GPU_ARGS:-}" ]; then
+  GPU_ARGS="$HYAK_FORCE_GPU_ARGS"
+  echo "using forced GPU args"
+else
+  GPU_ARGS=$(HYAK_GPU_MIN_IDLE="${HYAK_GPU_MIN_IDLE:-8}" bash scripts/choose_hyak_gpu.sh)
+fi
 echo "GPU_ARGS=$GPU_ARGS"
 PINNED_SBATCH="$SCRATCH_LOG_DIR/wine-fullgrid-${HYAK_RUNNER_TASK_ID:-manual}-$(date +%Y%m%d_%H%M%S).sbatch"
 {
