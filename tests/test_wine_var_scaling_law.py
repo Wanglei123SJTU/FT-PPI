@@ -6,10 +6,13 @@ import pandas as pd
 from src.experiments.wine_full_grid_allocation import (
     allocation_correction_ids_for_rho,
     allocation_train_ids_for_rho,
+    aggregate_task_cells,
     build_allocation_split,
     ppi_metrics,
     task_index_to_allocation_cell,
+    task_index_to_theory_exact_cell,
     theoretical_allocation,
+    theory_exact_task_cells,
 )
 from src.experiments.wine_var_scaling_law import (
     SplitBundle,
@@ -170,6 +173,34 @@ def test_full_grid_task_index_mapping():
     assert task_index_to_allocation_cell(config, 1) == ("mse_stop_mse", 300, 0, 0.10)
     assert task_index_to_allocation_cell(config, 6) == ("mse_stop_mse", 500, 0, 0.025)
     assert task_index_to_allocation_cell(config, 12) == ("var_stop_var", 300, 0, 0.025)
+
+
+def test_theory_exact_task_cells_are_var_only_and_added_to_aggregate():
+    config = dict(_config())
+    config.update(
+        {
+            "split_source": "p_target",
+            "budgets": [300, 500],
+            "replication_ids": [0, 1],
+            "allocation_grid": [0.025, 0.10, 0.50, 0.90],
+            "include_theory_exact_cells": True,
+            "theory_exact_method": "var_stop_var",
+            "methods": [
+                {"name": "mse_stop_mse", "loss": "mse", "early_stopping_metric": "mse"},
+                {"name": "var_stop_var", "loss": "var", "early_stopping_metric": "var"},
+            ],
+            "scaling_law_params_raw": {"a": 17.4, "alpha": 0.57, "b": 2.83},
+        }
+    )
+    theory_cells = theory_exact_task_cells(config)
+    assert len(theory_cells) == 4
+    assert all(cell[0] == "var_stop_var" for cell in theory_cells)
+    assert task_index_to_theory_exact_cell(config, 0) == theory_cells[0]
+    assert len(aggregate_task_cells(config)) == 2 * 2 * 2 * 4 + 4
+    for _, budget_B, _, rho in theory_cells:
+        theory = theoretical_allocation(config, budget_B)
+        assert np.isclose(rho, theory["theory_rho"])
+        assert not any(np.isclose(rho, grid_rho) for grid_rho in config["allocation_grid"])
 
 
 def test_ppi_metrics_uses_correction_and_unlabeled_predictions():

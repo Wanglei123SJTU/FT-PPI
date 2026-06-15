@@ -88,6 +88,10 @@ def allocation_cell_dir(
     )
 
 
+def rho_in_grid(config: dict[str, Any], rho: float) -> bool:
+    return any(np.isclose(float(rho), grid_rho, rtol=0.0, atol=1e-10) for grid_rho in allocation_grid(config))
+
+
 def build_allocation_split(clean: pd.DataFrame, config: dict[str, Any], budget_B: int, replication_id: int) -> AllocationSplit:
     population = build_population_split(clean, config)
     if split_source(config) != "p_target":
@@ -238,6 +242,7 @@ def write_allocation_manifest(
     method_name: str,
     train_ids: np.ndarray,
     correction_ids: np.ndarray,
+    allocation_source: str = "grid",
 ) -> None:
     manifest = {
         "budget_B": int(budget_B),
@@ -245,6 +250,7 @@ def write_allocation_manifest(
         "rho": float(rho),
         "s_train": int(len(train_ids)),
         "method": str(method_name),
+        "allocation_source": str(allocation_source),
         "split_source": split_source(config),
         "population_counts": {
             "P0": int(len(population.p0_ids)),
@@ -283,6 +289,7 @@ def train_allocation_cell(
     budget_B: int,
     replication_id: int,
     rho: float,
+    allocation_source: str = "grid",
 ) -> Path:
     method = method_by_name(config, method_name)
     output_dir = allocation_cell_dir(config, method.name, budget_B, replication_id, rho)
@@ -315,6 +322,7 @@ def train_allocation_cell(
         method.name,
         train_ids,
         correction_ids,
+        allocation_source=allocation_source,
     )
 
     requested_batch = int(config["batch_size"])
@@ -411,6 +419,7 @@ def train_allocation_cell(
         "budget_B": int(budget_B),
         "replication_id": int(replication_id),
         "rho": float(rho),
+        "allocation_source": str(allocation_source),
         "validation_size": int(len(split.validation_ids)),
         "n_eff": int(len(split.effective_ids)),
         "s_train": int(len(train_ids)),
@@ -446,10 +455,41 @@ def all_task_cells(config: dict[str, Any]) -> list[tuple[str, int, int, float]]:
     return cells
 
 
+def theory_exact_method(config: dict[str, Any]) -> str:
+    return str(config.get("theory_exact_method", "var_stop_var"))
+
+
+def theory_exact_task_cells(config: dict[str, Any]) -> list[tuple[str, int, int, float]]:
+    method_name = theory_exact_method(config)
+    cells: list[tuple[str, int, int, float]] = []
+    for budget_B in [int(x) for x in config["budgets"]]:
+        theory = theoretical_allocation(config, budget_B)
+        rho = float(theory["theory_rho"])
+        if rho_in_grid(config, rho):
+            continue
+        for replication_id in [int(x) for x in config["replication_ids"]]:
+            cells.append((method_name, budget_B, replication_id, rho))
+    return cells
+
+
+def aggregate_task_cells(config: dict[str, Any]) -> list[tuple[str, int, int, float]]:
+    cells = all_task_cells(config)
+    if bool(config.get("include_theory_exact_cells", False)):
+        cells.extend(theory_exact_task_cells(config))
+    return cells
+
+
 def task_index_to_allocation_cell(config: dict[str, Any], task_index: int) -> tuple[str, int, int, float]:
     cells = all_task_cells(config)
     if int(task_index) < 0 or int(task_index) >= len(cells):
         raise ValueError(f"task_index={task_index} out of range for {len(cells)} allocation cells")
+    return cells[int(task_index)]
+
+
+def task_index_to_theory_exact_cell(config: dict[str, Any], task_index: int) -> tuple[str, int, int, float]:
+    cells = theory_exact_task_cells(config)
+    if int(task_index) < 0 or int(task_index) >= len(cells):
+        raise ValueError(f"task_index={task_index} out of range for {len(cells)} theory-exact cells")
     return cells[int(task_index)]
 
 
@@ -465,6 +505,7 @@ def flatten_metrics(metrics: dict[str, Any], path: Path) -> dict[str, Any]:
         "budget_B": int(metrics["budget_B"]),
         "replication_id": int(metrics["replication_id"]),
         "rho": float(metrics["rho"]),
+        "allocation_source": str(metrics.get("allocation_source", "grid")),
         "validation_size": int(metrics["validation_size"]),
         "n_eff": int(metrics["n_eff"]),
         "s_train": int(metrics["s_train"]),
@@ -502,7 +543,7 @@ def flatten_metrics(metrics: dict[str, Any], path: Path) -> dict[str, Any]:
 def load_allocation_metrics(config: dict[str, Any]) -> pd.DataFrame:
     rows = []
     missing = []
-    for method_name, budget_B, replication_id, rho in all_task_cells(config):
+    for method_name, budget_B, replication_id, rho in aggregate_task_cells(config):
         path = allocation_cell_dir(config, method_name, budget_B, replication_id, rho) / "metrics.json"
         if not path.exists():
             missing.append((method_name, budget_B, replication_id, rho, str(path)))
@@ -512,7 +553,7 @@ def load_allocation_metrics(config: dict[str, Any]) -> pd.DataFrame:
     if missing:
         preview = "\n".join(map(str, missing[:20]))
         raise FileNotFoundError(f"missing {len(missing)} allocation cells; first missing:\n{preview}")
-    return pd.DataFrame(rows).sort_values(["method", "budget_B", "replication_id", "rho"]).reset_index(drop=True)
+    return pd.DataFrame(rows).sort_values(["method", "budget_B", "replication_id", "allocation_source", "rho"]).reset_index(drop=True)
 
 
 def scaling_params_raw(config: dict[str, Any]) -> dict[str, float]:
@@ -547,7 +588,7 @@ def aggregate_allocation(config: dict[str, Any]) -> dict[str, Path]:
     metrics.to_csv(output_dir / "full_grid_cell_metrics.csv", index=False)
 
     by_rho = (
-        metrics.groupby(["budget_B", "method", "rho", "s_train"], as_index=False)
+        metrics.groupby(["budget_B", "method", "allocation_source", "rho", "s_train"], as_index=False)
         .agg(
             n_replications=("replication_id", "nunique"),
             mean_ppi_var_est_raw=("ppi_var_est_raw", "mean"),
@@ -575,15 +616,25 @@ def aggregate_allocation(config: dict[str, Any]) -> dict[str, Path]:
         budget_rows = by_rho[by_rho["budget_B"] == budget_B]
         for method_name in sorted(budget_rows["method"].unique()):
             method_rows = budget_rows[budget_rows["method"] == method_name].copy()
-            grid_best_idx = method_rows["mean_ppi_var_est_raw"].astype(float).idxmin()
-            grid_best = method_rows.loc[grid_best_idx]
+            candidate_rows = method_rows
+            if method_name != "var_stop_var" or not bool(config.get("include_theory_exact_cells", False)):
+                candidate_rows = method_rows[method_rows["allocation_source"] == "grid"]
+            if candidate_rows.empty:
+                raise RuntimeError(f"no oracle candidate rows for B={budget_B}, method={method_name}")
+            grid_best_idx = candidate_rows["mean_ppi_var_est_raw"].astype(float).idxmin()
+            grid_best = candidate_rows.loc[grid_best_idx]
             if method_name == "var_stop_var":
-                eval_rho = float(theory["theory_eval_rho"])
+                eval_rho = float(theory["theory_rho"]) if bool(config.get("include_theory_exact_cells", False)) else float(theory["theory_eval_rho"])
+                eval_source = "theory_exact" if bool(config.get("include_theory_exact_cells", False)) else "grid"
             else:
                 eval_rho = float(grid_best["rho"])
-            eval_rows = method_rows[np.isclose(method_rows["rho"].astype(float), eval_rho)]
+                eval_source = "grid"
+            eval_rows = method_rows[
+                np.isclose(method_rows["rho"].astype(float), eval_rho, rtol=0.0, atol=1e-10)
+                & (method_rows["allocation_source"] == eval_source)
+            ]
             if eval_rows.empty:
-                raise RuntimeError(f"no eval row for B={budget_B}, method={method_name}, rho={eval_rho}")
+                raise RuntimeError(f"no eval row for B={budget_B}, method={method_name}, source={eval_source}, rho={eval_rho}")
             eval_row = eval_rows.iloc[0]
             regret = (
                 (float(eval_row["mean_ppi_var_est_raw"]) - float(grid_best["mean_ppi_var_est_raw"]))
@@ -599,8 +650,11 @@ def aggregate_allocation(config: dict[str, Any]) -> dict[str, Path]:
                     "method": method_name,
                     "theory_rho": float(theory["theory_rho"]) if method_name == "var_stop_var" else math.nan,
                     "theory_s": int(theory["theory_s"]) if method_name == "var_stop_var" else math.nan,
+                    "oracle_candidate_set": "grid+theory_exact" if method_name == "var_stop_var" and bool(config.get("include_theory_exact_cells", False)) else "grid",
                     "grid_best_rho": float(grid_best["rho"]),
                     "grid_best_s": int(grid_best["s_train"]),
+                    "grid_best_source": str(grid_best["allocation_source"]),
+                    "eval_source": eval_source,
                     "eval_rho": eval_rho,
                     "eval_s": int(eval_row["s_train"]),
                     "var_ratio": float(eval_row["var_ratio_to_sample_mean"]),
@@ -714,6 +768,12 @@ def main() -> None:
     train_group.add_argument("--task-index", type=int)
     train_group.add_argument("--cell", nargs=4, metavar=("METHOD", "B", "REP", "RHO"))
 
+    theory_parser = sub.add_parser("train-theory-cell")
+    theory_parser.add_argument("--config", required=True)
+    theory_group = theory_parser.add_mutually_exclusive_group(required=True)
+    theory_group.add_argument("--task-index", type=int)
+    theory_group.add_argument("--cell", nargs=3, metavar=("B", "REP", "METHOD"))
+
     aggregate_parser = sub.add_parser("aggregate")
     aggregate_parser.add_argument("--config", required=True)
 
@@ -727,7 +787,16 @@ def main() -> None:
             budget_B = int(args.cell[1])
             replication_id = int(args.cell[2])
             rho = float(args.cell[3])
-        train_allocation_cell(config, method_name, budget_B, replication_id, rho)
+        train_allocation_cell(config, method_name, budget_B, replication_id, rho, allocation_source="grid")
+    elif args.command == "train-theory-cell":
+        if args.task_index is not None:
+            method_name, budget_B, replication_id, rho = task_index_to_theory_exact_cell(config, args.task_index)
+        else:
+            budget_B = int(args.cell[0])
+            replication_id = int(args.cell[1])
+            method_name = str(args.cell[2])
+            rho = float(theoretical_allocation(config, budget_B)["theory_rho"])
+        train_allocation_cell(config, method_name, budget_B, replication_id, rho, allocation_source="theory_exact")
     elif args.command == "aggregate":
         outputs = aggregate_allocation(config)
         print("full_grid_allocation_aggregate_done")

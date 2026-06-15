@@ -1,0 +1,52 @@
+input_csv: Data/wine_data.csv
+output_dir: /gscratch/scrubbed/lei0603/ft-ppi/artifacts/wine_full_grid_allocation
+seed: 20260613
+
+experimental_population_size: 25000
+h_scale_size: 10000
+split_source: p_target
+
+budgets: [300, 500, 700, 1000]
+validation_fraction: 0.20
+replication_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+allocation_grid: [0.025, 0.05, 0.075, 0.10, 0.125, 0.15, 0.20, 0.30, 0.40, 0.50, 0.70, 0.90]
+
+include_theory_exact_cells: true
+theory_exact_method: var_stop_var
+
+scaling_law_params_raw:
+  a: 17.401426337966647
+  alpha: 0.573834715845365
+  b: 2.8270096710040584
+
+methods:
+  - name: mse_stop_mse
+    loss: mse
+    early_stopping_metric: mse
+  - name: var_stop_var
+    loss: var
+    early_stopping_metric: var
+
+model_name: Qwen/Qwen2.5-1.5B-Instruct
+max_length: 192
+target_modules: all-linear
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_lr: 2.0e-4
+head_lr: 5.0e-4
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+batch_size: 128
+oom_fallback_batch_sizes: [64, 32]
+prediction_batch_size: 64
+log_every: 20
+log_every_epochs: 1
+max_epochs: 20
+min_epochs: 4
+early_stopping_patience: 4
+early_stopping_min_delta: 0.0
+common_train_seed_within_rep: true
+gradient_checkpointing: true
+save_predictions: false
