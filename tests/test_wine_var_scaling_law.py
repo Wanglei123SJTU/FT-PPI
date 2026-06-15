@@ -3,8 +3,17 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.experiments.wine_full_grid_allocation import (
+    allocation_correction_ids_for_rho,
+    allocation_train_ids_for_rho,
+    build_allocation_split,
+    ppi_metrics,
+    task_index_to_allocation_cell,
+    theoretical_allocation,
+)
 from src.experiments.wine_var_scaling_law import (
     SplitBundle,
+    build_population_split,
     build_replication_splits,
     configured_losses,
     configured_methods,
@@ -38,10 +47,12 @@ def _fake_clean(n: int = 25000) -> pd.DataFrame:
 def _config() -> dict:
     return {
         "seed": 123,
+        "experimental_population_size": 25000,
+        "h_scale_size": 10000,
+        "split_source": "h_scale",
         "budget_B": 10000,
         "validation_stop_size": 1000,
         "validation_scale_size": 1000,
-        "eval_size": 2000,
         "replication_ids": [0, 1, 2],
         "s_grid": [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000],
     }
@@ -57,11 +68,11 @@ def test_replication_splits_are_disjoint_and_nested():
     assert len(bundle.v_stop_ids) == 1000
     assert len(bundle.v_scale_ids) == 1000
     assert len(bundle.l_prime_ids) == 8000
-    assert len(bundle.e_eval_ids) == 2000
-    assert set(bundle.e_eval_ids).isdisjoint(set(bundle.l_ids))
     assert set(bundle.v_stop_ids).issubset(set(bundle.l_ids))
     assert set(bundle.v_scale_ids).issubset(set(bundle.l_ids))
     assert set(bundle.v_stop_ids).isdisjoint(set(bundle.v_scale_ids))
+    assert set(bundle.l_prime_ids).isdisjoint(set(bundle.v_stop_ids))
+    assert set(bundle.l_prime_ids).isdisjoint(set(bundle.v_scale_ids))
 
     previous: set[int] = set()
     for s in config["s_grid"]:
@@ -71,19 +82,137 @@ def test_replication_splits_are_disjoint_and_nested():
         previous = current
 
 
-def test_validate_split_bundle_rejects_eval_leakage():
+def test_population_split_matches_paper_protocol_for_scaling_validation():
+    clean = _fake_clean()
+    config = _config()
+    population = build_population_split(clean, config)
+    assert len(population.p0_ids) == 25000
+    assert len(population.h_scale_ids) == 10000
+    assert len(population.p_target_ids) == 15000
+    assert set(population.h_scale_ids).isdisjoint(set(population.p_target_ids))
+    assert set(population.h_scale_ids) | set(population.p_target_ids) == set(population.p0_ids)
+
+    rep0 = build_replication_splits(clean, config, replication_id=0)
+    rep1 = build_replication_splits(clean, config, replication_id=1)
+    assert set(rep0.l_ids) == set(population.h_scale_ids)
+    assert set(rep1.l_ids) == set(population.h_scale_ids)
+    assert set(rep0.l_ids) == set(rep1.l_ids)
+    assert set(rep0.v_stop_ids).isdisjoint(set(rep0.v_scale_ids))
+    assert set(rep1.v_stop_ids).isdisjoint(set(rep1.v_scale_ids))
+    assert set(rep0.v_stop_ids) != set(rep1.v_stop_ids)
+
+
+def test_target_split_draws_labeled_budget_from_p_target():
+    clean = _fake_clean()
+    config = dict(_config())
+    config["split_source"] = "p_target"
+    config["budget_B"] = 500
+    config["validation_stop_size"] = 100
+    config["validation_scale_size"] = 100
+    config["s_grid"] = [50, 100, 200, 300]
+
+    population = build_population_split(clean, config)
+    bundle = build_replication_splits(clean, config, replication_id=0)
+    assert len(bundle.l_ids) == 500
+    assert set(bundle.l_ids).issubset(set(population.p_target_ids))
+    assert set(bundle.l_ids).isdisjoint(set(population.h_scale_ids))
+
+
+def test_full_grid_allocation_split_uses_target_population_and_nested_corrections():
+    clean = _fake_clean()
+    config = dict(_config())
+    config.update(
+        {
+            "split_source": "p_target",
+            "budgets": [300, 500],
+            "validation_fraction": 0.2,
+            "allocation_grid": [0.025, 0.05, 0.10, 0.50, 0.90],
+            "scaling_law_params_raw": {"a": 17.4, "alpha": 0.57, "b": 2.83},
+        }
+    )
+    population = build_population_split(clean, config)
+    split = build_allocation_split(clean, config, budget_B=500, replication_id=0)
+    assert len(split.labeled_ids) == 500
+    assert len(split.validation_ids) == 100
+    assert len(split.effective_ids) == 400
+    assert len(split.unlabeled_ids) == 14500
+    assert set(split.labeled_ids).issubset(set(population.p_target_ids))
+    assert set(split.labeled_ids).isdisjoint(set(population.h_scale_ids))
+
+    previous: set[int] = set()
+    for rho in config["allocation_grid"]:
+        train = set(allocation_train_ids_for_rho(split, rho))
+        correction = set(allocation_correction_ids_for_rho(split, rho))
+        assert previous.issubset(train)
+        assert train.isdisjoint(correction)
+        assert train | correction == set(split.effective_ids)
+        previous = train
+
+    theory = theoretical_allocation(config, 500)
+    assert 0.0 < theory["theory_rho"] < 1.0
+    assert theory["theory_eval_rho"] in config["allocation_grid"]
+
+
+def test_full_grid_task_index_mapping():
+    config = dict(_config())
+    config.update(
+        {
+            "split_source": "p_target",
+            "budgets": [300, 500],
+            "allocation_grid": [0.025, 0.10],
+            "methods": [
+                {"name": "mse_stop_mse", "loss": "mse", "early_stopping_metric": "mse"},
+                {"name": "var_stop_var", "loss": "var", "early_stopping_metric": "var"},
+            ],
+        }
+    )
+    assert task_index_to_allocation_cell(config, 0) == ("mse_stop_mse", 300, 0, 0.025)
+    assert task_index_to_allocation_cell(config, 1) == ("mse_stop_mse", 300, 0, 0.10)
+    assert task_index_to_allocation_cell(config, 6) == ("mse_stop_mse", 500, 0, 0.025)
+    assert task_index_to_allocation_cell(config, 12) == ("var_stop_var", 300, 0, 0.025)
+
+
+def test_ppi_metrics_uses_correction_and_unlabeled_predictions():
+    clean = _fake_clean(20)
+    p_target_ids = np.arange(20)
+    labeled_ids = np.array([0, 1, 2, 3])
+    correction_pred = pd.DataFrame(
+        {
+            "sample_id": [2, 3],
+            "y_raw": [82.0, 83.0],
+            "y_scaled": [-1.6, -1.4],
+            "pred_scaled": [-1.5, -1.5],
+            "pred_raw": [82.5, 82.5],
+            "residual_scaled": [-0.1, 0.1],
+            "residual_raw": [-0.5, 0.5],
+        }
+    )
+    unlabeled_pred = pd.DataFrame(
+        {
+            "sample_id": [4, 5, 6],
+            "pred_scaled": [-1.0, -0.8, -0.6],
+            "pred_raw": [85.0, 86.0, 87.0],
+        }
+    )
+    metrics = ppi_metrics(clean, p_target_ids, labeled_ids, correction_pred, unlabeled_pred)
+    assert np.isclose(metrics["mu_hat_ppi_raw"], 86.0)
+    assert metrics["correction_size"] == 2
+    assert metrics["unlabeled_size"] == 3
+    assert metrics["ppi_var_est_raw"] > 0.0
+
+
+def test_validate_split_bundle_rejects_validation_leakage():
     bundle = SplitBundle(
         l_ids=np.array([1, 2, 3, 4]),
         v_stop_ids=np.array([1]),
         v_scale_ids=np.array([2]),
-        l_prime_ids=np.array([3, 4]),
+        l_prime_ids=np.array([2, 3, 4]),
         train_order_ids=np.array([3, 4]),
-        e_eval_ids=np.array([4, 5]),
     )
     try:
         validate_split_bundle(bundle, [1, 2])
     except ValueError as exc:
-        assert "E_eval overlaps L" in str(exc)
+        assert "L_prime is not exactly L minus V_stop and V_scale" in str(exc)
     else:
         raise AssertionError("expected leakage validation failure")
 

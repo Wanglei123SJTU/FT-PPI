@@ -29,7 +29,13 @@ class SplitBundle:
     v_scale_ids: np.ndarray
     l_prime_ids: np.ndarray
     train_order_ids: np.ndarray
-    e_eval_ids: np.ndarray
+
+
+@dataclass(frozen=True)
+class PopulationSplit:
+    p0_ids: np.ndarray
+    h_scale_ids: np.ndarray
+    p_target_ids: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,28 @@ def validation_scale_size(config: dict[str, Any]) -> int:
 
 def n_effective_labeled(config: dict[str, Any]) -> int:
     return int(config["budget_B"]) - validation_stop_size(config) - validation_scale_size(config)
+
+
+def experimental_population_size(config: dict[str, Any], clean_size: int) -> int:
+    return int(config.get("experimental_population_size", config.get("p0_size", clean_size)))
+
+
+def h_scale_size(config: dict[str, Any]) -> int:
+    if "h_scale_size" in config:
+        return int(config["h_scale_size"])
+    if "pilot_size" in config:
+        return int(config["pilot_size"])
+    if "budget_B" in config:
+        return int(config["budget_B"])
+    raise ValueError("h_scale_size must be set when budget_B is not present")
+
+
+def split_source(config: dict[str, Any]) -> str:
+    source = str(config.get("split_source", "h_scale")).lower()
+    allowed = {"h_scale", "p_target", "clean"}
+    if source not in allowed:
+        raise ValueError(f"split_source must be one of {sorted(allowed)}, got {source!r}")
+    return source
 
 
 def configured_losses(config: dict[str, Any]) -> list[str]:
@@ -143,34 +171,60 @@ def method_by_name(config: dict[str, Any], method_name: str) -> MethodSpec:
     return methods[name]
 
 
+def build_population_split(clean: pd.DataFrame, config: dict[str, Any]) -> PopulationSplit:
+    all_ids = clean["sample_id"].to_numpy(dtype=np.int64)
+    p0_size = experimental_population_size(config, len(all_ids))
+    h_size = h_scale_size(config)
+    if p0_size > len(all_ids):
+        raise ValueError(f"experimental_population_size={p0_size} exceeds clean rows={len(all_ids)}")
+    if h_size > p0_size:
+        raise ValueError(f"h_scale_size={h_size} exceeds experimental_population_size={p0_size}")
+
+    rng = np.random.default_rng(int(config.get("seed", 20260613)))
+    p0_ids = rng.choice(all_ids, size=p0_size, replace=False)
+    h_scale_ids = np.asarray(p0_ids[:h_size], dtype=np.int64)
+    p_target_ids = np.asarray(p0_ids[h_size:], dtype=np.int64)
+    return PopulationSplit(
+        p0_ids=np.asarray(p0_ids, dtype=np.int64),
+        h_scale_ids=h_scale_ids,
+        p_target_ids=p_target_ids,
+    )
+
+
+def source_ids_for_split(clean: pd.DataFrame, config: dict[str, Any]) -> np.ndarray:
+    source = split_source(config)
+    if source == "clean":
+        return clean["sample_id"].to_numpy(dtype=np.int64)
+    population = build_population_split(clean, config)
+    if source == "h_scale":
+        return population.h_scale_ids
+    return population.p_target_ids
+
+
 def build_replication_splits(clean: pd.DataFrame, config: dict[str, Any], replication_id: int) -> SplitBundle:
     l_size = int(config["budget_B"])
     v_stop_size = validation_stop_size(config)
     v_scale_size = validation_scale_size(config)
-    e_size = int(config["eval_size"])
     s_grid = [int(x) for x in config["s_grid"]]
     if max(s_grid) > l_size - v_stop_size - v_scale_size:
         raise ValueError("largest train size exceeds |L \\ (V_stop union V_scale)|")
-    if l_size + e_size > len(clean):
-        raise ValueError(f"need at least {l_size + e_size} clean rows, found {len(clean)}")
+    source_ids = source_ids_for_split(clean, config)
+    if l_size > len(source_ids):
+        raise ValueError(f"need at least {l_size} rows from split_source={split_source(config)!r}, found {len(source_ids)}")
 
     rng = np.random.default_rng(_rep_seed(config, replication_id))
-    all_ids = clean["sample_id"].to_numpy(dtype=np.int64)
-    l_ids = rng.choice(all_ids, size=l_size, replace=False)
+    l_ids = rng.choice(source_ids, size=l_size, replace=False)
     v_stop_ids = rng.choice(l_ids, size=v_stop_size, replace=False)
     remaining_after_stop = np.setdiff1d(l_ids, v_stop_ids, assume_unique=False)
     v_scale_ids = rng.choice(remaining_after_stop, size=v_scale_size, replace=False)
     l_prime_ids = np.setdiff1d(remaining_after_stop, v_scale_ids, assume_unique=False)
     train_order_ids = rng.permutation(l_prime_ids)
-    outside_l = np.setdiff1d(all_ids, l_ids, assume_unique=False)
-    e_eval_ids = rng.choice(outside_l, size=e_size, replace=False)
     bundle = SplitBundle(
         l_ids=np.asarray(l_ids, dtype=np.int64),
         v_stop_ids=np.asarray(v_stop_ids, dtype=np.int64),
         v_scale_ids=np.asarray(v_scale_ids, dtype=np.int64),
         l_prime_ids=np.asarray(l_prime_ids, dtype=np.int64),
         train_order_ids=np.asarray(train_order_ids, dtype=np.int64),
-        e_eval_ids=np.asarray(e_eval_ids, dtype=np.int64),
     )
     validate_split_bundle(bundle, s_grid)
     return bundle
@@ -194,15 +248,12 @@ def validate_split_bundle(bundle: SplitBundle, s_grid: list[int]) -> list[str]:
     v_stop = set(map(int, bundle.v_stop_ids))
     v_scale = set(map(int, bundle.v_scale_ids))
     l_prime = set(map(int, bundle.l_prime_ids))
-    e_eval = set(map(int, bundle.e_eval_ids))
     if len(l) != len(bundle.l_ids):
         failures.append("L has duplicate sample_ids")
     if len(v_stop) != len(bundle.v_stop_ids):
         failures.append("V_stop has duplicate sample_ids")
     if len(v_scale) != len(bundle.v_scale_ids):
         failures.append("V_scale has duplicate sample_ids")
-    if len(e_eval) != len(bundle.e_eval_ids):
-        failures.append("E_eval has duplicate sample_ids")
     if not v_stop.issubset(l):
         failures.append("V_stop is not a subset of L")
     if not v_scale.issubset(l):
@@ -211,8 +262,6 @@ def validate_split_bundle(bundle: SplitBundle, s_grid: list[int]) -> list[str]:
         failures.append("V_stop overlaps V_scale")
     if l_prime != l - v_stop - v_scale:
         failures.append("L_prime is not exactly L minus V_stop and V_scale")
-    if e_eval & l:
-        failures.append("E_eval overlaps L")
     previous: set[int] = set()
     for s in s_grid:
         current = set(map(int, train_ids_for_s(bundle, int(s))))
@@ -422,12 +471,12 @@ def train_once(
     train_df: pd.DataFrame,
     stop_df: pd.DataFrame,
     scale_df: pd.DataFrame,
-    eval_df: pd.DataFrame | None,
     batch_size: int,
     seed: int,
     loss_name: str,
     early_stopping_metric: str = "var",
-) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
+    extra_prediction_frames: dict[str, pd.DataFrame] | None = None,
+) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame] | tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
     mods = _require_training_modules()
     torch = mods["torch"]
     set_training_seeds(seed)
@@ -557,11 +606,18 @@ def train_once(
         restore_trainable_state(model, best_state)
     stop_pred = predict_frame(model, tokenizer, stop_df, config, torch, mods["DataLoader"], batch_size)
     scale_pred = predict_frame(model, tokenizer, scale_df, config, torch, mods["DataLoader"], batch_size)
-    eval_pred = (
-        predict_frame(model, tokenizer, eval_df, config, torch, mods["DataLoader"], batch_size)
-        if eval_df is not None and len(eval_df) > 0
-        else None
-    )
+    extra_predictions: dict[str, pd.DataFrame] = {}
+    if extra_prediction_frames:
+        for name, frame in extra_prediction_frames.items():
+            extra_predictions[str(name)] = predict_frame(
+                model,
+                tokenizer,
+                frame,
+                config,
+                torch,
+                mods["DataLoader"],
+                batch_size,
+            )
     runtime = {
         "runtime_seconds": time.time() - start,
         "actual_batch_size": int(batch_size),
@@ -588,7 +644,9 @@ def train_once(
     del model
     gc.collect()
     torch.cuda.empty_cache()
-    return runtime, stop_pred, scale_pred, eval_pred
+    if extra_prediction_frames:
+        return runtime, stop_pred, scale_pred, extra_predictions
+    return runtime, stop_pred, scale_pred
 
 
 def predict_frame(
@@ -605,7 +663,7 @@ def predict_frame(
     dataset = WineTokenizedDataset(frame, tokenizer, int(config["max_length"]))
     loader = DataLoader(
         dataset,
-        batch_size=int(config.get("eval_batch_size", batch_size)),
+        batch_size=int(config.get("prediction_batch_size", batch_size)),
         shuffle=False,
         collate_fn=collate,
         num_workers=0,
@@ -678,7 +736,21 @@ def write_cell_manifest(
     training_loss: str,
     early_stopping_metric: str,
     bundle: SplitBundle,
+    population: PopulationSplit | None = None,
 ) -> None:
+    population_counts: dict[str, int] = {}
+    population_hashes: dict[str, str] = {}
+    if population is not None:
+        population_counts = {
+            "P0": int(len(population.p0_ids)),
+            "H_scale": int(len(population.h_scale_ids)),
+            "P_target": int(len(population.p_target_ids)),
+        }
+        population_hashes = {
+            "P0": ids_hash(population.p0_ids),
+            "H_scale": ids_hash(population.h_scale_ids),
+            "P_target": ids_hash(population.p_target_ids),
+        }
     manifest = {
         "replication_id": int(replication_id),
         "s_train": int(s_train),
@@ -686,13 +758,15 @@ def write_cell_manifest(
         "method": str(loss_name).lower(),
         "training_loss": str(training_loss).lower(),
         "early_stopping_metric": str(early_stopping_metric).lower(),
+        "split_source": split_source(config),
+        "population_counts": population_counts,
+        "population_hashes": population_hashes,
         "counts": {
             "L": int(len(bundle.l_ids)),
             "V_stop": int(len(bundle.v_stop_ids)),
             "V_scale": int(len(bundle.v_scale_ids)),
             "L_prime": int(len(bundle.l_prime_ids)),
             "train": int(s_train),
-            "E_eval": int(len(bundle.e_eval_ids)),
         },
         "hashes": {
             "L": ids_hash(bundle.l_ids),
@@ -700,7 +774,6 @@ def write_cell_manifest(
             "V_scale": ids_hash(bundle.v_scale_ids),
             "L_prime": ids_hash(bundle.l_prime_ids),
             "train": ids_hash(train_ids_for_s(bundle, s_train)),
-            "E_eval": ids_hash(bundle.e_eval_ids),
         },
         "seed": _rep_seed(config, replication_id),
     }
@@ -736,13 +809,25 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_n
 
     output_dir.mkdir(parents=True, exist_ok=True)
     clean = clean_wine(config["input_csv"])
-    population_var_y_scaled = float(np.var(scaled_y(clean[Y_COL]), ddof=1))
+    population = build_population_split(clean, config)
+    source_ids = source_ids_for_split(clean, config)
+    source_points = clean.loc[clean["sample_id"].isin(source_ids), Y_COL].astype(float)
+    population_var_y_scaled = float(np.var(scaled_y(source_points), ddof=1))
     bundle = build_replication_splits(clean, config, replication_id)
     train_df = subset_by_ids(clean, train_ids_for_s(bundle, s_train), "train")
     stop_df = subset_by_ids(clean, bundle.v_stop_ids, "validation_stop")
     scale_df = subset_by_ids(clean, bundle.v_scale_ids, "validation_scale")
-    eval_df = subset_by_ids(clean, bundle.e_eval_ids, "eval") if len(bundle.e_eval_ids) else None
-    write_cell_manifest(output_dir, config, replication_id, s_train, method_name, training_loss, early_stopping_metric, bundle)
+    write_cell_manifest(
+        output_dir,
+        config,
+        replication_id,
+        s_train,
+        method_name,
+        training_loss,
+        early_stopping_metric,
+        bundle,
+        population,
+    )
 
     requested_batch = int(config["batch_size"])
     batch_candidates = [requested_batch]
@@ -771,12 +856,11 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_n
                 f"steps_per_epoch={steps_per_epoch_for_s(s_train, batch_size)}",
                 flush=True,
             )
-            runtime, stop_pred, scale_pred, eval_pred = train_once(
+            runtime, stop_pred, scale_pred = train_once(
                 config,
                 train_df,
                 stop_df,
                 scale_df,
-                eval_df,
                 batch_size=batch_size,
                 seed=_rep_seed(
                     config,
@@ -821,31 +905,31 @@ def train_cell(config: dict[str, Any], replication_id: int, s_train: int, loss_n
     epoch_history = runtime.pop("epoch_history", [])
     if epoch_history:
         pd.DataFrame(epoch_history).to_csv(output_dir / "epoch_history.csv", index=False)
-    eval_metrics = None
-    if eval_pred is not None:
-        eval_pred["replication_id"] = int(replication_id)
-        eval_pred["s_train"] = int(s_train)
-        eval_pred["split_role"] = "eval"
-        eval_pred.to_parquet(output_dir / "eval_predictions.parquet", index=False)
-        eval_metrics = prediction_metrics(eval_pred)
     metrics = {
         "replication_id": int(replication_id),
         "s_train": int(s_train),
         "budget_B": int(config["budget_B"]),
         "validation_stop_size": validation_stop_size(config),
         "validation_scale_size": validation_scale_size(config),
-        "eval_size": int(config["eval_size"]),
         "n_eff": n_effective_labeled(config),
         "model_name": config["model_name"],
         "loss": method_name,
         "method": method_name,
         "training_loss": training_loss,
         "early_stopping_metric": early_stopping_metric,
+        "split_source": split_source(config),
+        "experimental_population_size": int(len(population.p0_ids)),
+        "h_scale_size": int(len(population.h_scale_ids)),
+        "p_target_size": int(len(population.p_target_ids)),
+        "population_hashes": {
+            "P0": ids_hash(population.p0_ids),
+            "H_scale": ids_hash(population.h_scale_ids),
+            "P_target": ids_hash(population.p_target_ids),
+        },
         "population_var_y_scaled": population_var_y_scaled,
-        "population_var_y_raw": float(np.var(clean[Y_COL].astype(float), ddof=1)),
+        "population_var_y_raw": float(np.var(source_points, ddof=1)),
         "validation_stop": prediction_metrics(stop_pred),
         "validation_scale": prediction_metrics(scale_pred),
-        "eval": eval_metrics,
         "runtime": runtime,
     }
     write_json(metrics_path, metrics)
@@ -887,8 +971,11 @@ def _load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
                     "budget_B": int(metrics["budget_B"]),
                     "validation_stop_size": int(metrics.get("validation_stop_size", metrics.get("validation_size", 0))),
                     "validation_scale_size": int(metrics.get("validation_scale_size", 0)),
-                    "eval_size": int(metrics["eval_size"]),
                     "n_eff": int(metrics["n_eff"]),
+                    "split_source": str(metrics.get("split_source", "clean")),
+                    "experimental_population_size": int(metrics.get("experimental_population_size", 0)),
+                    "h_scale_size": int(metrics.get("h_scale_size", 0)),
+                    "p_target_size": int(metrics.get("p_target_size", 0)),
                     "population_var_y_scaled": float(metrics["population_var_y_scaled"]),
                     "validation_stop_residual_var": float(metrics["validation_stop"]["residual_var_scaled"]),
                     "validation_stop_residual_mean": float(metrics["validation_stop"]["residual_mean_scaled"]),
@@ -917,10 +1004,6 @@ def _load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
                     "final_train_loss": float(metrics["runtime"]["final_train_loss"]),
                     "mean_train_loss": float(metrics["runtime"]["mean_train_loss"]),
                 }
-                if metrics.get("eval") is not None:
-                    row["eval_residual_var"] = float(metrics["eval"]["residual_var_scaled"])
-                    row["eval_rmse"] = float(metrics["eval"]["rmse_scaled"])
-                    row["eval_corr"] = float(metrics["eval"]["correlation"])
                 rows.append(row)
     if missing:
         missing_text = "\n".join(
@@ -1015,10 +1098,8 @@ def build_scaling_fits(metrics: pd.DataFrame) -> pd.DataFrame:
         group = group.sort_values("s_train")
         n_eff = int(group["n_eff"].iloc[0])
         population_var = float(group["population_var_y_scaled"].iloc[0])
-        sources = [("validation_scale", "validation_scale_residual_var")]
-        if "eval_residual_var" in group.columns and group["eval_residual_var"].notna().any():
-            sources.append(("eval", "eval_residual_var"))
-        for source, col in sources:
+        source, col = "validation_scale", "validation_scale_residual_var"
+        for source, col in [(source, col)]:
             fit = fit_scaling_law(group["s_train"].to_numpy(), group[col].to_numpy(), population_var)
             optimum = fitted_optimum(fit, n_eff)
             observed_objectives = [
@@ -1054,12 +1135,8 @@ def replay_rampup(metrics: pd.DataFrame, min_points_for_stop: int = 4) -> pd.Dat
     if "loss" not in metrics.columns:
         metrics["loss"] = "var"
     rows = []
-    oracle_col = (
-        "eval_residual_var"
-        if "eval_residual_var" in metrics.columns and metrics["eval_residual_var"].notna().any()
-        else "validation_scale_residual_var"
-    )
-    oracle_source = "eval" if oracle_col == "eval_residual_var" else "validation_scale"
+    oracle_col = "validation_scale_residual_var"
+    oracle_source = "validation_scale"
     for (loss_name, rep), group in metrics.groupby(["loss", "replication_id"]):
         group = group.sort_values("s_train").reset_index(drop=True)
         n_eff = int(group["n_eff"].iloc[0])
@@ -1154,9 +1231,6 @@ def build_loss_comparison_summary(metrics: pd.DataFrame) -> pd.DataFrame:
         "validation_scale_residual_var",
         "validation_scale_rmse",
         "validation_scale_corr",
-        "eval_residual_var",
-        "eval_rmse",
-        "eval_corr",
         "epochs_trained",
         "best_epoch",
         "runtime_seconds",
@@ -1196,7 +1270,7 @@ def build_loss_comparison_summary(metrics: pd.DataFrame) -> pd.DataFrame:
                 }
                 left_rows = metrics[(metrics["loss"] == left) & (metrics["s_train"] == s_train)]
                 right_rows = metrics[(metrics["loss"] == right) & (metrics["s_train"] == s_train)]
-                for col in ["validation_scale_residual_var", "eval_residual_var"]:
+                for col in ["validation_scale_residual_var"]:
                     if col not in metrics.columns:
                         continue
                     left_value = float(left_rows[col].mean())
@@ -1215,10 +1289,30 @@ def leakage_check(clean: pd.DataFrame, config: dict[str, Any]) -> dict[str, Any]
     failures = []
     rep_reports = []
     s_grid = [int(x) for x in config["s_grid"]]
+    population = build_population_split(clean, config)
+    source = split_source(config)
+    p0 = set(map(int, population.p0_ids))
+    h_scale = set(map(int, population.h_scale_ids))
+    p_target = set(map(int, population.p_target_ids))
+    if len(p0) != len(population.p0_ids):
+        failures.append({"population": "P0", "error": "duplicate sample_ids"})
+    if len(h_scale) != len(population.h_scale_ids):
+        failures.append({"population": "H_scale", "error": "duplicate sample_ids"})
+    if len(p_target) != len(population.p_target_ids):
+        failures.append({"population": "P_target", "error": "duplicate sample_ids"})
+    if h_scale & p_target:
+        failures.append({"population": "H_scale/P_target", "error": "sets overlap"})
+    if h_scale | p_target != p0:
+        failures.append({"population": "P0", "error": "P0 is not exactly H_scale union P_target"})
     for rep in config["replication_ids"]:
         try:
             bundle = build_replication_splits(clean, config, int(rep))
             validate_split_bundle(bundle, s_grid)
+            l_set = set(map(int, bundle.l_ids))
+            if source == "h_scale" and not l_set.issubset(h_scale):
+                raise ValueError("L is not a subset of H_scale")
+            if source == "p_target" and not l_set.issubset(p_target):
+                raise ValueError("L is not a subset of P_target")
             rep_reports.append(
                 {
                     "replication_id": int(rep),
@@ -1227,14 +1321,12 @@ def leakage_check(clean: pd.DataFrame, config: dict[str, Any]) -> dict[str, Any]
                         "V_stop": len(bundle.v_stop_ids),
                         "V_scale": len(bundle.v_scale_ids),
                         "L_prime": len(bundle.l_prime_ids),
-                        "E_eval": len(bundle.e_eval_ids),
                     },
                     "hashes": {
                         "L": ids_hash(bundle.l_ids),
                         "V_stop": ids_hash(bundle.v_stop_ids),
                         "V_scale": ids_hash(bundle.v_scale_ids),
                         "L_prime": ids_hash(bundle.l_prime_ids),
-                        "E_eval": ids_hash(bundle.e_eval_ids),
                     },
                 }
             )
@@ -1243,12 +1335,19 @@ def leakage_check(clean: pd.DataFrame, config: dict[str, Any]) -> dict[str, Any]
     return {
         "passed": not failures,
         "failures": failures,
+        "split_source": source,
+        "population_counts": {
+            "P0": len(population.p0_ids),
+            "H_scale": len(population.h_scale_ids),
+            "P_target": len(population.p_target_ids),
+        },
+        "population_hashes": {
+            "P0": ids_hash(population.p0_ids),
+            "H_scale": ids_hash(population.h_scale_ids),
+            "P_target": ids_hash(population.p_target_ids),
+        },
         "replications": rep_reports,
-        "eval_usage": (
-            "E_eval is disabled for this timing run."
-            if int(config.get("eval_size", 0)) == 0
-            else "E_eval is sampled from P minus L and is used only by aggregate ex-post diagnostics."
-        ),
+        "validation_usage": "V_scale is the sole scaling-law validation set.",
     }
 
 
@@ -1272,8 +1371,6 @@ def write_figures(metrics: pd.DataFrame, scaling: pd.DataFrame, ramp: pd.DataFra
     s_grid = np.sort(metrics["s_train"].unique())
     with PdfPages(output_dir / "scaling_law_full_grid.pdf") as pdf:
         sources = [("validation_scale", "validation_scale_residual_var")]
-        if "eval_residual_var" in metrics.columns and metrics["eval_residual_var"].notna().any():
-            sources.append(("eval", "eval_residual_var"))
         for loss_name in sorted(metrics["loss"].unique()):
             loss_metrics = metrics[metrics["loss"] == loss_name]
             for source, col in sources:
@@ -1298,8 +1395,6 @@ def write_figures(metrics: pd.DataFrame, scaling: pd.DataFrame, ramp: pd.DataFra
                 plt.close(fig)
 
     comparison_sources = [("validation_scale", "validation_scale_residual_var")]
-    if "eval_residual_var" in metrics.columns and metrics["eval_residual_var"].notna().any():
-        comparison_sources.append(("eval", "eval_residual_var"))
     with PdfPages(output_dir / "loss_comparison_residual_variance.pdf") as pdf:
         for source, col in comparison_sources:
             if col not in metrics.columns or metrics[col].isna().all():

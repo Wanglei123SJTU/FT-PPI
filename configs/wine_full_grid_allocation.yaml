@@ -1,24 +1,25 @@
 input_csv: Data/wine_data.csv
-output_dir: /gscratch/scrubbed/lei0603/ft-ppi/artifacts/wine_loss_controlled_b10000_r10_stopmetric_s50_to700
+output_dir: /gscratch/scrubbed/lei0603/ft-ppi/artifacts/wine_full_grid_allocation
 seed: 20260613
 
 experimental_population_size: 25000
 h_scale_size: 10000
-split_source: h_scale
+split_source: p_target
 
-budget_B: 10000
-validation_stop_size: 1000
-validation_scale_size: 1000
+budgets: [300, 500, 700, 1000]
+validation_fraction: 0.20
 replication_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-s_grid: [50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700]
-min_points_for_stop: 6
+allocation_grid: [0.025, 0.05, 0.075, 0.10, 0.125, 0.15, 0.20, 0.30, 0.40, 0.50, 0.70, 0.90]
+
+scaling_law_params_raw:
+  a: 17.401426337966647
+  alpha: 0.573834715845365
+  b: 2.8270096710040584
+
 methods:
   - name: mse_stop_mse
     loss: mse
     early_stopping_metric: mse
-  - name: mse_stop_var
-    loss: mse
-    early_stopping_metric: var
   - name: var_stop_var
     loss: var
     early_stopping_metric: var
