@@ -106,6 +106,7 @@ If a task discovers that a previous job actually completed after a runner discon
 - Treat results as verified only when there is a completed task marker or a Slurm `COMPLETED` status with expected output files.
 - If the runner disconnects before a final summary is printed, mark the task as submitted or partially observed, not completed.
 - Prefer reporting exact artifact paths, task IDs, Slurm job IDs, config names, and key metrics.
+- For long experiments, after the first few cells/replications complete, estimate runtime from the observed per-cell/per-replication durations and report an approximate remaining time and total wall-clock expectation.
 - After an experiment finishes, proactively inspect the outputs, make clear and readable visualizations for the central metrics when possible, and report the most important empirical takeaways without waiting for the user to ask.
 - Distinguish clearly between:
   - pipeline smoke success,

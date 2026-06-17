@@ -21,11 +21,12 @@ METHOD_LABELS = {
 }
 
 METHOD_COLORS = {
-    "mse_stop_mse": "#3B6EA8",
-    "mse_stop_var": "#D95F02",
-    "var_stop_var": "#1B9E77",
-    "mse": "#D95F02",
-    "var": "#1B9E77",
+    # Okabe-Ito inspired, colorblind-friendly tones used in many ML papers.
+    "mse_stop_mse": "#4477AA",
+    "mse_stop_var": "#EE7733",
+    "var_stop_var": "#228833",
+    "mse": "#EE7733",
+    "var": "#228833",
 }
 
 METHOD_MARKERS = {
@@ -35,6 +36,12 @@ METHOD_MARKERS = {
     "mse": "o",
     "var": "o",
 }
+
+SCALING_FIT_COLOR = "#E66101"
+MEASURED_VAR_COLOR = "#005A9C"
+VAR_METHOD_COLOR = "#1B7837"
+NOISE_FLOOR_COLOR = "#9E9E9E"
+BASELINE_COLOR = "#9C2F6F"
 
 
 @dataclass(frozen=True)
@@ -140,10 +147,6 @@ def clean_wine_baseline(data_path: Path) -> float | None:
 
 def _resolve_value_column(raw: pd.DataFrame, value: str) -> tuple[str, float, str, str]:
     candidates = {
-        "eval": [
-            ("eval_residual_var_raw", 1.0),
-            ("eval_residual_var", 25.0),
-        ],
         "validation_scale": [
             ("validation_scale_residual_var_raw", 1.0),
             ("validation_scale_residual_var", 25.0),
@@ -156,17 +159,15 @@ def _resolve_value_column(raw: pd.DataFrame, value: str) -> tuple[str, float, st
         ],
     }
     labels = {
-        "eval": "Eval residual variance",
         "validation_scale": "Validation-scale residual variance",
         "validation_stop": "Validation-stop residual variance",
     }
     stems = {
-        "eval": "eval_residual_variance",
         "validation_scale": "validation_scale_residual_variance",
         "validation_stop": "validation_stop_residual_variance",
     }
     if value == "auto":
-        search_order = ["eval", "validation_scale", "validation_stop"]
+        search_order = ["validation_scale", "validation_stop"]
     else:
         if value not in candidates:
             raise ValueError(f"Unknown --value '{value}'")
@@ -291,6 +292,12 @@ def method_label(method: str) -> str:
 
 
 def method_color(method: str) -> str:
+    if method == "mse_stop_mse":
+        return MEASURED_VAR_COLOR
+    if method == "mse_stop_var":
+        return SCALING_FIT_COLOR
+    if method == "var_stop_var":
+        return VAR_METHOD_COLOR
     return METHOD_COLORS.get(method, "#4C78A8")
 
 
@@ -301,17 +308,64 @@ def method_marker(method: str) -> str:
 def setup_style() -> None:
     plt.rcParams.update(
         {
-            "font.size": 11,
-            "axes.titlesize": 13,
-            "axes.labelsize": 12,
-            "legend.fontsize": 10,
-            "xtick.labelsize": 10,
-            "ytick.labelsize": 10,
-            "figure.dpi": 170,
+            "font.family": "DejaVu Sans",
+            "font.size": 8.8,
+            "axes.titlesize": 9.4,
+            "axes.labelsize": 10.0,
+            "legend.fontsize": 7.8,
+            "xtick.labelsize": 8.4,
+            "ytick.labelsize": 8.4,
+            "figure.dpi": 180,
+            "savefig.dpi": 320,
             "axes.spines.top": False,
             "axes.spines.right": False,
+            "axes.linewidth": 0.9,
+            "xtick.major.width": 0.8,
+            "ytick.major.width": 0.8,
+            "xtick.minor.width": 0.6,
+            "ytick.minor.width": 0.6,
+            "lines.solid_capstyle": "round",
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
         }
     )
+
+
+def apply_paper_axis(ax: plt.Axes, *, minor_grid: bool = False) -> None:
+    ax.set_axisbelow(True)
+    ax.grid(False)
+    ax.yaxis.grid(True, which="major", color="#DADADA", lw=0.72, ls="-", alpha=0.82)
+    if minor_grid:
+        ax.minorticks_on()
+        ax.yaxis.grid(True, which="minor", color="#EFEFEF", lw=0.45, ls="-", alpha=0.78)
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color("#2F2F2F")
+    ax.tick_params(axis="both", which="major", length=4.0, color="#2F2F2F")
+    ax.tick_params(axis="both", which="minor", length=2.4, color="#666666")
+
+
+def add_top_legend(ax: plt.Axes, *, ncol: int) -> None:
+    legend = ax.legend(
+        frameon=False,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.025),
+        ncol=ncol,
+        columnspacing=1.25,
+        handlelength=2.2,
+        handletextpad=0.55,
+        borderaxespad=0.0,
+    )
+
+
+def apply_reference_scaling_axis(ax: plt.Axes) -> None:
+    ax.set_axisbelow(True)
+    ax.grid(True, which="major", axis="both", color="#BDBDBD", lw=0.55, ls=":", alpha=0.9)
+    ax.grid(False, which="minor")
+    ax.minorticks_off()
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color("black")
+        ax.spines[spine].set_linewidth(0.9)
+    ax.tick_params(axis="both", which="major", length=3.5, width=0.8, color="black")
 
 
 def save_figure(fig: plt.Figure, output_dir: Path, stem: str) -> None:
@@ -352,28 +406,29 @@ def plot_linear_scaling(
     dense = np.linspace(float(group["s_train"].min()), float(group["s_train"].max()), 500)
     yerr = np.vstack([group["mean"] - group["ci95_low"], group["ci95_high"] - group["mean"]])
 
-    fig, ax = plt.subplots(figsize=(7.2, 5.1))
-    ax.plot(dense, power_law(dense, fit["a"], fit["alpha"], fit["b"]), color="#D55E00", lw=2.4, label="Scaling fit")
-    ax.axhline(fit["b"], color="#888888", lw=1.8, ls="--", label="b (noise floor)")
+    fig, ax = plt.subplots(figsize=(4.9, 3.9))
+    ax.plot(dense, power_law(dense, fit["a"], fit["alpha"], fit["b"]), color=SCALING_FIT_COLOR, lw=1.5, label="Scaling fit")
+    ax.axhline(fit["b"], color=NOISE_FLOOR_COLOR, lw=1.0, ls="--", label="b (Noise Floor)")
     ax.errorbar(
         group["s_train"],
         group["mean"],
         yerr=yerr if has_replications else None,
         fmt="o",
-        ms=6,
-        color="#0B3C68",
-        ecolor="#0B3C68",
-        elinewidth=1.4,
-        capsize=3.5,
+        ms=4.7,
+        color=MEASURED_VAR_COLOR,
+        ecolor=MEASURED_VAR_COLOR,
+        elinewidth=0.9,
+        capsize=2.5,
         mec="black",
-        mew=0.8,
+        mew=0.6,
         label="Measured Var" if has_replications else "Measured Var (mean only)",
     )
     ax.set_xlabel("FT subset size (s)", fontweight="bold")
     ax.set_ylabel(r"$\mathrm{Var}(Y - f_s(X))$", fontweight="bold")
-    ax.set_title(f"{method_label(primary_method)}: power-law fit")
-    ax.grid(True, ls=":", alpha=0.55)
-    ax.legend(frameon=False, loc="upper right")
+    ax.set_title("")
+    apply_reference_scaling_axis(ax)
+    ax.legend(frameon=False, loc="upper right", handlelength=2.0, borderaxespad=0.45, fontsize=7.8)
+    fig.tight_layout(pad=0.25)
     preview_note(ax, has_replications)
     save_figure(fig, output_dir, f"{primary_method}_{value_stem}_power_law_linear_raw")
 
@@ -399,33 +454,34 @@ def plot_loglog_scaling(
     yerr = np.vstack([ylog - np.log10(lower_centered), np.log10(upper_centered) - ylog])
     dense = np.linspace(float(group["s_train"].min()), float(group["s_train"].max()), 500)
 
-    fig, ax = plt.subplots(figsize=(7.2, 5.1))
+    fig, ax = plt.subplots(figsize=(4.9, 3.9))
     ax.plot(
         np.log10(dense),
         np.log10(np.maximum(power_law(dense, fit["a"], fit["alpha"], fit["b"]) - fit["b"], eps)),
-        color="#D55E00",
-        lw=2.4,
-        label=f"Scaling fit (slope = {-float(fit['alpha']):.3f})",
+        color=SCALING_FIT_COLOR,
+        lw=1.5,
+        label=f"Scaling Fit (slope = {-float(fit['alpha']):.3f})",
     )
     ax.errorbar(
         xlog,
         ylog,
         yerr=yerr if has_replications else None,
         fmt="o",
-        ms=6,
-        color="#0B3C68",
-        ecolor="#0B3C68",
-        elinewidth=1.4,
-        capsize=3.5,
+        ms=4.7,
+        color=MEASURED_VAR_COLOR,
+        ecolor=MEASURED_VAR_COLOR,
+        elinewidth=0.9,
+        capsize=2.5,
         mec="black",
-        mew=0.8,
-        label=r"Measured $\log(\mathrm{Var}-b)$" if has_replications else r"Measured $\log(\mathrm{Var}-b)$ (mean only)",
+        mew=0.6,
+        label="Measured (Var - b)" if has_replications else "Measured (Var - b, mean only)",
     )
     ax.set_xlabel("log(FT subset size)", fontweight="bold")
     ax.set_ylabel(r"$\log(\mathrm{Var}(Y - f_s(X)) - b)$", fontweight="bold")
-    ax.set_title(f"{method_label(primary_method)}: log-log diagnostic")
-    ax.grid(True, ls=":", alpha=0.55)
-    ax.legend(frameon=False, loc="upper right")
+    ax.set_title("")
+    apply_reference_scaling_axis(ax)
+    ax.legend(frameon=False, loc="upper right", handlelength=2.0, borderaxespad=0.45, fontsize=7.8)
+    fig.tight_layout(pad=0.25)
     preview_note(ax, has_replications)
     save_figure(fig, output_dir, f"{primary_method}_{value_stem}_power_law_loglog_raw")
 
@@ -441,7 +497,7 @@ def plot_method_comparison(
     methods = [m for m in ["mse_stop_mse", "mse_stop_var", "var_stop_var", "mse", "var"] if m in set(summary["method"])]
     methods += [m for m in summary["method"].unique() if m not in methods]
 
-    fig, ax = plt.subplots(figsize=(8.9, 5.6))
+    fig, ax = plt.subplots(figsize=(6.75, 4.35))
     for method in methods:
         group = summary[summary["method"] == method].sort_values("s_train")
         color = method_color(method)
@@ -449,23 +505,41 @@ def plot_method_comparison(
             group["s_train"],
             group["mean"],
             color=color,
-            lw=2.6,
+            lw=1.65,
             marker=method_marker(method),
-            ms=6,
+            ms=4.9,
             mec="black",
-            mew=0.7,
+            mew=0.55,
             label=method_label(method),
         )
         if has_replications:
-            ax.fill_between(group["s_train"], group["ci95_low"], group["ci95_high"], color=color, alpha=0.14, lw=0)
-    ax.axhline(baseline_var, color="#B23A35", lw=1.8, ls="--", label=f"Baseline Var = {baseline_var:.3f}")
+            ax.fill_between(group["s_train"], group["ci95_low"], group["ci95_high"], color=color, alpha=0.10, lw=0)
+    ax.axhline(baseline_var, color=BASELINE_COLOR, lw=1.2, ls="--")
+    x_min = float(summary["s_train"].min())
+    x_max = float(summary["s_train"].max())
+    ax.text(
+        x_max - 12,
+        baseline_var + 0.02,
+        f"Baseline Var = {baseline_var:.3f}",
+        ha="right",
+        va="bottom",
+        color=BASELINE_COLOR,
+        fontsize=8.6,
+    )
     ax.set_xlabel("FT subset size (s)", fontweight="bold")
     ax.set_ylabel(r"$\mathrm{Var}(Y-\hat{Y})$ on raw rating scale", fontweight="bold")
-    ax.set_title(f"{value_label} across loss / stopping rules")
-    ax.grid(True, which="major", ls=":", alpha=0.6)
-    ax.minorticks_on()
-    ax.grid(True, which="minor", ls=":", alpha=0.22)
-    ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0)
+    ax.set_title("")
+    apply_reference_scaling_axis(ax)
+    ax.set_xlim(x_min - 12, x_max + 12)
+    ax.legend(
+        frameon=False,
+        loc="upper right",
+        bbox_to_anchor=(0.99, 0.91),
+        handlelength=2.0,
+        borderaxespad=0.2,
+        fontsize=7.8,
+    )
+    fig.tight_layout(pad=0.25)
     preview_note(ax, has_replications)
     save_figure(fig, output_dir, f"method_comparison_{value_stem}_raw")
 
@@ -474,9 +548,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Plot Wine loss scaling diagnostics.")
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--data-path", type=Path, default=Path("Code/wine_data.csv"))
+    parser.add_argument("--data-path", type=Path, default=Path("Data/wine_data.csv"))
     parser.add_argument("--primary-method", default="var_stop_var")
-    parser.add_argument("--value", choices=["auto", "eval", "validation_scale", "validation_stop"], default="auto")
+    parser.add_argument("--value", choices=["auto", "validation_scale", "validation_stop"], default="validation_scale")
     parser.add_argument("--n-eff", type=float, default=8000.0)
     args = parser.parse_args()
 

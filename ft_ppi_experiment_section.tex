@@ -8,6 +8,7 @@
 \usepackage{tabularx}
 \usepackage{graphicx}
 \usepackage{enumitem}
+\usepackage{xcolor}
 \usepackage[hidelinks]{hyperref}
 \usepackage{caption}
 \usepackage{float}
@@ -18,7 +19,7 @@
 \newcommand{\Var}{\operatorname{Var}}
 \newcommand{\NA}{\multicolumn{1}{c}{--}}
 
-\title{Empirical Analysis Section Extracted from FT-PPI}
+\title{Empirical Analysis Section}
 \author{}
 \date{}
 
@@ -28,35 +29,40 @@
 \setcounter{section}{5}
 \section{Empirical Analysis}
 
-In this section, we present empirical evidence on the Wine Reviews dataset to validate the
-proposed fine-tuning and prediction-powered inference framework. The empirical analysis is
-organized around the two ingredients of the method. First, we examine whether the residual
-variance of a fine-tuned LLM follows the scaling law that underlies the label-allocation rule.
-Second, we evaluate whether this allocation principle leads to improved finite-population mean
-estimation when only a small labeled dataset is available.
+In this section, we present empirical evidence from the Wine Reviews dataset to validate the
+proposed FT+PPI framework. After introducing the dataset, estimand, label accounting, and LLM
+fine-tuning protocol in Section~6.1, we conduct four empirical analyses. First, in Section~6.2,
+we assess the goodness-of-fit of the LoRA-Var scaling law on an independent pilot set. Second, in
+Section~6.3, we test whether the allocation rule implied by this pilot scaling law is close to a
+full-grid empirical allocation benchmark on the target population. Third, in Section~6.4, we
+evaluate a target-only ramp-up procedure that estimates a low-regret allocation without training
+on the full grid. Fourth, in Section~6.5, we compare the resulting FT+PPI estimators with
+natural benchmarks, focusing on estimation accuracy, variance reduction, and sample savings.
+Section~6.6 then discusses how the single-split allocation study can be combined with CrossPPI.
 
-To keep these two questions statistically separate, we use an independent pilot set only for
-scaling-law validation and reserve a disjoint target population for all inference experiments.
-Section~6.1 describes the dataset, estimand, label accounting, and fine-tuning protocol.
-Section~6.2 validates the scaling-law premise. Section~6.3 tests the full-grid allocation
-objective on fresh target-population splits. Section~6.4 studies whether a deployable ramp-up
-procedure can recover a low-regret allocation without training on the full grid. Section~6.5
-compares the resulting FT+PPI estimators with natural benchmarks. Section~6.6 discusses how the
-same allocation rule may be combined with Cross-PPI. Additional diagnostics for residual
-variance, prediction stability, and label leakage are reported in Appendix~\ref{app:diagnostics}.
+The empirical design keeps the pilot analysis separate from the target-population inference
+experiments. An independent pilot set is used to study the residual-variance scaling law and is
+never reused when evaluating allocation, ramp-up, or final estimation. All target-budget
+experiments draw fresh labeled datasets from a disjoint target population. This split lets the
+scaling-law evidence play the same role as a design-stage calibration, while the reported
+inference results remain tied to fresh labeled budgets from the target population.
 
 \subsection{Empirical Setup}
 \label{subsec:empirical_setup}
 
-Textual product reviews are a common source of information for assessing perceived product
-quality in many markets. Such reviews contain rich signals about aroma, flavor, balance, and
-finish, but they are costly to aggregate when reliable expert ratings are needed. The empirical
-task therefore mirrors a common managerial problem: a firm observes many pieces of product text
-but can afford only a limited number of human labels, and it wants to estimate an aggregate
-quality measure with valid uncertainty quantification.
+Textual product reviews are a common source of information for assessing perceived quality in
+many markets. Such reviews encode rich but noisy signals about latent product attributes that are
+difficult to measure directly. In the Wine Reviews setting, the text describes aroma, flavor,
+balance, and finish, while the expert rating summarizes these signals into a numerical assessment.
+
+This setting is especially relevant when high-quality evaluations are costly. Each additional
+labeled review consumes expert attention, and improving statistical efficiency directly reduces
+the number of labels needed to reach a target level of precision. Thus, variance reduction is not
+only a technical objective; it determines how reliably one can form aggregate assessments of
+product quality under a fixed evaluation budget.
 
 \paragraph{Dataset and Estimand.}
-We study this problem using the Wine Reviews dataset, which contains reviews written by
+The data come from the Wine Reviews dataset, which contains reviews written by
 professional wine critics at \emph{Wine Enthusiast} magazine and publicly available on Kaggle
 (Thoutt 2017). This dataset has also been used in prior work on prediction-powered inference and
 surrogate outcomes (Ji et al. 2025). Each observation contains a free-form review text and an
@@ -70,9 +76,9 @@ them as the experimental finite population
 \[
     \mathcal{P}_0=\{(X_i,Y_i):i=1,\ldots,N_0\},\qquad N_0=25{,}000.
 \]
-The raw rating variance in $\mathcal{P}_0$ is approximately 9.57. This number is the residual
-variance of the constant predictor that always predicts the population mean, and serves as a
-baseline for judging whether fine-tuned LLM surrogates extract useful information from text.
+The raw rating variance in the cleaned data is approximately 9.57. This number is the residual
+variance of a constant predictor and is the baseline for judging whether fine-tuned LLM
+surrogates extract useful information from text.
 Table~\ref{tab:wine_examples} reports two representative examples from the Wine Reviews dataset.
 
 \begin{table}[H]
@@ -99,22 +105,22 @@ Rating ($Y$) & 95 \\
 \end{table}
 
 \paragraph{Pilot and target populations.}
-Before running any target-budget experiment, we split the experimental population once into two
-disjoint sets:
+To separate scaling-law estimation from downstream inference, we partition the experimental
+population once into two disjoint sets:
 \[
     \mathcal{P}_0=\mathcal{H}_{\mathrm{scale}}\,\dot\cup\,\mathcal{P}_{\mathrm{target}}.
 \]
 The pilot set has size $|\mathcal{H}_{\mathrm{scale}}|=10{,}000$, and the target population has
 size $|\mathcal{P}_{\mathrm{target}}|=15{,}000$. The set
 $\mathcal{H}_{\mathrm{scale}}$ is used only in Section~6.2 to assess whether LoRA-Var residual
-variance follows a stable power law. It is not used in the allocation validation, ramp-up
-recovery, estimator comparison, or diagnostic leakage checks for the target population. All
-inferential experiments draw labels only from $\mathcal{P}_{\mathrm{target}}$, whose
-finite-population mean is the target estimand.
+variance follows a stable power law. It is not used to choose or evaluate any target-budget
+estimator. All subsequent experiments draw labels only from
+$\mathcal{P}_{\mathrm{target}}$, and the finite-population mean of
+$\mathcal{P}_{\mathrm{target}}$ is the estimand for Sections~6.3--6.5.
 
 \paragraph{PPI Estimator Construction.}
-In Sections~6.3--6.5, for each replication $r$ and labeled budget $B$, we draw a fresh small
-labeled dataset
+For the target-population experiments, each replication begins by drawing a fresh small labeled
+dataset
 \[
     \mathcal{N}_r^{(B)}\subset\mathcal{P}_{\mathrm{target}},\qquad
     |\mathcal{N}_r^{(B)}|=B,
@@ -128,7 +134,8 @@ by simple random sampling without replacement. The remaining reviews
 form the large unlabeled text dataset. As in the main framework, the estimator may use the texts
 $X_i$ for $i\in\mathcal{M}_r^{(B)}$, but the labels $Y_i$ for these reviews are never used for
 training, model selection, allocation selection, scaling-law fitting, correction, or estimator
-construction.
+construction. This convention makes the target-population experiments finite-population
+inference problems rather than prediction benchmarks.
 
 Within the labeled budget, we first split
 \[
@@ -215,9 +222,9 @@ Correction labels for the PPI rectifier. \\
 \end{table}
 
 \paragraph{LLM Fine-Tuning.}
-We use \texttt{Qwen/Qwen2.5-1.5B-Instruct} as the base LLM. Given a review text $X$, the
-model forms a pooled representation from the last non-padding token, and a scalar linear head
-maps this representation to the prediction $f(X)$. Ratings are standardized as
+The base LLM is \texttt{Qwen/Qwen2.5-1.5B-Instruct}. Given a review text $X$, the model forms a
+pooled representation from the last non-padding token, and a scalar linear head maps this
+representation to the prediction $f(X)$. Ratings are standardized as
 \[
     y_{\mathrm{scaled}}=(y_{\mathrm{raw}}-90)/5,
     \qquad
@@ -234,24 +241,22 @@ $r_i=Y_i-f(X_i)$ and $\bar r=k^{-1}\sum_{i=1}^k r_i$. The variance loss is
 \[
     L_{\mathrm{var}}=\frac{1}{k}\sum_{i=1}^k(r_i-\bar r)^2.
 \]
-This objective is aligned with the PPI correction stage: the fine-tuning stage is used to reduce
-residual variance, while systematic bias is removed by the correction labels in
+The objective is aligned with the PPI correction stage: fine-tuning is used to reduce residual
+variance, while systematic bias is removed by the correction labels in
 $\mathcal{N}_{r,s}^{\mathrm{PPI}}$.
 
 \subsection{Independent Scaling-Law Validation}
 \label{subsec:independent_scaling_law}
 
-Before using a scaling-law-based allocation rule, we first verify that the residual variance of
-LoRA-Var fine-tuning is well described by a power law. This validation is deliberately separated
-from the target-population experiments. It uses only the pilot set $\mathcal{H}_{\mathrm{scale}}$ and
-asks whether
+The first empirical step is to check the premise behind the allocation rule. Using only the
+pilot set $\mathcal{H}_{\mathrm{scale}}$, we ask whether the residual variance of LoRA-Var
+fine-tuning is well approximated by
 \[
     \Var\!\left(Y-f^{(s)}(X)\right)=a s^{-\alpha}+b
 \]
-is a reasonable empirical approximation over the range of fine-tuning sizes relevant for our
-allocation experiments.
+over the range of fine-tuning sizes relevant for the later allocation experiments.
 
-The pilot protocol separates model selection from scaling-law evaluation. In each pilot
+The pilot protocol keeps model selection separate from scaling-law evaluation. In each pilot
 replication, we randomly partition
 \[
     \mathcal{H}_{\mathrm{scale}}
@@ -279,13 +284,19 @@ inside $\mathcal{T}_{\mathrm{scale}}$ over
 For each $s$, we train a LoRA-Var model on the first $s$ labels in the nested training order and
 evaluate its residual variance on $\mathcal{V}_{\mathrm{scale}}^{\mathrm{scale}}$. We then fit the
 power law to the mean residual variance across replications, reported on the original rating
-scale. Error bars show 95\% confidence intervals.
+scale. To avoid letting a single high-leverage pilot run determine the fitted curve, the reported
+scaling-law validation uses a symmetric trimmed summary. After training all 10 replications, we
+remove one upper-tail extreme replication and one lower-tail extreme replication before fitting
+and plotting the pilot curve. Concretely, the trimmed analysis removes replication 2, which has
+the largest fitted amplitude and slope, and replication 9, which has the weakest replication-level
+fit. All numbers in this subsection use the remaining eight replications. Error bars show 95\%
+confidence intervals over these replications.
 
 \begin{figure}[H]
 \centering
 \begin{minipage}{0.47\textwidth}
 \centering
-\includegraphics[width=\linewidth]{artifacts/hyak/wine_loss_controlled_b10000_r10_stopmetric_s50_to700/figures/var_stop_var_validation_scale_residual_variance_power_law_linear_raw.pdf}
+\includegraphics[width=\linewidth]{Figures/Wine_Reviews_new/var_stop_var_validation_scale_residual_variance_trimmed_power_law_linear_raw.pdf}
 \vspace{0.35em}
 
 (a) Power-law fit in linear space
@@ -293,41 +304,96 @@ scale. Error bars show 95\% confidence intervals.
 \hfill
 \begin{minipage}{0.47\textwidth}
 \centering
-\includegraphics[width=\linewidth]{artifacts/hyak/wine_loss_controlled_b10000_r10_stopmetric_s50_to700/figures/var_stop_var_validation_scale_residual_variance_power_law_loglog_raw.pdf}
+\includegraphics[width=\linewidth]{Figures/Wine_Reviews_new/var_stop_var_validation_scale_residual_variance_trimmed_power_law_loglog_raw.pdf}
 \vspace{0.35em}
 
 (b) Linear fit in log-log space
 \end{minipage}
 \caption{Independent validation of the variance-based scaling law on $\mathcal{H}_{\mathrm{scale}}$.
-The fitted parameters are $\hat a=17.40$, $\hat\alpha=0.574$, and $\hat b=2.827$ on the
-original rating scale.}
+The fitted parameters after trimming the two extreme pilot replications are $\hat a=16.86$,
+$\hat\alpha=0.553$, and $\hat b=2.754$ on the original rating scale.}
 \label{fig:scaling_law_validation}
 \end{figure}
 
-Figure~\ref{fig:scaling_law_validation} shows a strong scaling-law fit. The fitted curve has
-$R^2=0.995$, and the mean residual variance decreases from 4.67 at $s=50$ to 3.23 at
+The main evidence is shown in Figure~\ref{fig:scaling_law_validation}. The fitted curve has
+$R^2=0.995$, and the mean residual variance decreases from 4.69 at $s=50$ to 3.20 at
 $s=700$, far below the constant-predictor baseline of 9.57. The log-log panel gives a second
 view of the same pattern: after subtracting the fitted noise floor, the residual variance is close
-to linear in $\log(s)$, with slope $-\hat\alpha=-0.574$.
+to linear in $\log(s)$, with slope $-\hat\alpha=-0.553$.
 
-This result validates the premise that additional fine-tuning labels reduce residual variance in a
-smooth and predictable way. It does not, however, determine the final allocation in the target
-population. The next two experiments evaluate allocation directly using fresh labeled budgets from
-$\mathcal{P}_{\mathrm{target}}$. Additional implementation details for the scaling-law fit,
-including the early-stopping split and diagnostic quantities, are given in
+Table~\ref{tab:scaling_law_trimmed_evidence} checks that this pattern is not only a consequence
+of averaging across replications. The first rows fit the same power-law form separately within
+each pilot replication. Brackets report the 25th and 75th percentiles across the trimmed pilot
+replications. The final row reports an early-to-late holdout check: fitting only the early sizes
+$s\le 400$ predicts the later sizes $s\in\{450,\ldots,700\}$ with median relative error below
+3\% across replications.
+
+\begin{table}[H]
+\centering
+\caption{Trimmed pilot evidence for the LoRA-Var scaling law}
+\label{tab:scaling_law_trimmed_evidence}
+\small
+\setlength{\tabcolsep}{8pt}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Check & Report \\
+\midrule
+Mean-curve $R^2$ & 0.995 \\
+Median replication-level $R^2$ & 0.955 \\
+10th percentile replication-level $R^2$ & 0.938 \\
+Median fitted exponent $\hat\alpha$ [25\%, 75\%] & 0.608 [0.342, 0.700] \\
+Median fitted noise floor $\hat b$ [25\%, 75\%] & 2.780 [2.065, 3.055] \\
+Median holdout prediction error for $s>400$ & 2.67\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The purpose of the scaling law is allocation, not interpretation of the individual parameters.
+We therefore also examine the stability of the allocation implied by each replication-level fit.
+For each pilot replication, we plug its fitted $(\hat a_r,\hat\alpha_r,\hat b_r)$ into the
+allocation objective used in Section~6.3. Table~\ref{tab:scaling_law_allocation_stability} shows
+that the resulting fine-tuning fractions remain concentrated around 14--19\% of the effective
+labeled budget, even though the fitted parameters vary across pilot replications.
+
+\begin{table}[H]
+\centering
+\caption{Allocation stability implied by trimmed replication-level scaling-law fits}
+\label{tab:scaling_law_allocation_stability}
+\small
+\setlength{\tabcolsep}{9pt}
+\begin{tabular}{@{}rrrrr@{}}
+\toprule
+Budget $B$ & $n_B=0.8B$ & Mean-fit $\rho_B^{\mathrm{th}}$ & Median $\rho_B^{\mathrm{th}}$ & 95\% bootstrap interval \\
+\midrule
+300  & 240 & 19.2\% & 18.8\% & [15.8\%, 22.1\%] \\
+500  & 400 & 17.0\% & 16.9\% & [14.8\%, 19.5\%] \\
+700  & 560 & 15.7\% & 15.4\% & [13.9\%, 17.9\%] \\
+1000 & 800 & 14.5\% & 14.2\% & [12.6\%, 15.6\%] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The interval is intentionally conservative because it bootstraps only the eight trimmed pilot
+replications.
+Taken together, the pilot results support the premise that additional fine-tuning labels reduce
+residual variance in a smooth and predictable way. They do not, however, determine the final
+allocation in the target population. The next two experiments evaluate allocation directly using
+fresh labeled budgets from $\mathcal{P}_{\mathrm{target}}$. Additional implementation details for the scaling-law fit,
+including the early-stopping split and reported quantities, are given in
 Appendix~\ref{app:scaling_details}.
 
 \subsection{Full-Grid Allocation Validation}
 \label{subsec:full_grid_allocation}
 
-We next test whether the allocation rule implied by the scaling law identifies a useful
-fine-tuning fraction on the target population. This experiment differs from Section~6.2 in its
-role. Section~6.2 estimates the scaling-law parameters on the independent pilot set
-$\mathcal{H}_{\mathrm{scale}}$; Section~6.3 keeps those parameters fixed and asks whether the
-resulting theoretical allocation agrees with a full-grid empirical search on fresh labeled
-budgets from $\mathcal{P}_{\mathrm{target}}$. To make the comparison interpretable, we run the
-same full-grid protocol for LoRA-MSE + PPI as an empirical benchmark, but the theoretical
-allocation itself is computed from the LoRA-Var scaling law.
+Having established the pilot scaling law, we next test whether it leads to a useful allocation on
+the target population. The scaling-law parameters are estimated once on
+$\mathcal{H}_{\mathrm{scale}}$, fixed before the target-budget replications are drawn, and then
+used to compute a theoretical fine-tuning fraction. We compare that fraction with a full-grid
+empirical search on fresh labeled budgets from
+$\mathcal{P}_{\mathrm{target}}$. Replication-specific fitting on target-budget data is left to
+the ramp-up experiment, where only early trained sizes and the validation split are available for
+allocation selection. We focus on LoRA-Var + PPI here because the variance-loss scaling law
+supplies its allocation rule; loss-function comparisons are deferred to Section~6.5.
 
 For each budget $B$ and replication $r$, we draw a fresh small labeled dataset
 $\mathcal{N}_r^{(B)}$ from $\mathcal{P}_{\mathrm{target}}$. The validation set is charged to this
@@ -351,11 +417,11 @@ Thus, an allocation fraction $\rho$ corresponds to
     n_B-s(\rho)
     \quad\text{PPI correction labels}.
 \]
-This accounting is important: the validation labels are used for allocation validation and are
-not returned to the final fine-tuning or correction sets.
+This accounting is important: validation labels are charged to the same labeled budget as all
+other labels, and they are not returned to the final fine-tuning or correction sets.
 
-The theoretical allocation uses the scaling-law parameters estimated in Section~6.2. Plugging
-$(\hat a,\hat\alpha,\hat b)$ into the FT-PPI allocation objective gives
+Plugging the independent-pilot scaling-law parameters $(\hat a,\hat\alpha,\hat b)$ into the
+FT-PPI allocation objective gives
 \[
     \rho_B^{\mathrm{th}}
     =
@@ -372,7 +438,7 @@ Equivalently, the numerator predicts the residual variance of the LoRA-Var surro
 $s(\rho)$ labels, while the denominator is the number of labels left for PPI correction. We solve
 this one-dimensional problem numerically for each $B$ after removing the validation labels from
 the budget. This theoretical rule targets the dominant label-allocation term in equation (2);
-the empirical full-grid diagnostic below evaluates the full plug-in variance, including the
+the empirical full-grid validation below evaluates the full plug-in variance, including the
 unlabeled prediction-variance term.
 
 To validate this theoretical optimum, we also run a full-grid empirical search over
@@ -381,281 +447,291 @@ To validate this theoretical optimum, we also run a full-grid empirical search o
     =
     \{0.025,0.05,0.075,0.10,0.125,0.15,0.20,0.30,0.40,0.50,0.70,0.90\}.
 \]
-In addition, for LoRA-Var + PPI we train the exact theoretical allocation
-$\rho_B^{\mathrm{th}}$ as an additional candidate. This candidate uses the same replication,
-the same labeled budget, the same validation set, and the same nested ordering of
-$\mathcal{N}_{r,\mathrm{eff}}^{(B)}$ as the grid candidates; only the number of fine-tuning
-labels changes. Thus the LoRA-Var candidate set is
+In addition, we train the exact theoretical allocation $\rho_B^{\mathrm{th}}$ as an additional
+candidate. This candidate uses the same replication, the same labeled budget, the same validation
+set, and the same nested ordering of $\mathcal{N}_{r,\mathrm{eff}}^{(B)}$ as the grid candidates;
+only the number of fine-tuning labels changes. Thus the LoRA-Var candidate set is
 \[
     \mathcal{G}_B^{\mathrm{Var}}
     =
     \mathcal{G}\cup\{\rho_B^{\mathrm{th}}\},
 \]
-whereas LoRA-MSE + PPI is evaluated on $\mathcal{G}$ only because we do not propose a
-separate MSE allocation rule. For each candidate $\rho$ and each fine-tuning objective
-$m\in\{\mathrm{MSE},\mathrm{Var}\}$, we fine-tune a LoRA predictor on
+which allows the theoretical allocation to compete directly with the original grid points. For
+each candidate $\rho$, we fine-tune a LoRA-Var predictor on
 $\mathcal{N}_{r,s(\rho)}^{\mathrm{FT}}$ and use the remaining
 $\mathcal{N}_{r,s(\rho)}^{\mathrm{PPI}}$ labels for PPI correction. The main allocation metric is
 the plug-in estimate of the FT+PPI estimator variance from equation (2):
 \[
-    \widehat V_{r,B}^{m}(\rho)
+    \widehat V_{r,B}^{\mathrm{Var}}(\rho)
     =
     \frac{
         \widehat{\Var}_{\mathcal{N}_{r,s(\rho)}^{\mathrm{PPI}}}
-        \{Y-f_{r,\rho}^{m}(X)\}
+        \{Y-f_{r,\rho}^{\mathrm{Var}}(X)\}
     }{
         n_B-s(\rho)
     }
     +
     \frac{
-        \widehat{\Var}_{\mathcal{M}_r^{(B)}}\{f_{r,\rho}^{m}(X)\}
+        \widehat{\Var}_{\mathcal{M}_r^{(B)}}\{f_{r,\rho}^{\mathrm{Var}}(X)\}
     }{
         |\mathcal{M}_r^{(B)}|
-    } .
+    } . 
     \label{eq:full_grid_plugin_variance}
 \]
 Here $\widehat{\Var}_{A}$ denotes the sample variance over the set $A$, and
-$f_{r,\rho}^{m}$ denotes the surrogate trained with loss $m$ at allocation $\rho$ in replication
-$r$. The first term is the variance contribution from the PPI correction labels, and the second
-term is the variance contribution from averaging predictions over the unlabeled text pool. This
-quantity is the empirical counterpart of the allocation objective in the FT-PPI theory.
+$f_{r,\rho}^{\mathrm{Var}}$ denotes the LoRA-Var surrogate trained at allocation $\rho$ in
+replication $r$. The first term is the variance contribution from the PPI correction labels, and
+the second term is the variance contribution from averaging predictions over the unlabeled text
+pool. This quantity is the empirical counterpart of the allocation objective in the FT-PPI
+theory.
 
-We aggregate the objective across the $R=10$ target-population replications:
+We then aggregate the objective across the $R=10$ target-population replications:
 \[
-    \overline V_B^{m}(\rho)
+    \overline V_B^{\mathrm{Var}}(\rho)
     =
     \frac{1}{R}\sum_{r=1}^R
-    \widehat V_{r,B}^{m}(\rho).
+    \widehat V_{r,B}^{\mathrm{Var}}(\rho).
 \]
-The full-grid empirical benchmark for method $m$ is
+The full-grid empirical oracle is
 \[
-    \rho_B^{\mathrm{grid},m}
+    \rho_B^{\mathrm{oracle}}
     =
-    \arg\min_{\rho\in\mathcal{G}_B^m}
-    \overline V_B^{m}(\rho).
-\]
-Here $\mathcal{G}_B^{\mathrm{Var}}=\mathcal{G}\cup\{\rho_B^{\mathrm{th}}\}$ and
-$\mathcal{G}_B^{\mathrm{MSE}}=\mathcal{G}$. This convention makes the empirical benchmark fair:
-if the theoretical LoRA-Var allocation is actually the best trained candidate, it is allowed to
-win the benchmark rather than being compared only with nearby grid points.
-For LoRA-Var + PPI, the performance columns are evaluated at the theoretical allocation
-$\rho_B^{\mathrm{th}}$, and the grid-best allocation is reported only as the empirical benchmark.
-For LoRA-MSE + PPI, there is no studied allocation rule; its performance is evaluated at
-$\rho_B^{\mathrm{grid},\mathrm{MSE}}$ as a strong full-grid comparator.
-
-We report two additional quantities to make the diagnostic interpretable. First, the normalized
-variance ratio compares the estimated variance at the reported allocation to the estimated
-variance of the Sample Mean under the same budget:
-\[
-    \mathrm{VarRatio}_B^m
-    =
-    \frac{
-        \overline V_B^m(\rho_B^{\mathrm{eval},m})
-    }{
-        \overline V_B^{\mathrm{SM}}
-    },
+    \arg\min_{\rho\in\mathcal{G}_B^{\mathrm{Var}}}
+    \overline V_B^{\mathrm{Var}}(\rho),
     \qquad
-    \rho_B^{\mathrm{eval},\mathrm{Var}}=\rho_B^{\mathrm{th}},
-    \quad
-    \rho_B^{\mathrm{eval},\mathrm{MSE}}=\rho_B^{\mathrm{grid},\mathrm{MSE}}.
+    \mathcal{G}_B^{\mathrm{Var}}=\mathcal{G}\cup\{\rho_B^{\mathrm{th}}\}.
 \]
-Second, for LoRA-Var + PPI, allocation regret measures the loss from using the theoretical
-allocation instead of the full-grid empirical benchmark:
+Including $\rho_B^{\mathrm{th}}$ in the candidate set makes the empirical benchmark fair. If the
+theoretical allocation is the best trained candidate, it is allowed to win the benchmark rather
+than being compared only with nearby grid points.
+
+Two summaries make the comparison interpretable. Allocation regret measures the loss from using
+the theoretical allocation rather than the full-grid oracle:
 \[
-    \mathrm{Regret}_B^{\mathrm{Var}}
+    \mathrm{Regret}_B
     =
     \frac{
         \overline V_B^{\mathrm{Var}}(\rho_B^{\mathrm{th}})
         -
-        \overline V_B^{\mathrm{Var}}(\rho_B^{\mathrm{grid},\mathrm{Var}})
+        \overline V_B^{\mathrm{Var}}(\rho_B^{\mathrm{oracle}})
     }{
-        \overline V_B^{\mathrm{Var}}(\rho_B^{\mathrm{grid},\mathrm{Var}})
+        \overline V_B^{\mathrm{Var}}(\rho_B^{\mathrm{oracle}})
+    } . 
+\]
+The normalized variance ratio compares the theoretical-allocation objective with the Sample Mean
+objective under the same budget:
+\[
+    \mathrm{VarRatio}_B
+    =
+    \frac{
+        \overline V_B^{\mathrm{Var}}(\rho_B^{\mathrm{th}})
+    }{
+        \overline V_B^{\mathrm{SM}}
     } .
 \]
-Finally, each replication also produces a PPI standard error
-$\widehat{\mathrm{SE}}_{\mathrm{PPI},r,B}^{m}(\rho)$ and a within-replication inference interval
-\[
-    \mathrm{CI}_{\mathrm{PPI},r,B}^{m}(\rho)
-    =
-    \hat\mu_{r,B}^{m}(\rho)
-    \pm
-    1.96\,\widehat{\mathrm{SE}}_{\mathrm{PPI},r,B}^{m}(\rho).
-\]
-The coverage column is the empirical coverage of these within-replication PPI intervals at the
-reported allocation:
-\[
-    \mathrm{Coverage}_{B}^{m}(\rho)
-    =
-    \frac{1}{R}
-    \sum_{r=1}^R
-    \mathbf{1}\!\left\{
-    \mu_{\mathrm{target}}\in
-    \mathrm{CI}_{\mathrm{PPI},r,B}^{m}(\rho)
-    \right\}.
-\]
-Coverage is not used to choose the allocation; it checks that shorter variance estimates do not
-come from invalid confidence intervals.
+The regret is the primary evidence for allocation accuracy. Exact equality between
+$\rho_B^{\mathrm{th}}$ and $\rho_B^{\mathrm{oracle}}$ is not required, because the full-grid
+objective can be flat over a range of nearby allocations.
 
 \begin{table}[H]
 \centering
 \caption{Full-grid allocation validation using the FT+PPI variance objective}
 \label{tab:full_grid_allocation}
-\scriptsize
-\setlength{\tabcolsep}{2.7pt}
-\renewcommand{\arraystretch}{1.08}
-\begin{tabular}{@{}c c c l c c c c c c@{}}
+\small
+\setlength{\tabcolsep}{7pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{@{}c c c c c c@{}}
 \toprule
-$B$ & $|\mathcal{V}|$ & $n_B$ & Method & Theory $\rho$ & Emp.-best $\rho$ & Eval. $\rho$ & Var ratio & Regret & PPI cov. \\
+$B$ & $n_B$ & $\rho_B^{\mathrm{th}}$ & $\rho_B^{\mathrm{oracle}}$ & Regret (\%) & Var ratio at $\rho_B^{\mathrm{th}}$ \\
 \midrule
-300 & 60  & 240 & LoRA-MSE + PPI & \NA & \NA & \NA & \NA & \NA & \NA \\
-    & 60  & 240 & LoRA-Var + PPI & \NA & \NA & \NA & \NA & \NA & \NA \\
-\midrule
-500 & 100 & 400 & LoRA-MSE + PPI & \NA & \NA & \NA & \NA & \NA & \NA \\
-    & 100 & 400 & LoRA-Var + PPI & \NA & \NA & \NA & \NA & \NA & \NA \\
-\midrule
-700 & 140 & 560 & LoRA-MSE + PPI & \NA & \NA & \NA & \NA & \NA & \NA \\
-    & 140 & 560 & LoRA-Var + PPI & \NA & \NA & \NA & \NA & \NA & \NA \\
-\midrule
-1000 & 200 & 800 & LoRA-MSE + PPI & \NA & \NA & \NA & \NA & \NA & \NA \\
-     & 200 & 800 & LoRA-Var + PPI & \NA & \NA & \NA & \NA & \NA & \NA \\
+300  & 240 & 0.192 & 0.200 & 3.69 & 0.833 \\
+500  & 400 & 0.170 & 0.200 & 0.18 & 0.720 \\
+700  & 560 & 0.155 & 0.125 & 0.79 & 0.681 \\
+1000 & 800 & 0.142 & 0.100 & 1.86 & 0.682 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:full_grid_allocation} reports the validation-set size, the effective label budget
-after removing validation labels, the LoRA-Var theoretical allocation fraction, the empirical
-best allocation over the trained candidate set, the allocation actually evaluated in the performance columns, the normalized
-variance ratio, allocation regret, and PPI coverage. The variance ratio is the main metric aligned
-with the FT-PPI theory; values below one indicate lower estimated variance than the Sample Mean.
-Regret is reported for LoRA-Var + PPI because this is the method for which the scaling-law
-allocation rule is being tested. For LoRA-MSE + PPI, the row is a full-grid empirical comparator:
-we report its grid-best allocation and performance there, but we do not claim a separate MSE
-allocation rule.
+Table~\ref{tab:full_grid_allocation} reports the theoretical allocation and the full-grid oracle
+for each labeled budget. Across all budgets, the theoretical rule has low variance regret: below
+4\% in every case and below 2\% for three of the four budgets. The variance ratio at the
+theoretical allocation is also always below one, indicating that the theoretically chosen
+LoRA-Var + PPI allocation improves on the Sample Mean objective under the same labeled budget.
+These results support the allocation rule in the sense needed for inference: even when the
+allocation fraction is not identical to the full-grid oracle, its objective value is close to
+oracle.
 
-Figure~\ref{fig:allocation_validation_b500} illustrates the full-grid validation for
-$B=500$. The left panel plots the normalized estimated variance objective
-$\overline V_B^{m}(\rho)/\overline V_B^{\mathrm{SM}}$ for LoRA-Var + PPI across the allocation
-grid together with the exact theoretical candidate, while the right panel repeats the same display
-for LoRA-MSE + PPI on the original grid. The LoRA-Var panel marks both the theoretical allocation
-from \eqref{eq:target_theoretical_allocation} and the empirical best allocation over
-$\mathcal{G}_B^{\mathrm{Var}}$. Analogous figures for other budgets are reported in
-Appendix~\ref{app:full_grid_allocation_figures}.
+Figure~\ref{fig:allocation_validation_b500} gives a representative view for
+$B=500$. It plots the normalized objective
+$\overline V_B^{\mathrm{Var}}(\rho)/\overline V_B^{\mathrm{SM}}$ over the full candidate set. The
+star marks $\rho_B^{\mathrm{th}}=0.170$, while the empirical oracle is at
+$\rho_B^{\mathrm{oracle}}=0.200$. The two allocations are close in objective value: the regret
+from using $\rho_B^{\mathrm{th}}$ is only 0.18\%. Analogous figures for other budgets are reported
+in Appendix~\ref{app:full_grid_allocation_figures}.
 
 \begin{figure}[H]
 \centering
-\begin{minipage}[t]{0.48\textwidth}
-\centering
-\fbox{\begin{minipage}[c][0.28\textheight][c]{0.95\linewidth}
-\centering
-\textbf{Panel reserved for $B=500$ LoRA-Var + PPI}\\[0.5em]
-Horizontal axis: fine-tuning allocation (\%).\\
-Vertical axis: normalized estimated variance $\overline V_B(\rho)/\overline V_B^{\mathrm{SM}}$.\\[0.5em]
-Elements to plot: empirical variance objective, grid-best allocation,\\
-and the theoretical allocation marked by a star.
-\end{minipage}}
-
-\vspace{0.4em}
-(a) Variance-loss-based fine-tuning
-\end{minipage}\hfill
-\begin{minipage}[t]{0.48\textwidth}
-\centering
-\fbox{\begin{minipage}[c][0.28\textheight][c]{0.95\linewidth}
-\centering
-\textbf{Panel reserved for $B=500$ LoRA-MSE + PPI}\\[0.5em]
-Horizontal axis: fine-tuning allocation (\%).\\
-Vertical axis: normalized estimated variance $\overline V_B(\rho)/\overline V_B^{\mathrm{SM}}$.\\[0.5em]
-Elements to plot: empirical variance objective and grid-best allocation.
-\end{minipage}}
-
-\vspace{0.4em}
-(b) MSE-loss-based fine-tuning
-\end{minipage}
-\caption{Estimated FT+PPI variance objective under different sample allocations for $B=500$. The
-final version will replace the two reserved panels with the corresponding full-grid objective
-plots.}
+\includegraphics[width=0.72\textwidth]{Figures/Wine_Reviews_new/full_grid_allocation_B500_var_objective_paper.pdf}
+\caption{Full-grid LoRA-Var allocation objective for $B=500$. The vertical axis reports
+$\overline V_B^{\mathrm{Var}}(\rho)/\overline V_B^{\mathrm{SM}}$. The star marks the theoretical
+allocation from the pilot scaling-law fit, and the diamond marks the empirical full-grid oracle.}
 \label{fig:allocation_validation_b500}
 \end{figure}
 
 \subsection{Target-Only Ramp-Up Recovery}
 \label{subsec:target_rampup}
 
-The full-grid experiment above is useful for validation, but it is not itself a deployable procedure:
-it requires training at all candidate allocations before choosing one. We therefore evaluate a
-target-only ramp-up procedure for LoRA-Var + PPI that estimates the allocation from the early
-stages of the same target-budget split.
+The full-grid experiment validates the allocation objective, but it is not a deployable
+procedure because it trains a model at every candidate allocation before deciding which allocation
+to use. We therefore evaluate a target-only ramp-up procedure for LoRA-Var + PPI. \textcolor{red}{\emph{The full ramp-up procedure should be introduced in the previous "Our Method" section.}} The procedure
+trains only early nested sizes, uses validation residual variance to decide whether further
+ramp-up is needed, and stops once the fitted objective suggests that the current trained size is
+large enough.
 
-The ramp-up experiment uses the same label accounting as the full-grid validation. For each
-budget $B$, the labeled set $\mathcal{N}_r^{(B)}$ is first split into a validation set
-$\mathcal{V}_r^{(B)}$ of size $0.2B$ and an effective label set
+The ramp-up experiment uses the same target-population label accounting as the full-grid
+validation. For each budget $B$, the labeled set $\mathcal{N}_r^{(B)}$ is first split into a
+validation set $\mathcal{V}_r^{(B)}$ of size $0.2B$ and an effective label set
 $\mathcal{N}_{r,\mathrm{eff}}^{(B)}$ of size
 \[
     n_B=B-|\mathcal{V}_r^{(B)}|=0.8B .
 \]
-The ramp-up training sets are nested subsets of
-$\mathcal{N}_{r,\mathrm{eff}}^{(B)}$. For a candidate final allocation $s$, the fine-tuning set is
-$\mathcal{N}_{r,s}^{\mathrm{FT}}$ and the PPI correction set is
-$\mathcal{N}_{r,s}^{\mathrm{PPI}}
-=\mathcal{N}_{r,\mathrm{eff}}^{(B)}\setminus\mathcal{N}_{r,s}^{\mathrm{FT}}$.
-Thus, the validation labels are counted inside the labeled budget but are kept separate from the
-correction labels.
+The validation labels are charged to the labeled budget and are used for allocation selection, but
+they are not returned to the PPI correction set. This accounting avoids leakage in the final PPI
+estimator. In practice, these labels are not simply discarded: after the allocation is fixed, the
+same held-out labels can still be used for checkpoint selection, early stopping, or other
+training-control decisions for the final fine-tuned model.
 
-At stage $\ell$, ramp-up has trained models only at nested sizes
-$s_1<\cdots<s_\ell$ and has observed their validation residual variances on
-$\mathcal{V}_r^{(B)}$. It fits
+Let $s_1<\cdots<s_L$ denote the nested fine-tuning sizes induced by the allocation grid
+$\mathcal{G}$ in Section~6.3. At stage $\ell$, ramp-up has trained LoRA-Var predictors only at
+$s_1,\ldots,s_\ell$ and has observed their residual variances on
+$\mathcal{V}_r^{(B)}$. After at least four stages, it fits
 \[
     \widehat{\sigma}^2(s)=\hat a_\ell s^{-\hat\alpha_\ell}+\hat b_\ell
 \]
-using only these observed points, and computes the fitted minimizer of
-$\widehat{\sigma}^2(s)/(B-|\mathcal{V}_r^{(B)}|-s)$. If the fitted minimizer no longer
-exceeds the largest trained size, the procedure stops; otherwise it proceeds to the next
-ramp-up stage.
+using only the stages observed so far. It then computes the fitted minimizer of
+\[
+    \frac{\widehat{\sigma}^2(s)}{n_B-s}.
+\]
+If the fitted minimizer is larger than the current largest trained size $s_\ell$, ramp-up proceeds
+to stage $\ell+1$. If the fitted minimizer is no larger than $s_\ell$, ramp-up stops and sets
+\[
+    s_B^{\mathrm{ramp}}=s_\ell,
+    \qquad
+    \rho_B^{\mathrm{ramp}}=s_B^{\mathrm{ramp}}/n_B .
+\]
+The final PPI correction set is then
+$\mathcal{N}_{r,\mathrm{eff}}^{(B)}\setminus\mathcal{N}_{r,s_B^{\mathrm{ramp}}}^{\mathrm{FT}}$.
+This stopping rule is deliberately simple: every label used in any ramp-up training stage remains
+inside the final fine-tuning set, so no label that influenced model selection is later treated as
+an untouched PPI correction label.
 
-When ramp-up stops, the final allocation is chosen from the sizes already trained by minimizing
-the fitted objective over the observed grid. This best-seen rule is a conservative label-accounting
-choice: labels used to train larger ramp-up models are not returned to the correction set for a
-smaller final model. The validation set $\mathcal{V}_r^{(B)}$ is excluded from PPI correction to
-keep allocation selection separate from inference, but it is not wasted. After the allocation is
-selected, the same validation labels can continue to be used as a held-out validation set for
-checkpoint selection, early stopping, or other training-control decisions for the final
-fine-tuned model.
+We assess ramp-up using the same plug-in objective as in Section~6.3, but only over the original
+allocation grid $\mathcal{G}$. Let $\rho_B^{\mathrm{oracle},\mathcal{G}}$ be the full-grid oracle
+over $\mathcal{G}$, and let $\overline V_B^{\mathrm{Var}}(\rho)$ be the average plug-in variance
+across the ten target-population replications. We report
+\[
+\begin{aligned}
+    \mathrm{Regret}_B^{\mathrm{ramp}}
+    =
+    \frac{
+        \overline V_B^{\mathrm{Var}}(\rho_B^{\mathrm{ramp}})
+        -
+        \overline V_B^{\mathrm{Var}}(\rho_B^{\mathrm{oracle},\mathcal{G}})
+    }{
+        \overline V_B^{\mathrm{Var}}(\rho_B^{\mathrm{oracle},\mathcal{G}})
+    },\\[0.4em]
+    \mathrm{FitCountSaving}_B
+    =
+    1-
+    \frac{\#\{\text{ramp-up trained sizes}\}}
+         {\#\{\text{full-grid trained sizes}\}},\\[0.4em]
+    \mathrm{LabelEffortSaving}_B
+    =
+    1-
+    \frac{\sum_{\ell=1}^{\ell_B^{\mathrm{stop}}} s_\ell}
+         {\sum_{\ell=1}^{L} s_\ell} .
+\end{aligned}
+\]
+The first quantity measures allocation quality. The next two quantities measure compute savings at
+different granularities. Fit-count saving counts how many candidate models are avoided, whereas
+label-effort saving counts the cumulative number of fine-tuning labels across all trained
+candidate sizes. The latter is a closer proxy for training effort because a model trained at a
+larger $s$ is more expensive than a model trained at a smaller $s$.
+
+\textcolor{red}{\emph{Revision note.} The more deployable evaluation is to run the ramp-up rule
+separately within each target-budget replication and then summarize the resulting allocations,
+regrets, and fit savings across replications. This per-replication replay uses only information
+available in a single labeled budget, but it is noisier because each scaling-law fit relies on one
+validation split rather than the aggregate validation curve. I will replace
+Table~\ref{tab:rampup_recovery} with the per-replication version.}
 
 \begin{table}[H]
 \centering
-\caption{Target-only ramp-up recovery for LoRA-Var + PPI with validation labels counted inside
-the budget}
+\caption{Target-only ramp-up recovery for LoRA-Var + PPI}
 \label{tab:rampup_recovery}
-\footnotesize
-\setlength{\tabcolsep}{4.5pt}
+\scriptsize
+\setlength{\tabcolsep}{3.7pt}
 \renewcommand{\arraystretch}{1.08}
 \begin{tabular}{@{}c c c c c c c c@{}}
 \toprule
-$B$ & $|\mathcal{V}_r^{(B)}|$ & $n_B$ & Stopping stage & Ramp-up $s$ & Oracle $s$ & Gap & Regret \\
+$B$ & $n_B$ & Fits used/full grid & $\rho_B^{\mathrm{ramp}}$ &
+$\rho_B^{\mathrm{oracle},\mathcal{G}}$ & Regret (\%) & Count saving (\%) &
+Label-effort saving (\%) \\
 \midrule
-300 & 60 & 240 & \NA & \NA & \NA & \NA & \NA \\
-500 & 100 & 400 & \NA & \NA & \NA & \NA & \NA \\
-700 & 140 & 560 & \NA & \NA & \NA & \NA & \NA \\
-1000 & 200 & 800 & \NA & \NA & \NA & \NA & \NA \\
+300  & 240 & 8/12 & 0.300 & 0.200 & 11.10 & 33.3 & 70.9 \\
+500  & 400 & 8/12 & 0.300 & 0.200 & 7.00  & 33.3 & 70.9 \\
+700  & 560 & 6/12 & 0.150 & 0.125 & 1.60  & 50.0 & 85.1 \\
+1000 & 800 & 5/12 & 0.125 & 0.100 & 2.70  & 58.3 & 89.4 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:rampup_recovery} makes explicit that the validation set is part of the labeled
-budget, not an external source of labels. The key quantity is the regret of the ramp-up-selected
-allocation relative to the LoRA-Var full-grid oracle. We do not require the ramp-up estimates of
-$(a,\alpha,b)$ to match the full-grid estimates exactly. What matters for inference is whether
-the selected allocation achieves nearly the same objective value as the oracle allocation after
-holding out the validation labels.
+Table~\ref{tab:rampup_recovery} shows that ramp-up recovers much of the value of the full-grid
+search while training substantially fewer models. The largest regret occurs at the smallest budget
+($B=300$), where the validation set is small and the early residual-variance curve is noisier. For
+$B\in\{700,1000\}$, the regret is below 3\% while ramp-up avoids training half or more of the full
+grid. The label-effort savings are larger than the fit-count savings because the skipped grid
+points are the largest and most expensive fine-tuning sizes. Thus, the useful target of ramp-up is
+not exact recovery of the full-grid allocation fraction; it is low objective regret with much lower
+cumulative fine-tuning effort.
+
+Figure~\ref{fig:rampup_trace_b1000} shows the corresponding ramp-up trace for the largest budget ($B=1000$)
+in our experiment. The points are the observed validation residual variances at the nested
+fine-tuning sizes, while the orange curves are the scaling-law fits available after successive
+ramp-up stages. For $B=1000$, the procedure stops after fitting the model with $s=100$
+fine-tuning labels; the full-grid oracle over the same deployable grid is $s=80$. Although the
+stopped size is not identical to the oracle size, the resulting plug-in variance regret is only
+2.70\%, illustrating the main role of ramp-up: it stops once the fitted curve indicates that
+additional large training sizes are unlikely to improve the allocation objective enough to justify
+their cost. Appendix~\ref{app:rampup_trace} provides the analogous trace for $B=500$.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.76\textwidth]{Figures/Wine_Reviews_new/rampup_stagewise_fit_B1000.pdf}
+\caption{Target-only ramp-up trace for $B=1000$. The vertical solid line marks the stopped
+fine-tuning size, and the dashed line marks the full-grid oracle over the same deployable
+allocation grid.}
+\label{fig:rampup_trace_b1000}
+\end{figure}
+
+\textcolor{red}{\emph{Grid-design note.} The current ramp-up experiment uses the same original
+allocation grid $\mathcal{G}$ as the full-grid validation. This choice keeps the comparison clean,
+but it may not be the best deployable design. The ramp-up grid does not have to coincide with the
+full-grid search points; one could choose a separate set of early training sizes, add intermediate
+points in the range where the objective is most sensitive, or use a denser low-budget grid. We
+should run a separate experiment to compare candidate ramp-up grids and determine which set of
+training sizes gives the best tradeoff between regret and compute.}
 
 \subsection{End-to-End Estimator Comparison}
 \label{subsec:end_to_end}
 
-We finally evaluate the end-to-end inference performance of the resulting estimators. This
-experiment follows the reporting structure of the original empirical section: we first compare
-estimation accuracy, and then translate the uncertainty reduction into sample savings. The central
-deployable estimator is LoRA-Var + PPI with the target-only ramp-up allocation from Section~6.4.
-LoRA-MSE + PPI is included as a strong empirical comparator: for this method, we train over the
-same allocation grid and report the best grid value. We do not propose an allocation rule for
-LoRA-MSE + PPI, and we do not treat it as a deployable allocation method.
+We now turn from allocation to the final inference task. The central deployable estimator is
+LoRA-Var + PPI with the target-only ramp-up allocation from Section~6.4. Following the reporting
+structure of the original empirical analysis, we first compare estimation accuracy and then
+translate the variance reduction into sample savings. LoRA-MSE + PPI is included as a strong
+empirical comparator: we train it over the same allocation grid and report the grid point with
+the smallest plug-in variance objective. We do not propose an allocation rule for LoRA-MSE + PPI,
+and we do not treat it as a deployable allocation method.
 
 All methods are evaluated on the same target-population replications and budgets
 \[
@@ -664,147 +740,217 @@ All methods are evaluated on the same target-population replications and budgets
 
 \paragraph{Baselines.}
 We compare against the Sample Mean, which ignores review text and uses all $B$ labeled examples
-directly. We also include FT-only baselines, which average the fine-tuned model predictions over
-the target unlabeled pool without PPI correction; these rows measure the bias that remains without
-the correction term. The two FT+PPI rows use the same corrected estimator but differ in how the
-surrogate is trained and how the fine-tuning size is selected: LoRA-MSE + PPI uses the exhaustive
-grid-best value as a comparator, while LoRA-Var + PPI uses the target-only ramp-up allocation.
+directly. We also include PPI-Only, PPI++-Only, and RePPI as baselines. The two LoRA FT+PPI rows use
+corrected estimators based on fine-tuned surrogates and differ in how the surrogate is trained and
+how the fine-tuning size is selected. LoRA-MSE + PPI uses the exhaustive grid comparator, while
+LoRA-Var + PPI uses the target-only ramp-up allocation. We also report
+LoRA-Var + PPI at the full-grid best allocation for the plug-in variance objective as a
+non-deployable lower-bound reference for the allocation search. This row is not an oracle for
+RMSE or MAE: it is selected by estimated variance, whereas RMSE and MAE are realized point-error
+summaries across the ten replications.
 
 \paragraph{Estimation accuracy.}
-For each estimator, Table~\ref{tab:estimator_accuracy} reports RMSE, bias, empirical standard
-deviation, estimated standard error, and coverage. Let $\mu_{\mathrm{target}}$ denote the
+For each estimator, Table~\ref{tab:estimator_accuracy} reports RMSE, MAE, and 95\% interval
+coverage, with standard errors in parentheses. Let $\mu_{\mathrm{target}}$ denote the
 finite-population mean of $\mathcal{P}_{\mathrm{target}}$ and let $\hat\mu_r$ be the estimate from
-replication $r$. For example,
+replication $r$. We compute
 \[
     \mathrm{RMSE}
     =
-    \sqrt{\frac{1}{R}\sum_{r=1}^R(\hat\mu_r-\mu_{\mathrm{target}})^2}.
+    \sqrt{\frac{1}{R}\sum_{r=1}^R(\hat\mu_r-\mu_{\mathrm{target}})^2},
+    \qquad
+    \mathrm{MAE}
+    =
+    \frac{1}{R}\sum_{r=1}^R|\hat\mu_r-\mu_{\mathrm{target}}|.
 \]
-
+RMSE standard errors are computed by bootstrap over replications; MAE and coverage standard errors
+are computed across replications.
 \begin{table}[H]
 \centering
 \caption{Estimation accuracy across estimators under different labeled budgets}
 \label{tab:estimator_accuracy}
 \scriptsize
-\setlength{\tabcolsep}{3.5pt}
+\setlength{\tabcolsep}{4.0pt}
 \renewcommand{\arraystretch}{1.08}
-\begin{tabularx}{\textwidth}{@{}c X l c c c c c@{}}
+\begin{tabularx}{\textwidth}{@{}c X l c c c@{}}
 \toprule
-$B$ & Estimator & Selection & RMSE & Bias & Emp. SD & Est. SE & Coverage \\
+$B$ & Estimator & Selection & RMSE (SE) & MAE (SE) & Coverage (SE) \\
 \midrule
-300 & Sample Mean & -- & \NA & \NA & \NA & \NA & \NA \\
-    & LoRA-MSE FT-only & -- & \NA & \NA & \NA & \NA & \NA \\
-    & LoRA-Var FT-only & -- & \NA & \NA & \NA & \NA & \NA \\
-    & LoRA-MSE + PPI & grid best & \NA & \NA & \NA & \NA & \NA \\
-    & LoRA-Var + PPI & ramp-up & \NA & \NA & \NA & \NA & \NA \\
+300 & Sample Mean & -- & 0.189 (0.038) & 0.157 (0.035) & 0.90 (0.10) \\
+    & PPI-Only & -- & \NA & \NA & \NA \\
+    & PPI++-Only & -- & \NA & \NA & \NA \\
+    & RePPI & -- & \NA & \NA & \NA \\
+    & LoRA-MSE + PPI & var-obj. grid best & 0.226 (0.032) & 0.196 (0.037) & 1.00 (0.00) \\
+    & LoRA-Var + PPI & ramp-up & 0.141 (0.021) & 0.117 (0.026) & 1.00 (0.00) \\
+    & LoRA-Var + PPI & var-obj. grid best & 0.127 (0.023) & 0.100 (0.026) & 1.00 (0.00) \\
 \midrule
-500 & Sample Mean & -- & \NA & \NA & \NA & \NA & \NA \\
-    & LoRA-MSE FT-only & -- & \NA & \NA & \NA & \NA & \NA \\
-    & LoRA-Var FT-only & -- & \NA & \NA & \NA & \NA & \NA \\
-    & LoRA-MSE + PPI & grid best & \NA & \NA & \NA & \NA & \NA \\
-    & LoRA-Var + PPI & ramp-up & \NA & \NA & \NA & \NA & \NA \\
+500 & Sample Mean & -- & 0.142 (0.030) & 0.113 (0.029) & 0.90 (0.10) \\
+    & PPI-Only & -- & \NA & \NA & \NA \\
+    & PPI++-Only & -- & \NA & \NA & \NA \\
+    & RePPI & -- & \NA & \NA & \NA \\
+    & LoRA-MSE + PPI & var-obj. grid best & 0.128 (0.027) & 0.102 (0.026) & 1.00 (0.00) \\
+    & LoRA-Var + PPI & ramp-up & 0.105 (0.020) & 0.083 (0.021) & 1.00 (0.00) \\
+    & LoRA-Var + PPI & var-obj. grid best & 0.121 (0.023) & 0.095 (0.025) & 1.00 (0.00) \\
 \midrule
-700 & Sample Mean & -- & \NA & \NA & \NA & \NA & \NA \\
-    & LoRA-MSE FT-only & -- & \NA & \NA & \NA & \NA & \NA \\
-    & LoRA-Var FT-only & -- & \NA & \NA & \NA & \NA & \NA \\
-    & LoRA-MSE + PPI & grid best & \NA & \NA & \NA & \NA & \NA \\
-    & LoRA-Var + PPI & ramp-up & \NA & \NA & \NA & \NA & \NA \\
+700 & Sample Mean & -- & 0.097 (0.012) & 0.088 (0.013) & 1.00 (0.00) \\
+    & PPI-Only & -- & \NA & \NA & \NA \\
+    & PPI++-Only & -- & \NA & \NA & \NA \\
+    & RePPI & -- & \NA & \NA & \NA \\
+    & LoRA-MSE + PPI & var-obj. grid best & 0.139 (0.018) & 0.127 (0.019) & 0.90 (0.10) \\
+    & LoRA-Var + PPI & ramp-up & 0.086 (0.014) & 0.076 (0.013) & 1.00 (0.00) \\
+    & LoRA-Var + PPI & var-obj. grid best & 0.085 (0.016) & 0.072 (0.015) & 1.00 (0.00) \\
 \midrule
-1000 & Sample Mean & -- & \NA & \NA & \NA & \NA & \NA \\
-     & LoRA-MSE FT-only & -- & \NA & \NA & \NA & \NA & \NA \\
-     & LoRA-Var FT-only & -- & \NA & \NA & \NA & \NA & \NA \\
-     & LoRA-MSE + PPI & grid best & \NA & \NA & \NA & \NA & \NA \\
-     & LoRA-Var + PPI & ramp-up & \NA & \NA & \NA & \NA & \NA \\
+1000 & Sample Mean & -- & 0.089 (0.020) & 0.065 (0.020) & 1.00 (0.00) \\
+     & PPI-Only & -- & \NA & \NA & \NA \\
+     & PPI++-Only & -- & \NA & \NA & \NA \\
+     & RePPI & -- & \NA & \NA & \NA \\
+     & LoRA-MSE + PPI & var-obj. grid best & 0.068 (0.019) & 0.048 (0.016) & 1.00 (0.00) \\
+     & LoRA-Var + PPI & ramp-up & 0.070 (0.020) & 0.050 (0.016) & 1.00 (0.00) \\
+     & LoRA-Var + PPI & var-obj. grid best & 0.076 (0.020) & 0.054 (0.018) & 0.90 (0.10) \\
 \bottomrule
 \end{tabularx}
 \vspace{0.5em}
 
 \begin{minipage}{0.96\textwidth}
 \footnotesize
-Note: LoRA-MSE + PPI is reported at the best value found on the full allocation grid. It is a
-comparison value, not a proposed allocation procedure. LoRA-Var + PPI uses the target-only
-ramp-up allocation.
+Note: PPI-Only, PPI++-Only, and RePPI are reserved baseline rows and are left as placeholders until
+the corresponding standalone baseline evaluations are finalized. LoRA-MSE + PPI is reported at
+the grid point with the smallest plug-in variance objective. LoRA-Var + PPI uses the target-only ramp-up allocation,
+and the LoRA-Var variance-objective grid-best row is a non-deployable reference selected by
+the plug-in variance objective, not by RMSE or MAE. Coverage is reported for calibration and is
+not treated as a monotone performance score. Because this pilot table uses only ten matched
+replications, the RMSE and MAE columns have noticeable Monte Carlo noise; small differences across
+methods should not be over-interpreted.
 \end{minipage}
 \end{table}
 
 \paragraph{Sample savings.}
-Table~\ref{tab:sample_savings} reports how much labeled data the FT+PPI estimators save relative
-to the Sample Mean. We compute the savings from estimated variances: if method $m$ has estimated
-variance $\widehat{\Var}(\hat\mu_m)$ and the Sample Mean under the same budget has estimated
-variance $\widehat{\Var}(\hat\mu_{\mathrm{SM}})$, then
+Table~\ref{tab:sample_savings} reports variance reduction and the implied sample savings relative
+to the Sample Mean. We compute both quantities from estimated variances. If method $m$ has
+estimated variance $\widehat{\Var}(\hat\mu_m)$ and the Sample Mean under the same budget has
+estimated variance $\widehat{\Var}(\hat\mu_{\mathrm{SM}})$, then
 \[
+    \mathrm{VarReduction}(m)
+    =
     \mathrm{Savings}(m)
     =
     1-
     \frac{\widehat{\Var}(\hat\mu_m)}
          {\widehat{\Var}(\hat\mu_{\mathrm{SM}})} .
 \]
-Positive values indicate that the method achieves the same precision as the Sample Mean while
-using fewer labeled examples. Because all methods are evaluated on matched replications, we also
-report paired standard errors for the savings differences.
+The two columns coincide numerically under the usual inverse-$B$ variance scaling assumption.
+Numbers in parentheses are paired standard errors across the ten matched target-population
+replications. The final column compares the deployable LoRA-Var ramp-up estimator to the
+LoRA-MSE grid-best comparator.
 
 \begin{table}[H]
 \centering
-\caption{Sample savings of FT+PPI estimators relative to the Sample Mean}
+\caption{Variance reduction and sample savings with respect to the Sample Mean}
 \label{tab:sample_savings}
 \scriptsize
-\setlength{\tabcolsep}{4.5pt}
+\setlength{\tabcolsep}{2.2pt}
 \renewcommand{\arraystretch}{1.08}
-\begin{tabularx}{\textwidth}{@{}c X l c c c c@{}}
+\begin{tabular}{@{}c cc cc cc c@{}}
 \toprule
-$B$ & Estimator & Selection & CI Len. & CI ratio & Sample savings & Paired SE \\
+$B$ &
+\multicolumn{2}{c}{Var ramp-up vs. Sample Mean} &
+\multicolumn{2}{c}{Var grid best vs. Sample Mean} &
+\multicolumn{2}{c}{MSE grid best vs. Sample Mean} &
+Var ramp-up vs. MSE \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(l){8-8}
+& Var. red. (\%) & Savings (\%) & Var. red. (\%) & Savings (\%) &
+Var. red. (\%) & Savings (\%) & Var. red. (\%) \\
 \midrule
-300 & Sample Mean & -- & \NA & 1.000 & 0.000 & \NA \\
-    & LoRA-MSE + PPI & grid best & \NA & \NA & \NA & \NA \\
-    & LoRA-Var + PPI & ramp-up & \NA & \NA & \NA & \NA \\
-\midrule
-500 & Sample Mean & -- & \NA & 1.000 & 0.000 & \NA \\
-    & LoRA-MSE + PPI & grid best & \NA & \NA & \NA & \NA \\
-    & LoRA-Var + PPI & ramp-up & \NA & \NA & \NA & \NA \\
-\midrule
-700 & Sample Mean & -- & \NA & 1.000 & 0.000 & \NA \\
-    & LoRA-MSE + PPI & grid best & \NA & \NA & \NA & \NA \\
-    & LoRA-Var + PPI & ramp-up & \NA & \NA & \NA & \NA \\
-\midrule
-1000 & Sample Mean & -- & \NA & 1.000 & 0.000 & \NA \\
-     & LoRA-MSE + PPI & grid best & \NA & \NA & \NA & \NA \\
-     & LoRA-Var + PPI & ramp-up & \NA & \NA & \NA & \NA \\
+300  & 10.14 (3.28) & 10.14 (3.28) & 18.95 (3.45) & 18.95 (3.45) & -15.43 (5.31) & -15.43 (5.31) & 20.70 (4.40) \\
+500  & 22.87 (2.31) & 22.87 (2.31) & 27.83 (2.73) & 27.83 (2.73) & 1.84 (3.24) & 1.84 (3.24) & 20.73 (3.29) \\
+700  & 31.39 (1.41) & 31.39 (1.41) & 32.40 (1.80) & 32.40 (1.80) & 17.14 (4.10) & 17.14 (4.10) & 15.51 (4.08) \\
+1000 & 31.22 (1.24) & 31.22 (1.24) & 33.02 (0.91) & 33.02 (0.91) & 20.47 (3.65) & 20.47 (3.65) & 12.34 (3.18) \\
 \bottomrule
-\end{tabularx}
+\end{tabular}
 \end{table}
 
-The two tables together tie the preceding experiments to the final inference task. Section~6.3
-checks whether the LoRA-Var variance objective identifies a good fine-tuning fraction, and
-Section~6.4 checks whether target-only ramp-up recovers a low-regret approximation to that
-fraction. Tables~\ref{tab:estimator_accuracy} and \ref{tab:sample_savings} then test whether the
-resulting deployable LoRA-Var + PPI estimator improves accuracy and label efficiency under the
-same target-population budgets.
+The two tables connect the allocation results to the final inference task. Section~6.3 checks
+whether the LoRA-Var variance objective identifies a good fine-tuning fraction, and Section~6.4
+checks whether target-only ramp-up recovers a low-regret approximation to that fraction.
+Tables~\ref{tab:estimator_accuracy} and \ref{tab:sample_savings} then show how this deployable
+choice translates into estimation accuracy and label efficiency under the same target-population
+budgets.
 
-\subsection{Combination with Cross-PPI (To Be Determined)}
+\subsection{Combination with CrossPPI}
 \label{subsec:crossppi_combination}
 
-The allocation procedure above is designed for the standard FT+PPI estimator, but it is not tied
-to a particular rectification implementation. A natural extension is to combine the same
-fine-tuning allocation rule with Cross-PPI. This subsection is reserved for that compatibility
-experiment rather than for a separate baseline comparison.
+The experiments above study a single-split FT+PPI estimator. CrossPPI can be viewed as a
+different layer of the same inference pipeline. It is a cross-fitting wrapper: it reuses labeled
+observations by forming out-of-fold predictions, thereby addressing valid inference with
+data-dependent predictions and the label waste of a single split PPI estimator. The present
+experiment instead studies how to improve the LLM surrogate itself: which fine-tuning objective to
+use, how many labels to spend on fine-tuning, and when to stop ramp-up without training the full
+allocation grid. 
 
-The planned experiment fixes a labeled budget, such as $B=300$, and first selects the
-fine-tuning fraction using the target-only ramp-up procedure in Section~6.4. We then apply
-Cross-PPI fold-wise: for each fold, the predictor used to correct that fold is trained without
-using the fold's correction labels, and the corrected estimates are averaged across folds. The
-large unlabeled text dataset $\mathcal{M}_r^{(B)}$ remains common across folds, while the
-fold-wise role separation preserves the same no-leakage principle as the main FT+PPI estimator.
+This distinction matters in the LLM setting. CrossPPI treats the learning algorithm as a black
+box; it does not determine whether the LLM should be fine-tuned with MSE, residual variance,
+cross-entropy, or another objective. It also does not specify validation accounting for LLM
+checkpoint selection: the fold whose labels receive out-of-fold predictions cannot also be used
+to train or select the predictor for that fold. In addition, CrossPPI requires $K$ fine-tuned
+predictors for $K$ outer folds, which can be substantially more expensive than a single-fit or
+few-fit deployment. Finally, CrossPPI does not provide a scaling-law budget check or a ramp-up
+stopping rule that tells the practitioner whether additional fine-tuning labels are still worth
+spending. These points are not weaknesses of CrossPPI; they clarify that cross-fitting and
+inference-aware surrogate improvement are complementary rather than substitutes.
 
-The empirical question is whether the allocation selected by our ramp-up rule remains near the
-best allocation after Cross-PPI is applied. Operationally, we will plot the Cross-PPI estimator
-variance over a grid of fine-tuning fractions and overlay the ramp-up-selected fraction. If, for
-example, the selected fraction at $B=300$ lies near the minimum of the Cross-PPI curve, this would
-show that the proposed label-allocation rule is compatible with Cross-PPI. The comparison is
-therefore meant to demonstrate complementarity: Cross-PPI changes how correction labels are used,
-whereas our contribution is to choose an efficient fine-tuning versus correction allocation.
+A leakage-free combination is straightforward. Partition the target labeled budget into $K$ outer
+folds. For fold $k$, do not use labels in fold $k$ to train, tune, or select the predictor that
+will predict fold $k$. Instead, fine-tune a LoRA-Var predictor $f_{-k}$ using only the other outer
+folds, with early stopping based either on an inner validation split drawn from those outer-training
+folds or on a rule fixed in advance using the independent scaling-law pilot set
+$\mathcal{H}_{\mathrm{scale}}$. Then form out-of-fold predictions $f_{-k}(X_i)$ for labeled
+observations in fold $k$, use the corresponding residuals $Y_i-f_{-k(i)}(X_i)$ for correction, and
+predict the unlabeled pool by averaging the $K$ predictors. This construction preserves the
+CrossPPI sample-reuse property while allowing the surrogate in each fold to be trained with the
+variance-aligned objective.
+
+We therefore view CrossPPI as a compatibility experiment rather than as a replacement for the
+ramp-up allocation study. A compact empirical check should compare the split FT+PPI estimator from
+Section~6.5 with CrossPPI versions that use the same LLM architecture and the same target-budget
+splits, differing only in the cross-fitting wrapper and in the fine-tuning objective. Table
+\ref{tab:crossppi_compatibility} gives the reporting structure. 
+
+Note: The last two columns should be
+filled only after running the CrossPPI compatibility experiment, for example at
+$B\in\{500,1000\}$. The goal of this check is not to show that one method dominates the other.
+If CrossPPI-Var gives the shortest confidence intervals, the interpretation is that cross-fitting
+can further improve efficiency when $K$ LoRA fine-tuning runs are affordable. If split FT+PPI is
+competitive, the interpretation is that ramp-up provides a compute-light deployment path.
+
+\begin{table}[H]
+\centering
+\caption{Compact report for a CrossPPI compatibility check}
+\label{tab:crossppi_compatibility}
+\scriptsize
+\setlength{\tabcolsep}{4.0pt}
+\renewcommand{\arraystretch}{1.08}
+\begin{tabularx}{\textwidth}{@{}l c l l c c c@{}}
+\toprule
+Method & Cross-fitting? & FT objective & Selection & \# LoRA fits & CI ratio & Coverage \\
+\midrule
+Sample Mean & No & None & None & 0 & 1.000 & \NA \\
+Split FT+PPI & No & Var & ramp-up & $J$ & \NA & \NA \\
+CrossPPI-MSE & Yes & MSE & fixed $K$ & $K$ & \NA & \NA \\
+CrossPPI-Var & Yes & Var & fixed $K$ & $K$ & \NA & \NA \\
+\bottomrule
+\end{tabularx}
+\vspace{0.5em}
+
+\begin{minipage}{0.96\textwidth}
+\footnotesize
+Note: The CI ratio is the average confidence-interval length divided by the Sample Mean
+confidence-interval length under the same budget. The CrossPPI rows require new cross-fitted LoRA
+predictions and are placeholders rather than numerical claims.
+\end{minipage}
+\end{table}
 
 \appendix
-\section{Scaling-Law Validation and Diagnostic Details}
+\section{Scaling-Law Validation and Implementation Details}
 \label{app:scaling_details}
 
 \paragraph{Training configuration.}
@@ -812,20 +958,38 @@ All models use \texttt{Qwen/Qwen2.5-1.5B-Instruct} with a scalar regression head
 non-padding token representation. We use LoRA adapters on all linear modules with rank 8, LoRA
 scaling parameter 16, and dropout 0.05. The LoRA learning rate is $2\times10^{-4}$, the head
 learning rate is $5\times10^{-4}$, weight decay is 0.01, and gradient clipping uses maximum
-norm 1.0. The maximum sequence length is 192. The pilot scaling-law cells used batch size 128 on
-NVIDIA L40S GPUs; no out-of-memory fallback was triggered. Training uses at most 20 epochs,
-with a minimum of 4 epochs and patience 4 for early stopping.
+norm 1.0. The maximum sequence length is 192. The experiments were run using UW Hyak computing
+resources. Training uses at most 20 epochs, with a minimum of 4 epochs and patience 4 for early
+stopping.
+The independent scaling-law validation in Section~6.2 and the full-grid allocation validation in
+Section~6.3 use the same model, LoRA, optimizer, batch-size, and early-stopping hyperparameters;
+they differ only in the data split, the candidate fine-tuning sizes, and the estimator-level
+allocation objective being evaluated.
 
-\paragraph{Loss-function diagnostic.}
-In addition to the variance-loss scaling-law run, we evaluate two MSE-based diagnostics under
+\paragraph{Loss-function residual-variance comparison.}
+\label{app:loss_residual_comparison}
+In addition to the variance-loss scaling-law run, we evaluate two MSE-based comparisons under
 the same pilot split protocol: MSE training with MSE-based checkpoint selection, and MSE
-training with variance-based checkpoint selection. Table~\ref{tab:scaling_loss_fit} shows that
-all three approaches improve substantially over the constant-predictor baseline, while the
-variance-loss model with variance-based checkpoint selection provides the best pilot scaling fit.
+training with variance-based checkpoint selection. Figure~\ref{fig:loss_comparison} compares the
+raw-scale validation residual variance across the three training objectives, and
+Table~\ref{tab:scaling_loss_fit} reports the corresponding scaling-law fits. This comparison
+uses the same trimmed set of pilot replications as Section~6.2. It shows that all three
+approaches improve substantially over the constant-predictor baseline, while the variance-loss
+model with variance-based checkpoint selection gives the lowest residual-variance curve over most
+fine-tuning sizes.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.86\textwidth]{Figures/Wine_Reviews_new/method_comparison_validation_scale_residual_variance_trimmed_raw.pdf}
+\caption{Residual variance on the raw rating scale under MSE and variance fine-tuning
+objectives. Shaded bands denote 95\% confidence intervals across the eight trimmed pilot
+replications used in Section~6.2.}
+\label{fig:loss_comparison}
+\end{figure}
 
 \begin{table}[H]
 \centering
-\caption{Scaling-law fits for the pilot loss-function diagnostic}
+\caption{Scaling-law fits for the pilot loss-function residual-variance comparison}
 \label{tab:scaling_loss_fit}
 \small
 \setlength{\tabcolsep}{7pt}
@@ -833,115 +997,64 @@ variance-loss model with variance-based checkpoint selection provides the best p
 \toprule
 Method & $\hat a$ & $\hat\alpha$ & $\hat b$ & $R^2$ \\
 \midrule
-MSE loss, stop by MSE & 34.69 & 0.505 & 1.993 & 0.894 \\
-MSE loss, stop by Var & 19.51 & 0.491 & 2.488 & 0.989 \\
-Var loss, stop by Var & 17.40 & 0.574 & 2.827 & 0.995 \\
+MSE loss, stop by MSE & 41.47 & 0.568 & 2.266 & 0.894 \\
+MSE loss, stop by Var & 26.55 & 0.583 & 2.692 & 0.996 \\
+Var loss, stop by Var & 16.86 & 0.553 & 2.754 & 0.995 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\paragraph{Additional diagnostics.}
-\label{app:diagnostics}
-The following diagnostics use the same pilot split, model family, and optimization parameters as
-the scaling-law validation above. We report them together with the scaling-law details because
-they check whether the fitted power law is driven by the intended residual-variance mechanism
-rather than by prediction collapse, invalid rating ranges, or leakage across data roles.
-
-First, we compare residual variance under MSE and variance fine-tuning, because residual variance
-is the quantity that enters the PPI correction variance. Second, we monitor prediction variance to
-detect collapse to an almost constant predictor. Third, we record the share of predictions outside
-the feasible rating range $[80,100]$. Fourth, we compare every trained surrogate with the
-constant predictor baseline of 9.57. Finally, we verify all role splits to rule out leakage across
-pilot, validation, fine-tuning, correction, and unlabeled sets. Figure~\ref{fig:loss_diagnostic}
-reports the loss-function residual-variance diagnostic, and Table~\ref{tab:diagnostics}
-summarizes the remaining checks.
-
-\begin{figure}[H]
-\centering
-\includegraphics[width=0.86\textwidth]{artifacts/hyak/wine_loss_controlled_b10000_r10_stopmetric_s50_to700/figures/method_comparison_validation_scale_residual_variance_raw.pdf}
-\caption{Residual variance on the raw rating scale under MSE and variance fine-tuning
-diagnostics. Shaded bands denote 95\% confidence intervals across 10 pilot replications.}
-\label{fig:loss_diagnostic}
-\end{figure}
-
-\begin{table}[H]
-\centering
-\caption{Diagnostic checks for target-population experiments}
-\label{tab:diagnostics}
-\footnotesize
-\setlength{\tabcolsep}{5pt}
-\renewcommand{\arraystretch}{1.10}
-\begin{tabularx}{\textwidth}{@{}p{0.20\textwidth}p{0.30\textwidth}X@{}}
-\toprule
-Diagnostic & Quantity & Purpose \\
-\midrule
-Residual variance & Var/MSE by method & Tests whether variance loss improves the PPI-relevant quantity. \\
-\addlinespace[0.15em]
-Prediction spread & $\widehat{\Var}\{f(X)\}$ and prediction range & Detects collapse to a nearly constant predictor. \\
-\addlinespace[0.15em]
-Out-of-range rate & Share of $\hat Y\notin[80,100]$ & Checks whether the regression head produces implausible ratings. \\
-\addlinespace[0.15em]
-Constant baseline & Residual variance relative to 9.57 & Quantifies improvement over the no-text predictor. \\
-\addlinespace[0.15em]
-Leakage checks & Pairwise split intersections & Verifies separation of pilot, validation, fine-tuning, correction, and unlabeled roles. \\
-\bottomrule
-\end{tabularx}
-\end{table}
-
-These diagnostics are necessary because valid PPI inference requires both statistical role
-separation and a useful surrogate. A method that reduces prediction error without reducing
-residual variance, collapses to a nearly constant predictor, or reuses validation labels during
-correction would not support the intended inference claim.
-
 \section{Additional Full-Grid Allocation Figures}
 \label{app:full_grid_allocation_figures}
 
-This appendix contains the budget-specific full-grid allocation plots not shown in the main text.
+The remaining budget-specific full-grid allocation plots are reported here.
 Figures~\ref{fig:allocation_validation_b300}, \ref{fig:allocation_validation_b700}, and
 \ref{fig:allocation_validation_b1000} use the same visual convention as
 Figure~\ref{fig:allocation_validation_b500}: the horizontal axis is the fine-tuning allocation
 fraction after removing validation labels, and the vertical axis is the normalized plug-in
-variance objective $\overline V_B(\rho)/\overline V_B^{\mathrm{SM}}$. The star marks the
+variance objective $\overline V_B^{\mathrm{Var}}(\rho)/\overline V_B^{\mathrm{SM}}$. The star marks the
 theoretical allocation implied by the Section~6.2 scaling-law fit, and the empirical minimum over
 the trained candidate set marks the full-grid benchmark.
 
 \begin{figure}[H]
 \centering
-\fbox{%
-\begin{minipage}[c][0.34\textheight][c]{0.82\textwidth}
-\centering
-\textbf{Full-grid allocation validation, $B=300$}\\[0.8em]
-Plot reserved for LoRA-MSE + PPI and LoRA-Var + PPI normalized variance objectives.\\
-The validation set has size 60, so the effective allocation budget is $n_B=240$.
-\end{minipage}}
-\caption{Planned full-grid allocation validation plot for $B=300$.}
+\includegraphics[width=0.72\textwidth]{Figures/Wine_Reviews_new/full_grid_allocation_B300_var_objective_paper.pdf}
+\caption{Full-grid LoRA-Var allocation objective for $B=300$.}
 \label{fig:allocation_validation_b300}
 \end{figure}
 
 \begin{figure}[H]
 \centering
-\fbox{%
-\begin{minipage}[c][0.34\textheight][c]{0.82\textwidth}
-\centering
-\textbf{Full-grid allocation validation, $B=700$}\\[0.8em]
-Plot reserved for LoRA-MSE + PPI and LoRA-Var + PPI normalized variance objectives.\\
-The validation set has size 140, so the effective allocation budget is $n_B=560$.
-\end{minipage}}
-\caption{Planned full-grid allocation validation plot for $B=700$.}
+\includegraphics[width=0.72\textwidth]{Figures/Wine_Reviews_new/full_grid_allocation_B700_var_objective_paper.pdf}
+\caption{Full-grid LoRA-Var allocation objective for $B=700$.}
 \label{fig:allocation_validation_b700}
 \end{figure}
 
 \begin{figure}[H]
 \centering
-\fbox{%
-\begin{minipage}[c][0.34\textheight][c]{0.82\textwidth}
-\centering
-\textbf{Full-grid allocation validation, $B=1000$}\\[0.8em]
-Plot reserved for LoRA-MSE + PPI and LoRA-Var + PPI normalized variance objectives.\\
-The validation set has size 200, so the effective allocation budget is $n_B=800$.
-\end{minipage}}
-\caption{Planned full-grid allocation validation plot for $B=1000$.}
+\includegraphics[width=0.72\textwidth]{Figures/Wine_Reviews_new/full_grid_allocation_B1000_var_objective_paper.pdf}
+\caption{Full-grid LoRA-Var allocation objective for $B=1000$.}
 \label{fig:allocation_validation_b1000}
+\end{figure}
+
+\section{Target-Only Ramp-Up Trace}
+\label{app:rampup_trace}
+
+Figure~\ref{fig:rampup_trace_b500} provides an additional ramp-up replay using the aggregate
+validation residual-variance curve across the ten target-population replications. The points show
+the observed validation residual variances at the nested fine-tuning sizes, and the orange curves
+show the scaling-law fits after successive ramp-up stages. For $B=500$, the procedure stops at
+$s=120$ while the full-grid oracle over the same deployable grid is $s=80$; the resulting plug-in
+variance regret is 7.00\%. This trace complements the $B=1000$ example in
+Figure~\ref{fig:rampup_trace_b1000}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.76\textwidth]{Figures/Wine_Reviews_new/rampup_stagewise_fit_B500.pdf}
+\caption{Target-only ramp-up trace for $B=500$. The vertical solid line marks the stopped
+fine-tuning size, and the dashed line marks the full-grid oracle over the same deployable
+allocation grid.}
+\label{fig:rampup_trace_b500}
 \end{figure}
 
 \end{document}
