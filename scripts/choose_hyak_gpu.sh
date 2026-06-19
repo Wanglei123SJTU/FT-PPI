@@ -45,17 +45,12 @@ choose_from_idle() {
 }
 
 choose_from_idle "ckpt-g2" "gpu:h200:1" "h200"
-choose_from_idle "ckpt-all" "gpu:h200:1" "h200"
-choose_from_idle "gpu-h200" "gpu:h200:1" "h200"
-choose_from_idle "gpu-a100" "gpu:a100:1" "a100"
-choose_from_idle "ckpt" "gpu:a100:1" "a100"
-choose_from_idle "gpu-l40s" "gpu:l40s:1" "l40s"
 choose_from_idle "ckpt-g2" "gpu:l40s:1" "l40s"
-choose_from_idle "ckpt" "gpu:l40s:1" "l40s"
-choose_from_idle "gpu-l40" "gpu:l40:1" "l40"
 choose_from_idle "ckpt-g2" "gpu:l40:1" "l40"
+choose_from_idle "ckpt" "gpu:h200:1" "h200"
+choose_from_idle "ckpt" "gpu:a100:1" "a100"
+choose_from_idle "ckpt" "gpu:l40s:1" "l40s"
 choose_from_idle "ckpt" "gpu:l40:1" "l40"
-choose_from_idle "gpu-a40" "gpu:a40:1" "a40"
 choose_from_idle "ckpt" "gpu:a40:1" "a40"
 
 if [ "$ALLOW_LOW_MEMORY" = "1" ]; then
