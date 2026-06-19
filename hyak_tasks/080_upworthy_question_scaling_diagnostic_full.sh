@@ -50,10 +50,31 @@ fi
 echo "== DESCRIBE DATA AND TARGET =="
 .venv-hyak/bin/python -m src.experiments.upworthy_question_scaling_law describe --config "$CONFIG"
 
+existing_cells="$(
+  .venv-hyak/bin/python - "$CONFIG" <<'PY'
+from pathlib import Path
+import sys
+import yaml
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    config = yaml.safe_load(f)
+root = Path(config["output_dir"])
+print(len(list(root.glob("*/rep_*/s_*/metrics.json"))))
+PY
+)"
+if [ "$existing_cells" -ge "$TOTAL_CELLS" ]; then
+  echo "== SKIP ARRAY: existing metrics complete =="
+  echo "completed_cells=$existing_cells total_cells=$TOTAL_CELLS"
+  goto_aggregate=1
+else
+  goto_aggregate=0
+fi
+
 echo "== GPU STATUS =="
 sinfo -o "%20P %18G %8D %8t %10C %10m %N" | grep -Ei 'gpu|ckpt|h200|a100|a40|l40|rtx6k' || true
 squeue -u "$USER" || true
 
+if [ "$goto_aggregate" -eq 0 ]; then
 echo "== SUBMIT UPWORTHY QUESTION SCALING DIAGNOSTIC =="
 if [ -n "${HYAK_FORCE_GPU_ARGS:-}" ]; then
   GPU_ARGS="$HYAK_FORCE_GPU_ARGS"
@@ -133,6 +154,7 @@ find "$SCRATCH_LOG_DIR" -maxdepth 1 -name "upworthy-qscale-${JOB_ID}_*.out" -typ
   echo "--- final tail $log ---"
   tail -100 "$log" || true
 done
+fi
 
 echo "== AGGREGATE AND VALIDATE =="
 .venv-hyak/bin/python -m src.experiments.upworthy_question_scaling_law aggregate --config "$CONFIG"
