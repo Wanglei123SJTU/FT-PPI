@@ -1,0 +1,127 @@
+input_csv: Data/upworthy_pairs_with_text_features.csv
+output_dir: /gscratch/scrubbed/lei0603/ft-ppi/artifacts/upworthy_question_scaling_diagnostic_full
+seed: 20260618
+
+target_feature: delta_QUESTION
+train_pool_size: 5000
+validation_stop_size: 1000
+validation_scale_size: 1000
+s_grid: [50, 100, 200, 400, 800, 1600]
+replication_ids: [0, 1, 2]
+diagnostic_budgets: [300, 500, 1000, 2000, 5000]
+
+methods:
+  - name: mse_uniform
+    loss: mse
+    early_stopping_metric: mse
+    sampling_strategy: uniform
+
+  - name: ifvarq_uniform
+    loss: ifvarq
+    early_stopping_metric: ifvarq
+    sampling_strategy: uniform
+
+  - name: ifvarq_clip4_uniform
+    loss: ifvarq
+    early_stopping_metric: ifvarq
+    sampling_strategy: uniform
+    if_weight_clip: 4.0
+
+  - name: ifvarq_warm2_uniform
+    loss: ifvarq
+    warmup_loss: mse
+    warmup_epochs: 2
+    early_stopping_metric: ifvarq
+    sampling_strategy: uniform
+
+  - name: mse_question_balanced
+    loss: mse
+    early_stopping_metric: mse
+    sampling_strategy: question_balanced
+
+  - name: mse_question_if_weight_balanced
+    loss: mse
+    early_stopping_metric: mse
+    sampling_strategy: question_if_weight_balanced
+
+  - name: ifvarq_question_balanced
+    loss: ifvarq
+    early_stopping_metric: ifvarq
+    sampling_strategy: question_balanced
+    if_weight_clip: 4.0
+
+  - name: ifvarq_question_if_weight_balanced
+    loss: ifvarq
+    early_stopping_metric: ifvarq
+    sampling_strategy: question_if_weight_balanced
+    if_weight_clip: 4.0
+
+  - name: ifvarq_warm2_question_if_weight_balanced
+    loss: ifvarq
+    warmup_loss: mse
+    warmup_epochs: 2
+    early_stopping_metric: ifvarq
+    sampling_strategy: question_if_weight_balanced
+    if_weight_clip: 4.0
+
+  - name: lowlr_ifvarq_warm2_question_if_weight_balanced
+    loss: ifvarq
+    warmup_loss: mse
+    warmup_epochs: 2
+    early_stopping_metric: ifvarq
+    sampling_strategy: question_if_weight_balanced
+    if_weight_clip: 4.0
+    lora_lr: 8.0e-5
+    head_lr: 2.0e-4
+    max_epochs: 16
+    min_epochs: 4
+    early_stopping_patience: 4
+
+  - name: frozen_mse_uniform
+    loss: mse
+    early_stopping_metric: mse
+    sampling_strategy: uniform
+    train_backbone: false
+    head_lr: 1.0e-3
+    batch_size: 128
+    max_epochs: 20
+    min_epochs: 4
+    early_stopping_patience: 4
+
+  - name: frozen_ifvarq_warm2_question_if_weight_balanced
+    loss: ifvarq
+    warmup_loss: mse
+    warmup_epochs: 2
+    early_stopping_metric: ifvarq
+    sampling_strategy: question_if_weight_balanced
+    if_weight_clip: 4.0
+    train_backbone: false
+    head_lr: 1.0e-3
+    batch_size: 128
+    max_epochs: 20
+    min_epochs: 4
+    early_stopping_patience: 4
+
+model_name: Qwen/Qwen2.5-1.5B-Instruct
+max_length: 80
+target_modules: all-linear
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_lr: 2.0e-4
+head_lr: 5.0e-4
+head_hidden_size: 128
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+batch_size: 64
+oom_fallback_batch_sizes: [32, 16]
+prediction_batch_size: 64
+log_every_epochs: 1
+max_epochs: 12
+min_epochs: 3
+early_stopping_patience: 3
+early_stopping_min_delta: 0.0
+common_train_seed_within_rep: true
+gradient_checkpointing: true
+save_predictions: false

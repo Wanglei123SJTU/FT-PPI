@@ -51,6 +51,17 @@ class MethodSpec:
     name: str
     loss: str
     early_stopping_metric: str
+    sampling_strategy: str = "uniform"
+    warmup_loss: str | None = None
+    warmup_epochs: int = 0
+    if_weight_clip: float | None = None
+    train_backbone: bool = True
+    lora_lr: float | None = None
+    head_lr: float | None = None
+    batch_size: int | None = None
+    max_epochs: int | None = None
+    min_epochs: int | None = None
+    early_stopping_patience: int | None = None
 
 
 @dataclass(frozen=True)
@@ -99,18 +110,47 @@ def method_specs(config: dict[str, Any]) -> list[MethodSpec]:
     raw = config.get("methods", [{"name": "mse_stop_mse", "loss": "mse", "early_stopping_metric": "mse"}])
     methods: list[MethodSpec] = []
     seen: set[str] = set()
+    allowed_losses = {"mse", "ifvarq"}
+    allowed_sampling = {"uniform", "question_balanced", "if_weight_balanced", "question_if_weight_balanced"}
     for item in raw:
         name = str(item["name"]).lower()
         loss = str(item.get("loss", name)).lower()
         stop = str(item.get("early_stopping_metric", loss)).lower()
-        if loss not in {"mse", "ifvarq"}:
+        warmup_loss = item.get("warmup_loss")
+        warmup_loss = None if warmup_loss in (None, "") else str(warmup_loss).lower()
+        sampling_strategy = str(item.get("sampling_strategy", config.get("sampling_strategy", "uniform"))).lower()
+        if loss not in allowed_losses:
             raise ValueError(f"unsupported loss {loss!r}; expected 'mse' or 'ifvarq'")
-        if stop not in {"mse", "ifvarq"}:
+        if stop not in allowed_losses:
             raise ValueError(f"unsupported early_stopping_metric {stop!r}; expected 'mse' or 'ifvarq'")
+        if warmup_loss is not None and warmup_loss not in allowed_losses:
+            raise ValueError(f"unsupported warmup_loss {warmup_loss!r}; expected one of {sorted(allowed_losses)}")
+        if sampling_strategy not in allowed_sampling:
+            raise ValueError(f"unsupported sampling_strategy {sampling_strategy!r}; expected one of {sorted(allowed_sampling)}")
         if name in seen:
             raise ValueError(f"duplicate method name {name!r}")
         seen.add(name)
-        methods.append(MethodSpec(name=name, loss=loss, early_stopping_metric=stop))
+        if_weight_clip = item.get("if_weight_clip", config.get("if_weight_clip"))
+        methods.append(
+            MethodSpec(
+                name=name,
+                loss=loss,
+                early_stopping_metric=stop,
+                sampling_strategy=sampling_strategy,
+                warmup_loss=warmup_loss,
+                warmup_epochs=int(item.get("warmup_epochs", 0)),
+                if_weight_clip=None if if_weight_clip in (None, "") else float(if_weight_clip),
+                train_backbone=bool(item.get("train_backbone", config.get("train_backbone", True))),
+                lora_lr=None if item.get("lora_lr") in (None, "") else float(item["lora_lr"]),
+                head_lr=None if item.get("head_lr") in (None, "") else float(item["head_lr"]),
+                batch_size=None if item.get("batch_size") in (None, "") else int(item["batch_size"]),
+                max_epochs=None if item.get("max_epochs") in (None, "") else int(item["max_epochs"]),
+                min_epochs=None if item.get("min_epochs") in (None, "") else int(item["min_epochs"]),
+                early_stopping_patience=None
+                if item.get("early_stopping_patience") in (None, "")
+                else int(item["early_stopping_patience"]),
+            )
+        )
     return methods
 
 
@@ -126,7 +166,84 @@ def rep_seed(config: dict[str, Any], replication_id: int, salt: int = 0) -> int:
     return int(config.get("seed", 20260618)) + 100_003 * int(replication_id) + int(salt)
 
 
-def build_scaling_split(df: pd.DataFrame, config: dict[str, Any], replication_id: int) -> ScalingSplit:
+def _interleave_permuted_groups(groups: list[np.ndarray], cycle: list[int], rng: np.random.Generator) -> np.ndarray:
+    shuffled = [rng.permutation(np.asarray(group, dtype=np.int64)) for group in groups]
+    positions = [0 for _ in shuffled]
+    order: list[int] = []
+    total = int(sum(len(group) for group in shuffled))
+    if total == 0:
+        return np.asarray([], dtype=np.int64)
+    while len(order) < total:
+        advanced = False
+        for group_index in cycle:
+            if len(order) >= total:
+                break
+            if positions[group_index] < len(shuffled[group_index]):
+                order.append(int(shuffled[group_index][positions[group_index]]))
+                positions[group_index] += 1
+                advanced = True
+        if not advanced:
+            leftovers = [
+                int(group[pos])
+                for group, start in zip(shuffled, positions)
+                for pos in range(start, len(group))
+            ]
+            order.extend(rng.permutation(np.asarray(leftovers, dtype=np.int64)).tolist())
+    return np.asarray(order, dtype=np.int64)
+
+
+def build_train_order(
+    df: pd.DataFrame,
+    train_pool_ids: np.ndarray,
+    rng: np.random.Generator,
+    sampling_strategy: str,
+) -> np.ndarray:
+    strategy = str(sampling_strategy).lower()
+    if strategy == "uniform":
+        return rng.permutation(np.asarray(train_pool_ids, dtype=np.int64))
+
+    pool = pd.DataFrame({ID_COL: np.asarray(train_pool_ids, dtype=np.int64)}).merge(
+        df[[ID_COL, "delta_QUESTION", "if_weight_question"]],
+        on=ID_COL,
+        how="left",
+        validate="one_to_one",
+    )
+    if pool["delta_QUESTION"].isna().any() or pool["if_weight_question"].isna().any():
+        raise ValueError("train pool contains unknown sample ids or missing influence weights")
+
+    ids = pool[ID_COL].to_numpy(dtype=np.int64)
+
+    nonzero = pool.loc[pool["delta_QUESTION"].abs() > 0, ID_COL].to_numpy(dtype=np.int64)
+    zero = pool.loc[pool["delta_QUESTION"].abs() == 0, ID_COL].to_numpy(dtype=np.int64)
+    abs_weight = pool["if_weight_question"].abs().to_numpy(dtype=float)
+    cutoff = float(np.quantile(abs_weight, 0.75))
+    high_weight = pool.loc[pool["if_weight_question"].abs() >= cutoff, ID_COL].to_numpy(dtype=np.int64)
+    low_weight = pool.loc[pool["if_weight_question"].abs() < cutoff, ID_COL].to_numpy(dtype=np.int64)
+
+    if strategy == "question_balanced":
+        return _interleave_permuted_groups([nonzero, zero], [0, 1], rng)
+    if strategy == "if_weight_balanced":
+        return _interleave_permuted_groups([high_weight, low_weight], [0, 1], rng)
+    if strategy == "question_if_weight_balanced":
+        nonzero_ids = set(map(int, nonzero))
+        high_ids = set(map(int, high_weight))
+        groups = [
+            pool.loc[pool[ID_COL].isin(nonzero_ids & high_ids), ID_COL].to_numpy(dtype=np.int64),
+            pool.loc[pool[ID_COL].isin(nonzero_ids - high_ids), ID_COL].to_numpy(dtype=np.int64),
+            pool.loc[pool[ID_COL].isin(high_ids - nonzero_ids), ID_COL].to_numpy(dtype=np.int64),
+            pool.loc[~pool[ID_COL].isin(nonzero_ids | high_ids), ID_COL].to_numpy(dtype=np.int64),
+        ]
+        return _interleave_permuted_groups(groups, [0, 1, 2, 0, 1, 3], rng)
+
+    raise ValueError(f"unsupported sampling_strategy {sampling_strategy!r}")
+
+
+def build_scaling_split(
+    df: pd.DataFrame,
+    config: dict[str, Any],
+    replication_id: int,
+    sampling_strategy: str = "uniform",
+) -> ScalingSplit:
     population = build_population_split(df)
     train_pool_size = int(config["train_pool_size"])
     v_stop_size = int(config["validation_stop_size"])
@@ -140,7 +257,7 @@ def build_scaling_split(df: pd.DataFrame, config: dict[str, Any], replication_id
     v_stop_ids = np.asarray(ordered[:v_stop_size], dtype=np.int64)
     v_scale_ids = np.asarray(ordered[v_stop_size : v_stop_size + v_scale_size], dtype=np.int64)
     train_pool_ids = np.asarray(ordered[v_stop_size + v_scale_size : required], dtype=np.int64)
-    train_order_ids = rng.permutation(train_pool_ids)
+    train_order_ids = build_train_order(df, train_pool_ids, rng, sampling_strategy)
     split = ScalingSplit(
         train_pool_ids=train_pool_ids,
         v_stop_ids=v_stop_ids,
@@ -272,18 +389,36 @@ def mse_loss_from_residuals(residual: Any) -> Any:
     return (residual**2).mean()
 
 
-def ifvarq_loss_from_residuals(residual: Any, influence_weight: Any) -> Any:
+def ifvarq_loss_from_residuals(residual: Any, influence_weight: Any, if_weight_clip: float | None = None) -> Any:
+    if if_weight_clip is not None and float(if_weight_clip) > 0:
+        influence_weight = influence_weight.clip(min=-float(if_weight_clip), max=float(if_weight_clip))
     if_residual = influence_weight * residual
     return ((if_residual - if_residual.mean()) ** 2).mean()
 
 
-def training_loss_from_residuals(residual: Any, influence_weight: Any, loss_name: str) -> Any:
-    loss = str(loss_name).lower()
+def active_loss_name(method: MethodSpec, epoch: int) -> str:
+    if method.warmup_loss is not None and int(method.warmup_epochs) > 0 and int(epoch) <= int(method.warmup_epochs):
+        return method.warmup_loss
+    return method.loss
+
+
+def training_loss_from_residuals(
+    residual: Any,
+    influence_weight: Any,
+    method: MethodSpec | str,
+    epoch: int = 1,
+) -> Any:
+    if isinstance(method, MethodSpec):
+        loss = active_loss_name(method, epoch)
+        clip = method.if_weight_clip
+    else:
+        loss = str(method).lower()
+        clip = None
     if loss == "mse":
         return mse_loss_from_residuals(residual)
     if loss == "ifvarq":
-        return ifvarq_loss_from_residuals(residual, influence_weight)
-    raise ValueError(f"unsupported loss {loss_name!r}")
+        return ifvarq_loss_from_residuals(residual, influence_weight, clip)
+    raise ValueError(f"unsupported loss {loss!r}")
 
 
 def stopping_value_from_metrics(metrics: dict[str, float], early_stopping_metric: str) -> float:
@@ -405,7 +540,15 @@ def build_tokenizer(model_name: str, max_length: int, AutoTokenizer: Any) -> Any
     return tokenizer
 
 
-def build_pair_model(config: dict[str, Any], n_features: int, torch: Any, AutoModel: Any, LoraConfig: Any, get_peft_model: Any) -> Any:
+def build_pair_model(
+    config: dict[str, Any],
+    n_features: int,
+    torch: Any,
+    AutoModel: Any,
+    LoraConfig: Any,
+    get_peft_model: Any,
+    method: MethodSpec,
+) -> Any:
     import torch.nn as nn
 
     class AntiSymmetricPairRegressionModel(nn.Module):
@@ -418,18 +561,25 @@ def build_pair_model(config: dict[str, Any], n_features: int, torch: Any, AutoMo
             )
             if hasattr(backbone.config, "use_cache"):
                 backbone.config.use_cache = False
-            if bool(config.get("gradient_checkpointing", False)) and hasattr(backbone, "gradient_checkpointing_enable"):
+            train_backbone = bool(method.train_backbone)
+            self.train_backbone = train_backbone
+            if train_backbone and bool(config.get("gradient_checkpointing", False)) and hasattr(backbone, "gradient_checkpointing_enable"):
                 backbone.gradient_checkpointing_enable()
-            if bool(config.get("gradient_checkpointing", False)) and hasattr(backbone, "enable_input_require_grads"):
+            if train_backbone and bool(config.get("gradient_checkpointing", False)) and hasattr(backbone, "enable_input_require_grads"):
                 backbone.enable_input_require_grads()
-            lora_config = LoraConfig(
-                r=int(config["lora_r"]),
-                lora_alpha=int(config["lora_alpha"]),
-                target_modules=config["target_modules"],
-                lora_dropout=float(config["lora_dropout"]),
-                bias="none",
-            )
-            self.backbone = get_peft_model(backbone, lora_config)
+            if train_backbone:
+                lora_config = LoraConfig(
+                    r=int(config["lora_r"]),
+                    lora_alpha=int(config["lora_alpha"]),
+                    target_modules=config["target_modules"],
+                    lora_dropout=float(config["lora_dropout"]),
+                    bias="none",
+                )
+                self.backbone = get_peft_model(backbone, lora_config)
+            else:
+                for param in backbone.parameters():
+                    param.requires_grad_(False)
+                self.backbone = backbone
             hidden_size = int(backbone.config.hidden_size)
             self.head = nn.Sequential(
                 nn.Linear(hidden_size + int(n_features), int(config.get("head_hidden_size", 128))),
@@ -440,7 +590,11 @@ def build_pair_model(config: dict[str, Any], n_features: int, torch: Any, AutoMo
             nn.init.zeros_(self.head[-1].bias)
 
         def pool(self, input_ids: Any, attention_mask: Any) -> Any:
-            outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+            if self.train_backbone:
+                outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+            else:
+                with torch.no_grad():
+                    outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
             hidden = outputs.last_hidden_state
             lengths = attention_mask.sum(dim=1).clamp(min=1) - 1
             return hidden[torch.arange(hidden.shape[0], device=hidden.device), lengths].float()
@@ -505,6 +659,7 @@ def train_once(
         mods["AutoModel"],
         mods["LoraConfig"],
         mods["get_peft_model"],
+        method,
     ).to(device)
     try:
         model.backbone.print_trainable_parameters()
@@ -523,15 +678,20 @@ def train_once(
     )
     lora_params = [p for p in model.backbone.parameters() if p.requires_grad]
     head_params = list(model.head.parameters())
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": lora_params, "lr": float(config["lora_lr"]), "weight_decay": float(config["weight_decay"])},
-            {"params": head_params, "lr": float(config["head_lr"]), "weight_decay": float(config["weight_decay"])},
-        ]
+    lora_lr = float(method.lora_lr if method.lora_lr is not None else config["lora_lr"])
+    head_lr = float(method.head_lr if method.head_lr is not None else config["head_lr"])
+    param_groups = []
+    if lora_params:
+        param_groups.append({"params": lora_params, "lr": lora_lr, "weight_decay": float(config["weight_decay"])})
+    param_groups.append({"params": head_params, "lr": head_lr, "weight_decay": float(config["weight_decay"])})
+    optimizer = torch.optim.AdamW(param_groups)
+    max_epochs = int(method.max_epochs if method.max_epochs is not None else config.get("max_epochs", 12))
+    min_epochs = int(method.min_epochs if method.min_epochs is not None else config.get("min_epochs", 3))
+    patience = int(
+        method.early_stopping_patience
+        if method.early_stopping_patience is not None
+        else config.get("early_stopping_patience", 3)
     )
-    max_epochs = int(config.get("max_epochs", 12))
-    min_epochs = int(config.get("min_epochs", 3))
-    patience = int(config.get("early_stopping_patience", 3))
     min_delta = float(config.get("early_stopping_min_delta", 0.0))
     best_state: dict[str, Any] | None = None
     best_value = float("inf")
@@ -554,7 +714,7 @@ def train_once(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 pred = model(**inputs)
             residual = labels.float() - pred.float()
-            loss = training_loss_from_residuals(residual, influence_weight.float(), method.loss)
+            loss = training_loss_from_residuals(residual, influence_weight.float(), method, epoch)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["max_grad_norm"]))
             optimizer.step()
@@ -577,6 +737,7 @@ def train_once(
         epoch_history.append(
             {
                 "epoch": int(epoch),
+                "active_loss": active_loss_name(method, epoch),
                 "train_loss_mean": float(np.mean(epoch_losses)) if epoch_losses else float("nan"),
                 "train_loss_last": float(epoch_losses[-1]) if epoch_losses else float("nan"),
                 "validation_stop_mse": float(stop_metrics["rmse_scaled"]) ** 2,
@@ -591,6 +752,7 @@ def train_once(
                 "train_progress",
                 f"method={method.name}",
                 f"loss={method.loss}",
+                f"active_loss={epoch_history[-1]['active_loss']}",
                 f"epoch={epoch}",
                 f"train_loss={epoch_history[-1]['train_loss_mean']:.6f}",
                 f"v_stop_mse={epoch_history[-1]['validation_stop_mse']:.6f}",
@@ -610,8 +772,15 @@ def train_once(
     runtime = {
         "runtime_seconds": time.time() - start,
         "actual_batch_size": int(batch_size),
-        "requested_batch_size": int(config["batch_size"]),
-        "oom_fallback_used": bool(batch_size != int(config["batch_size"])),
+        "requested_batch_size": int(method.batch_size if method.batch_size is not None else config["batch_size"]),
+        "oom_fallback_used": bool(batch_size != int(method.batch_size if method.batch_size is not None else config["batch_size"])),
+        "train_backbone": bool(method.train_backbone),
+        "sampling_strategy": method.sampling_strategy,
+        "warmup_loss": method.warmup_loss,
+        "warmup_epochs": int(method.warmup_epochs),
+        "if_weight_clip": method.if_weight_clip,
+        "lora_lr": float(lora_lr),
+        "head_lr": float(head_lr),
         "max_epochs": int(max_epochs),
         "min_epochs": int(min_epochs),
         "early_stopping_patience": int(patience),
@@ -728,6 +897,17 @@ def write_cell_manifest(
         "method": method.name,
         "loss": method.loss,
         "early_stopping_metric": method.early_stopping_metric,
+        "sampling_strategy": method.sampling_strategy,
+        "warmup_loss": method.warmup_loss,
+        "warmup_epochs": int(method.warmup_epochs),
+        "if_weight_clip": method.if_weight_clip,
+        "train_backbone": bool(method.train_backbone),
+        "lora_lr": method.lora_lr,
+        "head_lr": method.head_lr,
+        "batch_size": method.batch_size,
+        "max_epochs": method.max_epochs,
+        "min_epochs": method.min_epochs,
+        "early_stopping_patience": method.early_stopping_patience,
         "replication_id": int(replication_id),
         "s_train": int(s_train),
         "counts": {
@@ -771,13 +951,13 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
     population = build_population_split(df)
     y_scale = outcome_scale_from_h_scale(df, population.h_scale_ids)
     df, inference = compute_inference_setup(df, population.p_target_ids, y_scale, str(config.get("target_feature", TARGET_FEATURE)))
-    split = build_scaling_split(df, config, replication_id)
+    split = build_scaling_split(df, config, replication_id, method.sampling_strategy)
     train_df = subset_by_ids(df, train_ids_for_s(split, s_train), "train", y_scale)
     stop_df = subset_by_ids(df, split.v_stop_ids, "validation_stop", y_scale)
     scale_df = subset_by_ids(df, split.v_scale_ids, "validation_scale", y_scale)
     write_cell_manifest(output_dir, config, method, replication_id, s_train, split, population)
 
-    requested_batch = int(config["batch_size"])
+    requested_batch = int(method.batch_size if method.batch_size is not None else config["batch_size"])
     batch_candidates = [requested_batch]
     for value in config.get("oom_fallback_batch_sizes", [64, 32]):
         batch = int(value)
@@ -790,6 +970,8 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
                 "upworthy_scaling_cell_start",
                 f"method={method.name}",
                 f"loss={method.loss}",
+                f"sampling={method.sampling_strategy}",
+                f"train_backbone={method.train_backbone}",
                 f"rep={replication_id}",
                 f"s={s_train}",
                 f"batch_size={batch_size}",
@@ -839,6 +1021,19 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
         "method": method.name,
         "loss": method.loss,
         "early_stopping_metric": method.early_stopping_metric,
+        "method_config": {
+            "sampling_strategy": method.sampling_strategy,
+            "warmup_loss": method.warmup_loss,
+            "warmup_epochs": int(method.warmup_epochs),
+            "if_weight_clip": method.if_weight_clip,
+            "train_backbone": bool(method.train_backbone),
+            "lora_lr": method.lora_lr,
+            "head_lr": method.head_lr,
+            "batch_size": method.batch_size,
+            "max_epochs": method.max_epochs,
+            "min_epochs": method.min_epochs,
+            "early_stopping_patience": method.early_stopping_patience,
+        },
         "replication_id": int(replication_id),
         "s_train": int(s_train),
         "model_name": config["model_name"],
@@ -889,10 +1084,19 @@ def load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
             continue
         with open(path, "r", encoding="utf-8") as f:
             metrics = json.load(f)
+        method_config = metrics.get("method_config", {})
+        runtime = metrics.get("runtime", {})
         row = {
             "method": str(metrics["method"]),
             "loss": str(metrics["loss"]),
             "early_stopping_metric": str(metrics["early_stopping_metric"]),
+            "sampling_strategy": str(method_config.get("sampling_strategy", runtime.get("sampling_strategy", "uniform"))),
+            "warmup_loss": method_config.get("warmup_loss", runtime.get("warmup_loss")),
+            "warmup_epochs": int(method_config.get("warmup_epochs", runtime.get("warmup_epochs", 0)) or 0),
+            "if_weight_clip": method_config.get("if_weight_clip", runtime.get("if_weight_clip")),
+            "train_backbone": bool(method_config.get("train_backbone", runtime.get("train_backbone", True))),
+            "lora_lr": runtime.get("lora_lr", method_config.get("lora_lr")),
+            "head_lr": runtime.get("head_lr", method_config.get("head_lr")),
             "replication_id": int(metrics["replication_id"]),
             "s_train": int(metrics["s_train"]),
             "h_scale_size": int(metrics["h_scale_size"]),
@@ -913,14 +1117,14 @@ def load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
             "validation_scale_mse_scaled": float(metrics["validation_scale"]["rmse_scaled"]) ** 2,
             "validation_scale_rmse_scaled": float(metrics["validation_scale"]["rmse_scaled"]),
             "validation_scale_corr": float(metrics["validation_scale"]["correlation"]),
-            "actual_batch_size": int(metrics["runtime"]["actual_batch_size"]),
-            "oom_fallback_used": bool(metrics["runtime"]["oom_fallback_used"]),
-            "runtime_seconds": float(metrics["runtime"]["runtime_seconds"]),
-            "epochs_trained": int(metrics["runtime"]["epochs_trained"]),
-            "best_epoch": int(metrics["runtime"]["best_epoch"]),
-            "early_stopped": bool(metrics["runtime"]["early_stopped"]),
-            "total_train_steps": int(metrics["runtime"]["total_train_steps"]),
-            "device": str(metrics["runtime"]["device"]),
+            "actual_batch_size": int(runtime["actual_batch_size"]),
+            "oom_fallback_used": bool(runtime["oom_fallback_used"]),
+            "runtime_seconds": float(runtime["runtime_seconds"]),
+            "epochs_trained": int(runtime["epochs_trained"]),
+            "best_epoch": int(runtime["best_epoch"]),
+            "early_stopped": bool(runtime["early_stopped"]),
+            "total_train_steps": int(runtime["total_train_steps"]),
+            "device": str(runtime["device"]),
         }
         rows.append(row)
     if missing:
@@ -948,6 +1152,13 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
             mean_epochs_trained=("epochs_trained", "mean"),
             direct_ols_ifvar_target_raw=("direct_ols_ifvar_target_raw", "first"),
             question_beta_raw=("question_beta_raw", "first"),
+            sampling_strategy=("sampling_strategy", "first"),
+            train_backbone=("train_backbone", "first"),
+            warmup_loss=("warmup_loss", "first"),
+            warmup_epochs=("warmup_epochs", "first"),
+            if_weight_clip=("if_weight_clip", "first"),
+            lora_lr=("lora_lr", "first"),
+            head_lr=("head_lr", "first"),
         )
         .sort_values(["method", "s_train"])
         .reset_index(drop=True)
@@ -999,8 +1210,9 @@ def describe_data(config: dict[str, Any]) -> dict[str, Any]:
     df = load_upworthy_pairs(config["input_csv"])
     population = build_population_split(df)
     y_scale = outcome_scale_from_h_scale(df, population.h_scale_ids)
-    _, inference = compute_inference_setup(df, population.p_target_ids, y_scale, str(config.get("target_feature", TARGET_FEATURE)))
-    split0 = build_scaling_split(df, config, replication_ids(config)[0])
+    df, inference = compute_inference_setup(df, population.p_target_ids, y_scale, str(config.get("target_feature", TARGET_FEATURE)))
+    methods = method_specs(config)
+    split0 = build_scaling_split(df, config, replication_ids(config)[0], methods[0].sampling_strategy)
     return {
         "n_rows": int(len(df)),
         "h_scale_size": int(len(population.h_scale_ids)),
@@ -1010,7 +1222,7 @@ def describe_data(config: dict[str, Any]) -> dict[str, Any]:
         "validation_scale_size": int(len(split0.v_scale_ids)),
         "s_grid": s_grid(config),
         "replication_ids": replication_ids(config),
-        "methods": [method.__dict__ for method in method_specs(config)],
+        "methods": [method.__dict__ for method in methods],
         "outcome_scale": {"mean": y_scale.mean, "sd": y_scale.sd},
         "question_beta_raw": inference["question_beta_raw"],
         "direct_ols_ifvar_target_raw": inference["direct_ols_ifvar_target_raw"],

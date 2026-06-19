@@ -6,7 +6,10 @@ from pathlib import Path
 
 from src.experiments.upworthy_question_scaling_law import (
     FEATURE_COLS,
+    ID_COL,
+    MethodSpec,
     OutcomeScale,
+    build_train_order,
     build_population_split,
     build_scaling_split,
     compute_inference_setup,
@@ -14,6 +17,7 @@ from src.experiments.upworthy_question_scaling_law import (
     load_upworthy_pairs,
     outcome_scale_from_h_scale,
     task_index_to_cell,
+    training_loss_from_residuals,
     train_ids_for_s,
 )
 
@@ -102,6 +106,47 @@ def test_ifvarq_loss_is_weighted_residual_variance():
     weighted = residual * weight
     expected = np.mean((weighted - weighted.mean()) ** 2)
     assert np.isclose(ifvarq_loss_from_residuals(residual, weight), expected)
+
+
+def test_ifvarq_loss_can_clip_extreme_weights():
+    residual = np.array([1.0, 2.0, 4.0, 8.0])
+    weight = np.array([0.5, 1.0, -10.0, 20.0])
+    clipped = residual * np.clip(weight, -2.0, 2.0)
+    expected = np.mean((clipped - clipped.mean()) ** 2)
+    assert np.isclose(ifvarq_loss_from_residuals(residual, weight, if_weight_clip=2.0), expected)
+
+
+def test_warmup_loss_uses_mse_before_ifvarq():
+    residual = np.array([1.0, 2.0, 4.0, 8.0])
+    weight = np.array([0.5, 1.0, -1.0, 2.0])
+    method = MethodSpec(
+        name="warmup",
+        loss="ifvarq",
+        early_stopping_metric="ifvarq",
+        warmup_loss="mse",
+        warmup_epochs=2,
+    )
+    assert np.isclose(training_loss_from_residuals(residual, weight, method, epoch=1), np.mean(residual**2))
+    assert np.isclose(training_loss_from_residuals(residual, weight, method, epoch=3), ifvarq_loss_from_residuals(residual, weight))
+
+
+def test_question_balanced_order_enriches_question_varying_pairs():
+    df = pd.DataFrame(
+        {
+            ID_COL: np.arange(10, dtype=np.int64),
+            "delta_QUESTION": [1, -1, 1, -1, 1, -1, 0, 0, 0, 0],
+            "if_weight_question": np.linspace(0.1, 1.0, 10),
+        }
+    )
+    order = build_train_order(
+        df,
+        train_pool_ids=df[ID_COL].to_numpy(dtype=np.int64),
+        rng=np.random.default_rng(0),
+        sampling_strategy="question_balanced",
+    )
+    ordered_q = df.set_index(ID_COL).loc[order[:8], "delta_QUESTION"].to_numpy()
+    assert np.all(np.abs(ordered_q[0::2]) == 1)
+    assert np.all(ordered_q[1::2] == 0)
 
 
 def test_task_index_to_cell_orders_methods_then_reps_then_s():
