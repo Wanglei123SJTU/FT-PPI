@@ -8,6 +8,7 @@ ONCE="${3:-0}"
 mkdir -p .hyak_runner
 RUNNER_LOG=".hyak_runner/runner.out"
 RUNNER_PID=".hyak_runner/runner.pid"
+RUNNER_REPO_DIR="${HYAK_RUNNER_REPO_DIR:-$(pwd)}"
 
 runner_is_alive() {
   if [ ! -s "$RUNNER_PID" ]; then
@@ -25,6 +26,7 @@ if runner_is_alive; then
 else
   echo "starting detached runner"
   nohup env \
+    HYAK_RUNNER_REPO_DIR="$RUNNER_REPO_DIR" \
     HYAK_RUNNER_BRANCH="$BRANCH" \
     HYAK_RUNNER_POLL_SECONDS="$POLL_SECONDS" \
     HYAK_RUNNER_ONCE="$ONCE" \
