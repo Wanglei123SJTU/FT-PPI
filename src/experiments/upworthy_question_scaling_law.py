@@ -227,6 +227,23 @@ def feature_cols_from_config(config: dict[str, Any] | None = None) -> list[str]:
     return cols
 
 
+def surrogate_feature_cols_from_config(config: dict[str, Any] | None = None) -> list[str]:
+    if config is None or "surrogate_feature_columns" not in config or config.get("surrogate_feature_columns") is None:
+        return feature_cols_from_config(config)
+    raw = config.get("surrogate_feature_columns")
+    if isinstance(raw, str):
+        if raw.lower() in {"", "none", "text_only", "text-only"}:
+            return []
+        raise ValueError("surrogate_feature_columns must be a list of feature names or [] for text-only")
+    cols = [str(col) for col in raw]
+    unknown = sorted(set(cols) - set(FEATURE_COLS))
+    if unknown:
+        raise ValueError(f"surrogate_feature_columns must be drawn from {FEATURE_COLS}, got unknown {unknown}")
+    if len(cols) != len(set(cols)):
+        raise ValueError(f"surrogate_feature_columns contains duplicates: {cols}")
+    return cols
+
+
 def normalize_sampling_strategy(strategy: str) -> str:
     value = str(strategy).lower()
     aliases = {
@@ -861,10 +878,10 @@ def train_once(
     device = torch.device("cuda")
 
     tokenizer = build_tokenizer(config["model_name"], int(config["max_length"]), mods["AutoTokenizer"])
-    feature_cols = feature_cols_from_config(config)
+    surrogate_feature_cols = surrogate_feature_cols_from_config(config)
     model = build_pair_model(
         config,
-        len(feature_cols),
+        len(surrogate_feature_cols),
         torch,
         mods["AutoModel"],
         mods["LoraConfig"],
@@ -877,7 +894,7 @@ def train_once(
         pass
 
     collate = make_pair_collate_fn(tokenizer, torch)
-    train_dataset = PairTokenizedDataset(train_df, tokenizer, int(config["max_length"]), feature_cols=feature_cols)
+    train_dataset = PairTokenizedDataset(train_df, tokenizer, int(config["max_length"]), feature_cols=surrogate_feature_cols)
     train_loader = mods["DataLoader"](
         train_dataset,
         batch_size=int(batch_size),
@@ -1025,8 +1042,8 @@ def predict_frame(
     batch_size: int,
 ) -> pd.DataFrame:
     model.eval()
-    feature_cols = feature_cols_from_config(config)
-    dataset = PairTokenizedDataset(frame, tokenizer, int(config["max_length"]), feature_cols=feature_cols)
+    surrogate_feature_cols = surrogate_feature_cols_from_config(config)
+    dataset = PairTokenizedDataset(frame, tokenizer, int(config["max_length"]), feature_cols=surrogate_feature_cols)
     loader = DataLoader(
         dataset,
         batch_size=int(config.get("prediction_batch_size", batch_size)),
@@ -1110,6 +1127,7 @@ def write_cell_manifest(
     population: PopulationSplit,
 ) -> None:
     feature_cols = feature_cols_from_config(config)
+    surrogate_feature_cols = surrogate_feature_cols_from_config(config)
     manifest = {
         "method": method.name,
         "loss": method.loss,
@@ -1129,6 +1147,7 @@ def write_cell_manifest(
         "s_train": int(s_train),
         "target_feature": str(config.get("target_feature", TARGET_FEATURE)),
         "feature_columns": feature_cols,
+        "surrogate_feature_columns": surrogate_feature_cols,
         "counts": {
             "H_scale": int(len(population.h_scale_ids)),
             "P_target": int(len(population.p_target_ids)),
@@ -1168,6 +1187,7 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
 
     df = load_upworthy_pairs(config["input_csv"], config)
     feature_cols = feature_cols_from_config(config)
+    surrogate_feature_cols = surrogate_feature_cols_from_config(config)
     target_feature = str(config.get("target_feature", TARGET_FEATURE))
     population = build_population_split(df)
     y_scale = outcome_scale_from_h_scale(df, population.h_scale_ids)
@@ -1266,6 +1286,7 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
         "pooling_strategy": str(config.get("pooling_strategy", "last")).lower(),
         "target_feature": target_feature,
         "feature_columns": feature_cols,
+        "surrogate_feature_columns": surrogate_feature_cols,
         "h_scale_size": int(len(population.h_scale_ids)),
         "p_target_size": int(len(population.p_target_ids)),
         "train_pool_size": int(len(split.train_pool_ids)),
@@ -1313,6 +1334,7 @@ def load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
         method_config = metrics.get("method_config", {})
         runtime = metrics.get("runtime", {})
         feature_columns = metrics.get("feature_columns", FEATURE_COLS)
+        surrogate_feature_columns = metrics.get("surrogate_feature_columns", feature_columns)
         row = {
             "method": str(metrics["method"]),
             "loss": str(metrics["loss"]),
@@ -1336,6 +1358,8 @@ def load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
             "target_feature": str(metrics.get("target_feature", config.get("target_feature", TARGET_FEATURE))),
             "feature_columns": ",".join(str(x) for x in feature_columns),
             "n_features": int(len(feature_columns)),
+            "surrogate_feature_columns": ",".join(str(x) for x in surrogate_feature_columns),
+            "n_surrogate_features": int(len(surrogate_feature_columns)),
             "train_pool_size": int(metrics["train_pool_size"]),
             "validation_stop_size": int(metrics["validation_stop_size"]),
             "validation_scale_size": int(metrics["validation_scale_size"]),
@@ -1385,6 +1409,8 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
                 "target_feature",
                 "feature_columns",
                 "n_features",
+                "surrogate_feature_columns",
+                "n_surrogate_features",
                 "method",
                 "loss",
                 "early_stopping_metric",
@@ -1463,6 +1489,7 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
 def describe_data(config: dict[str, Any]) -> dict[str, Any]:
     df = load_upworthy_pairs(config["input_csv"], config)
     feature_cols = feature_cols_from_config(config)
+    surrogate_feature_cols = surrogate_feature_cols_from_config(config)
     target_feature = str(config.get("target_feature", TARGET_FEATURE))
     population = build_population_split(df)
     y_scale = outcome_scale_from_h_scale(df, population.h_scale_ids)
@@ -1488,6 +1515,8 @@ def describe_data(config: dict[str, Any]) -> dict[str, Any]:
         "target_feature": target_feature,
         "feature_columns": feature_cols,
         "n_features": int(len(feature_cols)),
+        "surrogate_feature_columns": surrogate_feature_cols,
+        "n_surrogate_features": int(len(surrogate_feature_cols)),
         "outcome_column": outcome_col_from_config(config),
         "outcome_transform": outcome_transform_from_config(config),
         "ctr_shrinkage_tau": config.get("ctr_shrinkage_tau"),

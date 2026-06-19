@@ -18,6 +18,7 @@ from src.experiments.upworthy_question_scaling_law import (
     ifvarq_loss_from_residuals,
     load_upworthy_pairs,
     outcome_scale_from_h_scale,
+    surrogate_feature_cols_from_config,
     target_feature_index,
     task_index_to_cell,
     training_loss_from_residuals,
@@ -175,6 +176,16 @@ def test_feature_columns_config_rejects_missing_target():
         assert "active feature_columns" in str(exc)
     else:
         raise AssertionError("target outside active feature_columns should fail")
+
+
+def test_surrogate_feature_columns_can_be_text_only():
+    config = {
+        "feature_columns": ["delta_QUESTION", "delta_LENGTH"],
+        "surrogate_feature_columns": [],
+    }
+    assert feature_cols_from_config(config) == ["delta_QUESTION", "delta_LENGTH"]
+    assert surrogate_feature_cols_from_config(config) == []
+    assert surrogate_feature_cols_from_config({"feature_columns": ["delta_LENGTH"]}) == ["delta_LENGTH"]
 
 
 def test_ifvarq_loss_is_weighted_residual_variance():
