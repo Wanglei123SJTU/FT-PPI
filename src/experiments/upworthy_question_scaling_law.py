@@ -84,6 +84,12 @@ def outcome_col_from_config(config: dict[str, Any] | None = None) -> str:
     return str(config.get("outcome_column", Y_COL))
 
 
+def outcome_transform_from_config(config: dict[str, Any] | None = None) -> str:
+    if config is None:
+        return ""
+    return str(config.get("outcome_transform", "")).lower()
+
+
 def estimation_weight_scheme_from_config(config: dict[str, Any] | None = None) -> str:
     if config is None:
         return "none"
@@ -143,14 +149,53 @@ def apply_row_filters(df: pd.DataFrame, config: dict[str, Any] | None = None) ->
     return out.reset_index(drop=True)
 
 
+def _safe_logit(prob: np.ndarray) -> np.ndarray:
+    clipped = np.clip(prob.astype(float), 1e-9, 1.0 - 1e-9)
+    return np.log(clipped / (1.0 - clipped))
+
+
+def compute_transformed_outcome(df: pd.DataFrame, transform: str, config: dict[str, Any] | None = None) -> np.ndarray:
+    value = str(transform).lower()
+    if value in {"", "none"}:
+        raise ValueError("compute_transformed_outcome requires a non-empty outcome_transform")
+    if value in {"logit_ctr_diff_eb", "ctr_diff_eb"}:
+        _require_columns(df, ["clicks_a", "clicks_b", "impressions_a", "impressions_b"], value)
+        tau = float((config or {}).get("ctr_shrinkage_tau", 0.0))
+        if tau < 0:
+            raise ValueError("ctr_shrinkage_tau must be non-negative")
+        clicks_a = df["clicks_a"].astype(float).to_numpy()
+        clicks_b = df["clicks_b"].astype(float).to_numpy()
+        imps_a = df["impressions_a"].astype(float).to_numpy()
+        imps_b = df["impressions_b"].astype(float).to_numpy()
+        total_imps = float(imps_a.sum() + imps_b.sum())
+        if total_imps <= 0:
+            raise ValueError("CTR outcome transform requires positive total impressions")
+        prior_ctr = float((clicks_a.sum() + clicks_b.sum()) / total_imps)
+        ctr_a = (clicks_a + tau * prior_ctr) / np.maximum(imps_a + tau, 1e-12)
+        ctr_b = (clicks_b + tau * prior_ctr) / np.maximum(imps_b + tau, 1e-12)
+        if value == "ctr_diff_eb":
+            return (ctr_a - ctr_b).astype(float)
+        return (_safe_logit(ctr_a) - _safe_logit(ctr_b)).astype(float)
+    raise ValueError(f"unsupported outcome_transform {transform!r}")
+
+
 def load_upworthy_pairs(input_csv: str | Path, config: dict[str, Any] | None = None) -> pd.DataFrame:
     df = pd.read_csv(input_csv)
     outcome_col = outcome_col_from_config(config)
-    required = {outcome_col, TEXT_A_COL, TEXT_B_COL, "split", *FEATURE_COLS}
+    outcome_transform = outcome_transform_from_config(config)
+    required = {TEXT_A_COL, TEXT_B_COL, "split", *FEATURE_COLS}
+    if outcome_transform in {"", "none"}:
+        required.add(outcome_col)
+    elif outcome_transform in {"logit_ctr_diff_eb", "ctr_diff_eb"}:
+        required.update(["clicks_a", "clicks_b", "impressions_a", "impressions_b"])
+    else:
+        raise ValueError(f"unsupported outcome_transform {outcome_transform!r}")
     missing = sorted(required - set(df.columns))
     if missing:
         raise ValueError(f"missing required columns: {missing}")
     out = apply_row_filters(df.copy(), config)
+    if outcome_transform not in {"", "none"}:
+        out[outcome_col] = compute_transformed_outcome(out, outcome_transform, config)
     if ID_COL not in out.columns:
         if "pair_id" in out.columns:
             out.insert(0, ID_COL, out["pair_id"].astype(np.int64))
@@ -745,6 +790,9 @@ def build_pair_model(
                 last_layer = self.head
             nn.init.normal_(last_layer.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(last_layer.bias)
+            self.pooling_strategy = str(config.get("pooling_strategy", "last")).lower()
+            if self.pooling_strategy not in {"last", "mean"}:
+                raise ValueError("pooling_strategy must be either 'last' or 'mean'")
 
         def pool(self, input_ids: Any, attention_mask: Any) -> Any:
             if self.train_backbone:
@@ -753,8 +801,12 @@ def build_pair_model(
                 with torch.no_grad():
                     outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
             hidden = outputs.last_hidden_state
-            lengths = attention_mask.sum(dim=1).clamp(min=1) - 1
-            return hidden[torch.arange(hidden.shape[0], device=hidden.device), lengths].float()
+            if self.pooling_strategy == "last":
+                lengths = attention_mask.sum(dim=1).clamp(min=1) - 1
+                return hidden[torch.arange(hidden.shape[0], device=hidden.device), lengths].float()
+            mask = attention_mask.unsqueeze(-1).to(dtype=hidden.dtype)
+            denom = mask.sum(dim=1).clamp(min=1.0)
+            return ((hidden * mask).sum(dim=1) / denom).float()
 
         def forward(
             self,
@@ -1208,7 +1260,10 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
         "model_name": config["model_name"],
         "input_csv": str(config["input_csv"]),
         "outcome_column": outcome_col_from_config(config),
+        "outcome_transform": outcome_transform_from_config(config),
+        "ctr_shrinkage_tau": config.get("ctr_shrinkage_tau"),
         "estimation_weight_scheme": estimation_weight_scheme_from_config(config),
+        "pooling_strategy": str(config.get("pooling_strategy", "last")).lower(),
         "target_feature": target_feature,
         "feature_columns": feature_cols,
         "h_scale_size": int(len(population.h_scale_ids)),
@@ -1274,7 +1329,10 @@ def load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
             "h_scale_size": int(metrics["h_scale_size"]),
             "p_target_size": int(metrics["p_target_size"]),
             "outcome_column": str(metrics.get("outcome_column", config.get("outcome_column", Y_COL))),
+            "outcome_transform": str(metrics.get("outcome_transform", config.get("outcome_transform", ""))),
+            "ctr_shrinkage_tau": metrics.get("ctr_shrinkage_tau", config.get("ctr_shrinkage_tau")),
             "estimation_weight_scheme": str(metrics.get("estimation_weight_scheme", config.get("estimation_weight_scheme", "none"))),
+            "pooling_strategy": str(metrics.get("pooling_strategy", config.get("pooling_strategy", "last"))),
             "target_feature": str(metrics.get("target_feature", config.get("target_feature", TARGET_FEATURE))),
             "feature_columns": ",".join(str(x) for x in feature_columns),
             "n_features": int(len(feature_columns)),
@@ -1320,7 +1378,10 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
         metrics.groupby(
             [
                 "outcome_column",
+                "outcome_transform",
+                "ctr_shrinkage_tau",
                 "estimation_weight_scheme",
+                "pooling_strategy",
                 "target_feature",
                 "feature_columns",
                 "n_features",
@@ -1330,6 +1391,7 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
                 "s_train",
             ],
             as_index=False,
+            dropna=False,
         )
         .agg(
             n_replications=("replication_id", "nunique"),
@@ -1427,7 +1489,10 @@ def describe_data(config: dict[str, Any]) -> dict[str, Any]:
         "feature_columns": feature_cols,
         "n_features": int(len(feature_cols)),
         "outcome_column": outcome_col_from_config(config),
+        "outcome_transform": outcome_transform_from_config(config),
+        "ctr_shrinkage_tau": config.get("ctr_shrinkage_tau"),
         "estimation_weight_scheme": estimation_weight_scheme_from_config(config),
+        "pooling_strategy": str(config.get("pooling_strategy", "last")).lower(),
         "outcome_scale": {"mean": y_scale.mean, "sd": y_scale.sd},
         "question_beta_raw": inference["question_beta_raw"],
         "target_coefficient_raw": inference["target_coefficient_raw"],

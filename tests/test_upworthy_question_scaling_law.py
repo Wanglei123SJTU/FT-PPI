@@ -9,6 +9,7 @@ from src.experiments.upworthy_question_scaling_law import (
     ID_COL,
     MethodSpec,
     OutcomeScale,
+    Y_COL,
     build_train_order,
     build_population_split,
     build_scaling_split,
@@ -97,6 +98,28 @@ def test_load_upworthy_pairs_can_select_outcome_and_weights():
     assert np.allclose(df["y_logit_ctr_diff"], df["y_ctr_diff"])
     assert "estimation_weight" in df
     assert np.all(df["estimation_weight"].to_numpy() > 0)
+
+
+def test_load_upworthy_pairs_can_build_eb_logit_outcome():
+    path = Path(".pytest_tmp/upworthy_question_scaling_toy_eb.csv")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = _toy_frame().drop(columns=["sample_id"])
+    raw.to_csv(path, index=False)
+    tau = 1000.0
+    df = load_upworthy_pairs(
+        path,
+        {
+            "outcome_column": "y_logit_ctr_diff_eb_tau1000",
+            "outcome_transform": "logit_ctr_diff_eb",
+            "ctr_shrinkage_tau": tau,
+        },
+    )
+    prior = (raw["clicks_a"].sum() + raw["clicks_b"].sum()) / (raw["impressions_a"].sum() + raw["impressions_b"].sum())
+    ctr_a = (raw["clicks_a"].to_numpy(dtype=float) + tau * prior) / (raw["impressions_a"].to_numpy(dtype=float) + tau)
+    ctr_b = (raw["clicks_b"].to_numpy(dtype=float) + tau * prior) / (raw["impressions_b"].to_numpy(dtype=float) + tau)
+    expected = np.log(ctr_a / (1.0 - ctr_a)) - np.log(ctr_b / (1.0 - ctr_b))
+    assert np.allclose(df[Y_COL].to_numpy(dtype=float), expected)
+    assert np.allclose(df["y_logit_ctr_diff_eb_tau1000"].to_numpy(dtype=float), expected)
 
 
 def test_scaling_split_is_disjoint_and_nested():
