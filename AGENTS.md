@@ -27,6 +27,63 @@ This file records stable working habits for future Codex runs. Keep it focused o
 
 The stable workflow is a persistent Hyak runner. The user logs in once and completes Duo; Codex then drives work by committing/pushing task files and reading logs.
 
+### Automation Contract
+
+- Codex should operate Hyak through the runner workflow, not by asking the user to type PowerShell, SSH, `sbatch`, `squeue`, or log-inspection commands manually.
+- The user is responsible only for the interactive authentication step: entering the UW password and completing Duo when the runner window asks for it.
+- After that first login succeeds, Codex should handle the loop end to end:
+  1. edit local code/config/task files;
+  2. run local checks where feasible;
+  3. commit and push to GitHub;
+  4. let the remote Hyak runner pull the new commit;
+  5. submit/monitor Slurm jobs through `hyak_tasks/*.sh`;
+  6. inspect runner, task, Slurm, and artifact logs;
+  7. fix failures with another commit and a new task filename.
+- Do not ask the user to open a new shell or run Hyak commands unless authentication has expired or a GUI/credential prompt is unavoidable.
+- If the runner disconnects or authentication expires, Codex should reopen or restart the runner workflow and ask the user only to complete password/Duo again. After authentication, Codex resumes automation.
+- Do not paste or store passwords, Duo passcodes, SSH keys, GitHub tokens, or API keys in scripts, docs, commits, or logs.
+
+### New Conversation Quickstart
+
+A new Codex conversation should be able to use Hyak immediately from this repository:
+
+1. Read this file first.
+2. Check whether local code is already pushed:
+
+```powershell
+git status --short --branch
+```
+
+3. Start or reconnect the persistent runner from Windows:
+
+```powershell
+scripts\start_hyak_runner.bat
+```
+
+4. Ask the user to enter the UW password and complete Duo in the runner window. Do not ask the user to type any other PowerShell or SSH commands.
+5. Once authentication succeeds, drive all Hyak work by editing local files, committing, and pushing to `origin/main`.
+6. For every new remote action, create a new `hyak_tasks/<id>_<description>.sh` file, commit it, and push it. The runner will pull and execute it.
+7. Monitor local runner output at `artifacts/hyak/hyak_runner.log`. If the local stream is stale or disconnected, inspect the remote runner/task logs by creating a small Hyak task or reconnecting the runner rather than asking the user to manually inspect files.
+8. If a task fails, fix code/config locally, create a new task filename, commit, push, and let the runner retry. Do not edit or rerun old task IDs unless intentionally clearing remote runner state.
+
+Minimal Hyak task skeleton:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+echo "example_task_start $(date)"
+
+cd ~/FT-PPI
+git status --short --branch
+
+# Submit or run the intended remote command here.
+# For Slurm jobs, print sbatch command, job id, squeue polling, sacct final state,
+# Slurm log tail, and required output checks.
+
+echo "example_task_done $(date)"
+```
+
 ### Starting the Runner
 
 - Start from Windows with:
@@ -100,6 +157,45 @@ If a task discovers that a previous job actually completed after a runner discon
   5. Monitor `artifacts/hyak/hyak_runner.log` and remote task/Slurm logs.
   6. Fix with a new commit and a new task filename if needed.
 - Do not create broad, unrelated commits. Keep task-specific fixes scoped.
+
+### Standard GitHub Push Procedure
+
+When the user asks to save or push work to GitHub, Codex should do the Git operations directly:
+
+1. Check the worktree:
+
+```powershell
+git status --short --branch
+```
+
+2. Inspect the intended changes with `git diff --stat`, `git diff --name-status`, and targeted diffs for sensitive files.
+3. Run relevant checks, usually:
+
+```powershell
+$env:PYTHONPATH='.'; pytest tests -q
+```
+
+4. Stage only the intended files. Do not stage local scratch files, credentials, large raw artifacts, or unrelated generated outputs.
+5. Commit with a concise message:
+
+```powershell
+git commit -m "Concise message"
+```
+
+6. Push to GitHub:
+
+```powershell
+git push origin main
+```
+
+7. Confirm the result:
+
+```powershell
+git status --short --branch
+git log -1 --oneline
+```
+
+If `git push` is rejected because the remote moved, run `git pull --ff-only` and inspect the result before retrying. Do not use force push, reset, or rebase unless the user explicitly asks.
 
 ## Reporting Results
 
