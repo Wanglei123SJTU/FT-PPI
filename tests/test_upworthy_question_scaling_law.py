@@ -13,9 +13,11 @@ from src.experiments.upworthy_question_scaling_law import (
     build_population_split,
     build_scaling_split,
     compute_inference_setup,
+    feature_cols_from_config,
     ifvarq_loss_from_residuals,
     load_upworthy_pairs,
     outcome_scale_from_h_scale,
+    target_feature_index,
     task_index_to_cell,
     training_loss_from_residuals,
     train_ids_for_s,
@@ -98,6 +100,40 @@ def test_inference_setup_uses_target_hessian_and_question_weight():
     assert info["target_feature_index"] == 1
     assert np.isclose(info["question_beta_raw"], -0.1)
     assert info["direct_ols_ifvar_target_raw"] < 1e-20
+
+
+def test_single_feature_target_setup_uses_active_feature_columns():
+    df = _toy_frame(n_h=12, n_t=12)
+    population = build_population_split(df)
+    y_scale = outcome_scale_from_h_scale(df, population.h_scale_ids)
+    feature_cols = ["delta_NUMERIC"]
+    out, info = compute_inference_setup(
+        df,
+        population.p_target_ids,
+        y_scale,
+        target_feature="delta_NUMERIC",
+        feature_cols=feature_cols,
+    )
+    assert "if_weight_target" in out
+    assert "if_weight_question" in out
+    assert info["target_feature"] == "delta_NUMERIC"
+    assert info["feature_columns"] == ["intercept", "delta_NUMERIC"]
+    assert info["target_feature_index"] == 1
+    x = np.column_stack([np.ones(12), df.loc[df["split"] == "target", "delta_NUMERIC"].to_numpy(dtype=float)])
+    y = df.loc[df["split"] == "target", "y_logit_ctr_diff"].to_numpy(dtype=float)
+    expected_beta = np.linalg.pinv(x.T @ x) @ x.T @ y
+    assert np.isclose(info["target_coefficient_raw"], expected_beta[1])
+
+
+def test_feature_columns_config_rejects_missing_target():
+    config = {"feature_columns": ["delta_LENGTH"]}
+    assert feature_cols_from_config(config) == ["delta_LENGTH"]
+    try:
+        target_feature_index("delta_QUESTION", feature_cols_from_config(config))
+    except ValueError as exc:
+        assert "active feature_columns" in str(exc)
+    else:
+        raise AssertionError("target outside active feature_columns should fail")
 
 
 def test_ifvarq_loss_is_weighted_residual_variance():

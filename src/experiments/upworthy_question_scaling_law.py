@@ -30,6 +30,8 @@ FEATURE_COLS = [
     "delta_LENGTH",
 ]
 TARGET_FEATURE = "delta_QUESTION"
+IF_WEIGHT_COL = "if_weight_target"
+LEGACY_IF_WEIGHT_COL = "if_weight_question"
 
 
 @dataclass(frozen=True)
@@ -98,6 +100,29 @@ def load_upworthy_pairs(input_csv: str | Path) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def feature_cols_from_config(config: dict[str, Any] | None = None) -> list[str]:
+    if config is None or config.get("feature_columns") in (None, ""):
+        return list(FEATURE_COLS)
+    cols = [str(col) for col in config["feature_columns"]]
+    if not cols:
+        raise ValueError("feature_columns must contain at least one feature")
+    unknown = sorted(set(cols) - set(FEATURE_COLS))
+    if unknown:
+        raise ValueError(f"feature_columns must be drawn from {FEATURE_COLS}, got unknown {unknown}")
+    if len(cols) != len(set(cols)):
+        raise ValueError(f"feature_columns contains duplicates: {cols}")
+    return cols
+
+
+def normalize_sampling_strategy(strategy: str) -> str:
+    value = str(strategy).lower()
+    aliases = {
+        "question_balanced": "target_nonzero_balanced",
+        "question_if_weight_balanced": "target_if_weight_balanced",
+    }
+    return aliases.get(value, value)
+
+
 def build_population_split(df: pd.DataFrame) -> PopulationSplit:
     h_scale = df.loc[df["split"].astype(str) == "h_scale", ID_COL].to_numpy(dtype=np.int64)
     p_target = df.loc[df["split"].astype(str) == "target", ID_COL].to_numpy(dtype=np.int64)
@@ -111,7 +136,14 @@ def method_specs(config: dict[str, Any]) -> list[MethodSpec]:
     methods: list[MethodSpec] = []
     seen: set[str] = set()
     allowed_losses = {"mse", "ifvarq"}
-    allowed_sampling = {"uniform", "question_balanced", "if_weight_balanced", "question_if_weight_balanced"}
+    allowed_sampling = {
+        "uniform",
+        "if_weight_balanced",
+        "target_nonzero_balanced",
+        "target_if_weight_balanced",
+        "question_balanced",
+        "question_if_weight_balanced",
+    }
     for item in raw:
         name = str(item["name"]).lower()
         loss = str(item.get("loss", name)).lower()
@@ -197,34 +229,38 @@ def build_train_order(
     train_pool_ids: np.ndarray,
     rng: np.random.Generator,
     sampling_strategy: str,
+    target_feature: str = TARGET_FEATURE,
 ) -> np.ndarray:
-    strategy = str(sampling_strategy).lower()
+    strategy = normalize_sampling_strategy(sampling_strategy)
     if strategy == "uniform":
         return rng.permutation(np.asarray(train_pool_ids, dtype=np.int64))
 
+    weight_col = IF_WEIGHT_COL if IF_WEIGHT_COL in df.columns else LEGACY_IF_WEIGHT_COL
     pool = pd.DataFrame({ID_COL: np.asarray(train_pool_ids, dtype=np.int64)}).merge(
-        df[[ID_COL, "delta_QUESTION", "if_weight_question"]],
+        df[[ID_COL, target_feature, weight_col]],
         on=ID_COL,
         how="left",
         validate="one_to_one",
     )
-    if pool["delta_QUESTION"].isna().any() or pool["if_weight_question"].isna().any():
+    if pool[target_feature].isna().any() or pool[weight_col].isna().any():
         raise ValueError("train pool contains unknown sample ids or missing influence weights")
 
     ids = pool[ID_COL].to_numpy(dtype=np.int64)
 
-    nonzero = pool.loc[pool["delta_QUESTION"].abs() > 0, ID_COL].to_numpy(dtype=np.int64)
-    zero = pool.loc[pool["delta_QUESTION"].abs() == 0, ID_COL].to_numpy(dtype=np.int64)
-    abs_weight = pool["if_weight_question"].abs().to_numpy(dtype=float)
+    nonzero = pool.loc[pool[target_feature].abs() > 0, ID_COL].to_numpy(dtype=np.int64)
+    zero = pool.loc[pool[target_feature].abs() == 0, ID_COL].to_numpy(dtype=np.int64)
+    abs_weight = pool[weight_col].abs().to_numpy(dtype=float)
     cutoff = float(np.quantile(abs_weight, 0.75))
-    high_weight = pool.loc[pool["if_weight_question"].abs() >= cutoff, ID_COL].to_numpy(dtype=np.int64)
-    low_weight = pool.loc[pool["if_weight_question"].abs() < cutoff, ID_COL].to_numpy(dtype=np.int64)
+    high_weight = pool.loc[pool[weight_col].abs() >= cutoff, ID_COL].to_numpy(dtype=np.int64)
+    low_weight = pool.loc[pool[weight_col].abs() < cutoff, ID_COL].to_numpy(dtype=np.int64)
 
-    if strategy == "question_balanced":
+    if strategy == "target_nonzero_balanced":
+        if len(zero) == 0:
+            return rng.permutation(ids)
         return _interleave_permuted_groups([nonzero, zero], [0, 1], rng)
     if strategy == "if_weight_balanced":
         return _interleave_permuted_groups([high_weight, low_weight], [0, 1], rng)
-    if strategy == "question_if_weight_balanced":
+    if strategy == "target_if_weight_balanced":
         nonzero_ids = set(map(int, nonzero))
         high_ids = set(map(int, high_weight))
         groups = [
@@ -243,6 +279,7 @@ def build_scaling_split(
     config: dict[str, Any],
     replication_id: int,
     sampling_strategy: str = "uniform",
+    target_feature: str = TARGET_FEATURE,
 ) -> ScalingSplit:
     population = build_population_split(df)
     train_pool_size = int(config["train_pool_size"])
@@ -257,7 +294,7 @@ def build_scaling_split(
     v_stop_ids = np.asarray(ordered[:v_stop_size], dtype=np.int64)
     v_scale_ids = np.asarray(ordered[v_stop_size : v_stop_size + v_scale_size], dtype=np.int64)
     train_pool_ids = np.asarray(ordered[v_stop_size + v_scale_size : required], dtype=np.int64)
-    train_order_ids = build_train_order(df, train_pool_ids, rng, sampling_strategy)
+    train_order_ids = build_train_order(df, train_pool_ids, rng, sampling_strategy, target_feature=target_feature)
     split = ScalingSplit(
         train_pool_ids=train_pool_ids,
         v_stop_ids=v_stop_ids,
@@ -304,18 +341,20 @@ def replication_ids(config: dict[str, Any]) -> list[int]:
     return [int(x) for x in config["replication_ids"]]
 
 
-def x_matrix(frame: pd.DataFrame) -> np.ndarray:
-    return np.column_stack([np.ones(len(frame), dtype=float), frame[FEATURE_COLS].to_numpy(dtype=float)])
+def x_matrix(frame: pd.DataFrame, feature_cols: list[str] | None = None) -> np.ndarray:
+    cols = feature_cols if feature_cols is not None else FEATURE_COLS
+    return np.column_stack([np.ones(len(frame), dtype=float), frame[cols].to_numpy(dtype=float)])
 
 
-def target_feature_index(target_feature: str = TARGET_FEATURE) -> int:
-    if target_feature not in FEATURE_COLS:
-        raise ValueError(f"target_feature must be one of {FEATURE_COLS}, got {target_feature!r}")
-    return 1 + FEATURE_COLS.index(target_feature)
+def target_feature_index(target_feature: str = TARGET_FEATURE, feature_cols: list[str] | None = None) -> int:
+    cols = feature_cols if feature_cols is not None else FEATURE_COLS
+    if target_feature not in cols:
+        raise ValueError(f"target_feature must be one of active feature_columns={cols}, got {target_feature!r}")
+    return 1 + cols.index(target_feature)
 
 
-def fit_ols_beta(frame: pd.DataFrame) -> np.ndarray:
-    x = x_matrix(frame)
+def fit_ols_beta(frame: pd.DataFrame, feature_cols: list[str] | None = None) -> np.ndarray:
+    x = x_matrix(frame, feature_cols)
     y = frame[Y_COL].to_numpy(dtype=float)
     return np.linalg.pinv(x.T @ x) @ x.T @ y
 
@@ -325,26 +364,31 @@ def compute_inference_setup(
     p_target_ids: Iterable[int],
     y_scale: OutcomeScale,
     target_feature: str = TARGET_FEATURE,
+    feature_cols: list[str] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
+    cols = feature_cols if feature_cols is not None else FEATURE_COLS
     target = subset_by_ids(df, np.asarray(list(p_target_ids), dtype=np.int64), "target_for_inference", y_scale)
-    x_target = x_matrix(target)
+    x_target = x_matrix(target, cols)
     hessian = (x_target.T @ x_target) / len(target)
     hessian_inv = np.linalg.pinv(hessian)
-    idx = target_feature_index(target_feature)
-    beta = fit_ols_beta(target)
-    weights_all = x_matrix(df) @ hessian_inv[idx, :]
+    idx = target_feature_index(target_feature, cols)
+    beta = fit_ols_beta(target, cols)
+    weights_all = x_matrix(df, cols) @ hessian_inv[idx, :]
     out = df.copy()
-    out["if_weight_question"] = weights_all
+    out[IF_WEIGHT_COL] = weights_all
+    out[LEGACY_IF_WEIGHT_COL] = weights_all
 
     target_weights = x_target @ hessian_inv[idx, :]
     target_residual_raw = target[Y_COL].to_numpy(dtype=float) - x_target @ beta
     target_if_residual_raw = target_weights * target_residual_raw
     target_if_residual_scaled = target_if_residual_raw / y_scale.sd
+    names = ["intercept", *cols]
     info = {
         "target_feature": target_feature,
         "target_feature_index": int(idx),
-        "feature_columns": ["intercept", *FEATURE_COLS],
-        "target_beta_raw": {name: float(value) for name, value in zip(["intercept", *FEATURE_COLS], beta)},
+        "feature_columns": names,
+        "target_beta_raw": {name: float(value) for name, value in zip(names, beta)},
+        "target_coefficient_raw": float(beta[idx]),
         "question_beta_raw": float(beta[idx]),
         "hessian": hessian.tolist(),
         "hessian_inv": hessian_inv.tolist(),
@@ -467,12 +511,14 @@ def set_training_seeds(seed: int) -> None:
 
 
 class PairTokenizedDataset:
-    def __init__(self, frame: pd.DataFrame, tokenizer: Any, max_length: int):
+    def __init__(self, frame: pd.DataFrame, tokenizer: Any, max_length: int, feature_cols: list[str] | None = None):
+        cols = feature_cols if feature_cols is not None else FEATURE_COLS
+        weight_col = IF_WEIGHT_COL if IF_WEIGHT_COL in frame.columns else LEGACY_IF_WEIGHT_COL
         self.sample_ids = frame[ID_COL].astype(int).tolist()
         self.y_raw = frame["y_raw"].astype(float).to_numpy()
         self.y_scaled = frame["y_scaled"].astype(float).to_numpy()
-        self.influence_weight = frame["if_weight_question"].astype(float).to_numpy()
-        self.features = frame[FEATURE_COLS].astype(float).to_numpy()
+        self.influence_weight = frame[weight_col].astype(float).to_numpy()
+        self.features = frame[cols].astype(float).to_numpy()
         self.a_encodings = tokenizer(
             frame[TEXT_A_COL].astype(str).tolist(),
             truncation=True,
@@ -652,9 +698,10 @@ def train_once(
     device = torch.device("cuda")
 
     tokenizer = build_tokenizer(config["model_name"], int(config["max_length"]), mods["AutoTokenizer"])
+    feature_cols = feature_cols_from_config(config)
     model = build_pair_model(
         config,
-        len(FEATURE_COLS),
+        len(feature_cols),
         torch,
         mods["AutoModel"],
         mods["LoraConfig"],
@@ -667,7 +714,7 @@ def train_once(
         pass
 
     collate = make_pair_collate_fn(tokenizer, torch)
-    train_dataset = PairTokenizedDataset(train_df, tokenizer, int(config["max_length"]))
+    train_dataset = PairTokenizedDataset(train_df, tokenizer, int(config["max_length"]), feature_cols=feature_cols)
     train_loader = mods["DataLoader"](
         train_dataset,
         batch_size=int(batch_size),
@@ -814,7 +861,8 @@ def predict_frame(
     batch_size: int,
 ) -> pd.DataFrame:
     model.eval()
-    dataset = PairTokenizedDataset(frame, tokenizer, int(config["max_length"]))
+    feature_cols = feature_cols_from_config(config)
+    dataset = PairTokenizedDataset(frame, tokenizer, int(config["max_length"]), feature_cols=feature_cols)
     loader = DataLoader(
         dataset,
         batch_size=int(config.get("prediction_batch_size", batch_size)),
@@ -844,15 +892,16 @@ def predict_frame(
                         "y_scaled": labels,
                         "pred_scaled": pred_scaled,
                         "pred_raw": raw_y(pred_scaled, y_scale),
-                        "if_weight_question": influence_weight,
+                        IF_WEIGHT_COL: influence_weight,
+                        LEGACY_IF_WEIGHT_COL: influence_weight,
                     }
                 )
             )
     out = pd.concat(rows, ignore_index=True)
     out["residual_scaled"] = out["y_scaled"] - out["pred_scaled"]
     out["residual_raw"] = out["y_raw"] - out["pred_raw"]
-    out["if_residual_scaled"] = out["if_weight_question"] * out["residual_scaled"]
-    out["if_residual_raw"] = out["if_weight_question"] * out["residual_raw"]
+    out["if_residual_scaled"] = out[IF_WEIGHT_COL] * out["residual_scaled"]
+    out["if_residual_raw"] = out[IF_WEIGHT_COL] * out["residual_raw"]
     return out
 
 
@@ -893,6 +942,7 @@ def write_cell_manifest(
     split: ScalingSplit,
     population: PopulationSplit,
 ) -> None:
+    feature_cols = feature_cols_from_config(config)
     manifest = {
         "method": method.name,
         "loss": method.loss,
@@ -910,6 +960,8 @@ def write_cell_manifest(
         "early_stopping_patience": method.early_stopping_patience,
         "replication_id": int(replication_id),
         "s_train": int(s_train),
+        "target_feature": str(config.get("target_feature", TARGET_FEATURE)),
+        "feature_columns": feature_cols,
         "counts": {
             "H_scale": int(len(population.h_scale_ids)),
             "P_target": int(len(population.p_target_ids)),
@@ -948,10 +1000,12 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
     output_dir.mkdir(parents=True, exist_ok=True)
 
     df = load_upworthy_pairs(config["input_csv"])
+    feature_cols = feature_cols_from_config(config)
+    target_feature = str(config.get("target_feature", TARGET_FEATURE))
     population = build_population_split(df)
     y_scale = outcome_scale_from_h_scale(df, population.h_scale_ids)
-    df, inference = compute_inference_setup(df, population.p_target_ids, y_scale, str(config.get("target_feature", TARGET_FEATURE)))
-    split = build_scaling_split(df, config, replication_id, method.sampling_strategy)
+    df, inference = compute_inference_setup(df, population.p_target_ids, y_scale, target_feature, feature_cols)
+    split = build_scaling_split(df, config, replication_id, method.sampling_strategy, target_feature=target_feature)
     train_df = subset_by_ids(df, train_ids_for_s(split, s_train), "train", y_scale)
     stop_df = subset_by_ids(df, split.v_stop_ids, "validation_stop", y_scale)
     scale_df = subset_by_ids(df, split.v_scale_ids, "validation_scale", y_scale)
@@ -1038,8 +1092,8 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
         "s_train": int(s_train),
         "model_name": config["model_name"],
         "input_csv": str(config["input_csv"]),
-        "target_feature": str(config.get("target_feature", TARGET_FEATURE)),
-        "feature_columns": FEATURE_COLS,
+        "target_feature": target_feature,
+        "feature_columns": feature_cols,
         "h_scale_size": int(len(population.h_scale_ids)),
         "p_target_size": int(len(population.p_target_ids)),
         "train_pool_size": int(len(split.train_pool_ids)),
@@ -1086,6 +1140,7 @@ def load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
             metrics = json.load(f)
         method_config = metrics.get("method_config", {})
         runtime = metrics.get("runtime", {})
+        feature_columns = metrics.get("feature_columns", FEATURE_COLS)
         row = {
             "method": str(metrics["method"]),
             "loss": str(metrics["loss"]),
@@ -1101,10 +1156,14 @@ def load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
             "s_train": int(metrics["s_train"]),
             "h_scale_size": int(metrics["h_scale_size"]),
             "p_target_size": int(metrics["p_target_size"]),
+            "target_feature": str(metrics.get("target_feature", config.get("target_feature", TARGET_FEATURE))),
+            "feature_columns": ",".join(str(x) for x in feature_columns),
+            "n_features": int(len(feature_columns)),
             "train_pool_size": int(metrics["train_pool_size"]),
             "validation_stop_size": int(metrics["validation_stop_size"]),
             "validation_scale_size": int(metrics["validation_scale_size"]),
             "question_beta_raw": float(metrics["inference"]["question_beta_raw"]),
+            "target_coefficient_raw": float(metrics["inference"].get("target_coefficient_raw", metrics["inference"]["question_beta_raw"])),
             "direct_ols_ifvar_target_raw": float(metrics["inference"]["direct_ols_ifvar_target_raw"]),
             "direct_ols_ifvar_target_scaled": float(metrics["inference"]["direct_ols_ifvar_target_scaled"]),
             "validation_stop_ifvarq_raw": float(metrics["validation_stop"]["if_residual_var_raw"]),
@@ -1139,7 +1198,7 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
     metrics.to_csv(output_dir / "scaling_cell_metrics.csv", index=False)
 
     by_s = (
-        metrics.groupby(["method", "loss", "early_stopping_metric", "s_train"], as_index=False)
+        metrics.groupby(["target_feature", "feature_columns", "n_features", "method", "loss", "early_stopping_metric", "s_train"], as_index=False)
         .agg(
             n_replications=("replication_id", "nunique"),
             mean_ifvarq_raw=("validation_scale_ifvarq_raw", "mean"),
@@ -1152,6 +1211,7 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
             mean_epochs_trained=("epochs_trained", "mean"),
             direct_ols_ifvar_target_raw=("direct_ols_ifvar_target_raw", "first"),
             question_beta_raw=("question_beta_raw", "first"),
+            target_coefficient_raw=("target_coefficient_raw", "first"),
             sampling_strategy=("sampling_strategy", "first"),
             train_backbone=("train_backbone", "first"),
             warmup_loss=("warmup_loss", "first"),
@@ -1208,11 +1268,19 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
 
 def describe_data(config: dict[str, Any]) -> dict[str, Any]:
     df = load_upworthy_pairs(config["input_csv"])
+    feature_cols = feature_cols_from_config(config)
+    target_feature = str(config.get("target_feature", TARGET_FEATURE))
     population = build_population_split(df)
     y_scale = outcome_scale_from_h_scale(df, population.h_scale_ids)
-    df, inference = compute_inference_setup(df, population.p_target_ids, y_scale, str(config.get("target_feature", TARGET_FEATURE)))
+    df, inference = compute_inference_setup(df, population.p_target_ids, y_scale, target_feature, feature_cols)
     methods = method_specs(config)
-    split0 = build_scaling_split(df, config, replication_ids(config)[0], methods[0].sampling_strategy)
+    split0 = build_scaling_split(
+        df,
+        config,
+        replication_ids(config)[0],
+        methods[0].sampling_strategy,
+        target_feature=target_feature,
+    )
     return {
         "n_rows": int(len(df)),
         "h_scale_size": int(len(population.h_scale_ids)),
@@ -1223,8 +1291,12 @@ def describe_data(config: dict[str, Any]) -> dict[str, Any]:
         "s_grid": s_grid(config),
         "replication_ids": replication_ids(config),
         "methods": [method.__dict__ for method in methods],
+        "target_feature": target_feature,
+        "feature_columns": feature_cols,
+        "n_features": int(len(feature_cols)),
         "outcome_scale": {"mean": y_scale.mean, "sd": y_scale.sd},
         "question_beta_raw": inference["question_beta_raw"],
+        "target_coefficient_raw": inference["target_coefficient_raw"],
         "direct_ols_ifvar_target_raw": inference["direct_ols_ifvar_target_raw"],
         "direct_ols_ifvar_target_scaled": inference["direct_ols_ifvar_target_scaled"],
     }
