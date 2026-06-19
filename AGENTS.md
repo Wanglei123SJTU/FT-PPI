@@ -145,6 +145,7 @@ If a task discovers that a previous job actually completed after a runner discon
 - If the local runner tail disconnects, do not assume the job failed. Reconnect or inspect remote `.hyak_runner/runner.out`, `.hyak_runner/logs/`, Slurm logs, `squeue`, and `sacct`.
 - Before submitting GPU jobs, first inspect currently idle GPU resources and choose the best idle type rather than waiting indefinitely for one preferred model. Use `scripts/choose_hyak_gpu.sh` when possible. The default priority is `H200 > A100 > L40S > L40 > A40 > RTX6000 > 2080Ti/P100`; use a bare `--gres=gpu:1` only as a last-resort fallback.
 - For array-style experiments, request as many suitable idle GPUs as is practical so independent cells can run in parallel. Prefer a single homogeneous GPU type for a controlled comparison when enough devices are idle. If Slurm runs cells on different suitable GPU types, the experiment must still use the same committed config, seeds, model, optimizer, batch policy, stopping rule, and evaluation protocol across all methods; do not let GPU-specific adjustments create an unfair comparison.
+- Operational default: when work is naturally parallel, parallelize it. Use Slurm arrays or equivalent batching for independent cells/replications, set array concurrency to the highest practical value supported by available suitable GPUs, and choose the strongest idle GPU class first before falling back for throughput.
 
 ## GitHub and Runner Interaction
 

@@ -25,12 +25,14 @@ $Target = "${NetId}@${HostName}"
 $OnceValue = if ($Once) { "1" } else { "0" }
 $UseDetached = -not $Foreground -and -not $Once
 if ($UseDetached) {
-  $RemoteCommand = "cd $RemoteRepo && git pull --ff-only origin $Branch && bash scripts/start_hyak_runner_remote.sh $Branch $PollSeconds $OnceValue"
+  $RemoteCommand = "cd $RemoteRepo && if git status --porcelain --untracked-files=all -- Data/wine_data.csv 2>/dev/null | grep -q '^?? '; then rm -f Data/wine_data.csv && echo removed untracked Data/wine_data.csv before pull; fi && git pull --ff-only origin $Branch && bash scripts/start_hyak_runner_remote.sh $Branch $PollSeconds $OnceValue"
 } else {
-  $RemoteCommand = "cd $RemoteRepo && git pull --ff-only origin $Branch && HYAK_RUNNER_BRANCH=$Branch HYAK_RUNNER_POLL_SECONDS=$PollSeconds HYAK_RUNNER_ONCE=$OnceValue bash scripts/hyak_runner.sh"
+  $RemoteCommand = "cd $RemoteRepo && if git status --porcelain --untracked-files=all -- Data/wine_data.csv 2>/dev/null | grep -q '^?? '; then rm -f Data/wine_data.csv && echo removed untracked Data/wine_data.csv before pull; fi && git pull --ff-only origin $Branch && HYAK_RUNNER_BRANCH=$Branch HYAK_RUNNER_POLL_SECONDS=$PollSeconds HYAK_RUNNER_ONCE=$OnceValue bash scripts/hyak_runner.sh"
 }
-$EscapedRemoteCommand = $RemoteCommand.Replace('"', '\"')
-$CmdLine = "ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target ""$EscapedRemoteCommand"" 2>&1"
+$SshExe = Join-Path $env:SystemRoot "System32\OpenSSH\ssh.exe"
+if (-not (Test-Path $SshExe)) {
+  $SshExe = "ssh"
+}
 
 Write-Host "Target: $Target"
 Write-Host "Remote repo: $RemoteRepo"
@@ -50,7 +52,7 @@ Write-Host ""
 $PreviousErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
-  & cmd.exe /d /s /c $CmdLine 2>&1 |
+  & $SshExe -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target $RemoteCommand 2>&1 |
     ForEach-Object { $_.ToString() } |
     Tee-Object -FilePath $LogPath -Append
   $ExitCode = $LASTEXITCODE

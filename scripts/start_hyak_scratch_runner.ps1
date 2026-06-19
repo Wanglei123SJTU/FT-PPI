@@ -34,6 +34,10 @@ if [ ! -d "$RUN_REPO/.git" ]; then
   git clone --depth 1 --branch __BRANCH__ https://github.com/Wanglei123SJTU/FT-PPI.git "$RUN_REPO"
 else
   cd "$RUN_REPO"
+  if git status --porcelain --untracked-files=all -- Data/wine_data.csv 2>/dev/null | grep -q '^?? '; then
+    rm -f Data/wine_data.csv
+    echo "removed untracked Data/wine_data.csv before checkout"
+  fi
   git fetch --depth 1 origin +__BRANCH__:refs/remotes/origin/__BRANCH__
   git checkout -B __BRANCH__ origin/__BRANCH__
 fi
