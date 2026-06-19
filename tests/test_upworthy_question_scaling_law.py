@@ -43,6 +43,11 @@ def _toy_frame(n_h: int = 12, n_t: int = 10) -> pd.DataFrame:
                     "headline_a": f"Can this headline {sample_id} work?",
                     "headline_b": f"This headline {sample_id} works",
                     "y_logit_ctr_diff": y,
+                    "y_ctr_diff": y / 100.0,
+                    "clicks_a": 10 + i,
+                    "clicks_b": 12 + i,
+                    "impressions_a": 1000 + 10 * i,
+                    "impressions_b": 1100 + 10 * i,
                     "delta_QUESTION": q,
                     "delta_NUMERIC": numeric,
                     "delta_SIMPLICITY": simplicity,
@@ -79,6 +84,19 @@ def test_load_upworthy_pairs_and_population_split():
     population = build_population_split(df)
     assert len(population.h_scale_ids) == 12
     assert len(population.p_target_ids) == 10
+
+
+def test_load_upworthy_pairs_can_select_outcome_and_weights():
+    path = Path(".pytest_tmp/upworthy_question_scaling_toy_weighted.csv")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _toy_frame().drop(columns=["sample_id"]).to_csv(path, index=False)
+    df = load_upworthy_pairs(
+        path,
+        {"outcome_column": "y_ctr_diff", "estimation_weight_scheme": "logit_precision_p99clip"},
+    )
+    assert np.allclose(df["y_logit_ctr_diff"], df["y_ctr_diff"])
+    assert "estimation_weight" in df
+    assert np.all(df["estimation_weight"].to_numpy() > 0)
 
 
 def test_scaling_split_is_disjoint_and_nested():
@@ -164,6 +182,15 @@ def test_warmup_loss_uses_mse_before_ifvarq():
     )
     assert np.isclose(training_loss_from_residuals(residual, weight, method, epoch=1), np.mean(residual**2))
     assert np.isclose(training_loss_from_residuals(residual, weight, method, epoch=3), ifvarq_loss_from_residuals(residual, weight))
+
+
+def test_weighted_mse_loss_uses_sample_weights():
+    residual = np.array([1.0, 2.0, 4.0])
+    influence_weight = np.ones_like(residual)
+    sample_weight = np.array([1.0, 2.0, 3.0])
+    method = MethodSpec(name="wmse", loss="weighted_mse", early_stopping_metric="mse")
+    expected = np.mean((sample_weight / sample_weight.mean()) * residual**2)
+    assert np.isclose(training_loss_from_residuals(residual, influence_weight, method, epoch=1, sample_weight=sample_weight), expected)
 
 
 def test_question_balanced_order_enriches_question_varying_pairs():

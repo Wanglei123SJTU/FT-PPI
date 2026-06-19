@@ -22,6 +22,7 @@ Y_COL = "y_logit_ctr_diff"
 TEXT_A_COL = "headline_a"
 TEXT_B_COL = "headline_b"
 ID_COL = "sample_id"
+EST_WEIGHT_COL = "estimation_weight"
 FEATURE_COLS = [
     "delta_QUESTION",
     "delta_NUMERIC",
@@ -77,13 +78,79 @@ def load_config(path: str | Path) -> dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def load_upworthy_pairs(input_csv: str | Path) -> pd.DataFrame:
+def outcome_col_from_config(config: dict[str, Any] | None = None) -> str:
+    if config is None:
+        return Y_COL
+    return str(config.get("outcome_column", Y_COL))
+
+
+def estimation_weight_scheme_from_config(config: dict[str, Any] | None = None) -> str:
+    if config is None:
+        return "none"
+    return str(config.get("estimation_weight_scheme", config.get("estimation_weights", "none"))).lower()
+
+
+def _require_columns(df: pd.DataFrame, columns: Iterable[str], context: str) -> None:
+    missing = sorted(set(columns) - set(df.columns))
+    if missing:
+        raise ValueError(f"{context} requires missing columns: {missing}")
+
+
+def build_estimation_weights(df: pd.DataFrame, scheme: str) -> np.ndarray:
+    value = str(scheme).lower()
+    if value in {"", "none", "unweighted", "uniform"}:
+        return np.ones(len(df), dtype=float)
+    if value in {"logit_precision", "logit_precision_p99clip"}:
+        _require_columns(df, ["clicks_a", "clicks_b", "impressions_a", "impressions_b"], value)
+        clicks_a = df["clicks_a"].astype(float).to_numpy()
+        clicks_b = df["clicks_b"].astype(float).to_numpy()
+        imps_a = df["impressions_a"].astype(float).to_numpy()
+        imps_b = df["impressions_b"].astype(float).to_numpy()
+        var = (
+            1.0 / (clicks_a + 0.5)
+            + 1.0 / (np.maximum(imps_a - clicks_a, 0.0) + 0.5)
+            + 1.0 / (clicks_b + 0.5)
+            + 1.0 / (np.maximum(imps_b - clicks_b, 0.0) + 0.5)
+        )
+        weights = 1.0 / np.maximum(var, 1e-12)
+        if value.endswith("p99clip"):
+            weights = np.minimum(weights, float(np.quantile(weights, 0.99)))
+        return weights.astype(float)
+    if value == "impression_hmean":
+        _require_columns(df, ["impressions_a", "impressions_b"], value)
+        imps_a = df["impressions_a"].astype(float).to_numpy()
+        imps_b = df["impressions_b"].astype(float).to_numpy()
+        return (1.0 / np.maximum(1.0 / np.maximum(imps_a, 1e-12) + 1.0 / np.maximum(imps_b, 1e-12), 1e-12)).astype(float)
+    raise ValueError(f"unsupported estimation_weight_scheme {scheme!r}")
+
+
+def apply_row_filters(df: pd.DataFrame, config: dict[str, Any] | None = None) -> pd.DataFrame:
+    if config is None:
+        return df
+    out = df
+    if config.get("min_impressions_per_arm") not in (None, ""):
+        _require_columns(out, ["impressions_a", "impressions_b"], "min_impressions_per_arm")
+        threshold = float(config["min_impressions_per_arm"])
+        out = out.loc[(out["impressions_a"].astype(float) >= threshold) & (out["impressions_b"].astype(float) >= threshold)]
+    if config.get("min_total_impressions") not in (None, ""):
+        _require_columns(out, ["impressions_a", "impressions_b"], "min_total_impressions")
+        threshold = float(config["min_total_impressions"])
+        out = out.loc[(out["impressions_a"].astype(float) + out["impressions_b"].astype(float)) >= threshold]
+    if config.get("min_clicks_per_arm") not in (None, ""):
+        _require_columns(out, ["clicks_a", "clicks_b"], "min_clicks_per_arm")
+        threshold = float(config["min_clicks_per_arm"])
+        out = out.loc[(out["clicks_a"].astype(float) >= threshold) & (out["clicks_b"].astype(float) >= threshold)]
+    return out.reset_index(drop=True)
+
+
+def load_upworthy_pairs(input_csv: str | Path, config: dict[str, Any] | None = None) -> pd.DataFrame:
     df = pd.read_csv(input_csv)
-    required = {Y_COL, TEXT_A_COL, TEXT_B_COL, "split", *FEATURE_COLS}
+    outcome_col = outcome_col_from_config(config)
+    required = {outcome_col, TEXT_A_COL, TEXT_B_COL, "split", *FEATURE_COLS}
     missing = sorted(required - set(df.columns))
     if missing:
         raise ValueError(f"missing required columns: {missing}")
-    out = df.copy()
+    out = apply_row_filters(df.copy(), config)
     if ID_COL not in out.columns:
         if "pair_id" in out.columns:
             out.insert(0, ID_COL, out["pair_id"].astype(np.int64))
@@ -92,7 +159,8 @@ def load_upworthy_pairs(input_csv: str | Path) -> pd.DataFrame:
     out[ID_COL] = out[ID_COL].astype(np.int64)
     if out[ID_COL].duplicated().any():
         raise ValueError(f"{ID_COL} must be unique")
-    out[Y_COL] = out[Y_COL].astype(float)
+    out[Y_COL] = out[outcome_col].astype(float)
+    out[EST_WEIGHT_COL] = build_estimation_weights(out, estimation_weight_scheme_from_config(config))
     for col in FEATURE_COLS:
         out[col] = out[col].astype(float)
     out[TEXT_A_COL] = out[TEXT_A_COL].astype(str)
@@ -135,7 +203,8 @@ def method_specs(config: dict[str, Any]) -> list[MethodSpec]:
     raw = config.get("methods", [{"name": "mse_stop_mse", "loss": "mse", "early_stopping_metric": "mse"}])
     methods: list[MethodSpec] = []
     seen: set[str] = set()
-    allowed_losses = {"mse", "ifvarq"}
+    allowed_losses = {"mse", "weighted_mse", "ifvarq"}
+    allowed_stop_metrics = {"mse", "ifvarq"}
     allowed_sampling = {
         "uniform",
         "if_weight_balanced",
@@ -152,8 +221,8 @@ def method_specs(config: dict[str, Any]) -> list[MethodSpec]:
         warmup_loss = None if warmup_loss in (None, "") else str(warmup_loss).lower()
         sampling_strategy = str(item.get("sampling_strategy", config.get("sampling_strategy", "uniform"))).lower()
         if loss not in allowed_losses:
-            raise ValueError(f"unsupported loss {loss!r}; expected 'mse' or 'ifvarq'")
-        if stop not in allowed_losses:
+            raise ValueError(f"unsupported loss {loss!r}; expected one of {sorted(allowed_losses)}")
+        if stop not in allowed_stop_metrics:
             raise ValueError(f"unsupported early_stopping_metric {stop!r}; expected 'mse' or 'ifvarq'")
         if warmup_loss is not None and warmup_loss not in allowed_losses:
             raise ValueError(f"unsupported warmup_loss {warmup_loss!r}; expected one of {sorted(allowed_losses)}")
@@ -353,10 +422,13 @@ def target_feature_index(target_feature: str = TARGET_FEATURE, feature_cols: lis
     return 1 + cols.index(target_feature)
 
 
-def fit_ols_beta(frame: pd.DataFrame, feature_cols: list[str] | None = None) -> np.ndarray:
+def fit_ols_beta(frame: pd.DataFrame, feature_cols: list[str] | None = None, weight_col: str | None = None) -> np.ndarray:
     x = x_matrix(frame, feature_cols)
     y = frame[Y_COL].to_numpy(dtype=float)
-    return np.linalg.pinv(x.T @ x) @ x.T @ y
+    if weight_col is None:
+        return np.linalg.pinv(x.T @ x) @ x.T @ y
+    weights = frame[weight_col].to_numpy(dtype=float)
+    return np.linalg.pinv(x.T * weights @ x) @ (x.T * weights @ y)
 
 
 def compute_inference_setup(
@@ -367,18 +439,30 @@ def compute_inference_setup(
     feature_cols: list[str] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     cols = feature_cols if feature_cols is not None else FEATURE_COLS
+    if EST_WEIGHT_COL not in df.columns:
+        df = df.copy()
+        df[EST_WEIGHT_COL] = 1.0
     target = subset_by_ids(df, np.asarray(list(p_target_ids), dtype=np.int64), "target_for_inference", y_scale)
+    raw_target_weights = target[EST_WEIGHT_COL].to_numpy(dtype=float)
+    target_weight_mean = float(np.mean(raw_target_weights))
+    if not np.isfinite(target_weight_mean) or target_weight_mean <= 0:
+        raise ValueError("target estimation weights must have positive finite mean")
+    normalized_all_weights = df[EST_WEIGHT_COL].to_numpy(dtype=float) / target_weight_mean
+    normalized_target_weights = raw_target_weights / target_weight_mean
+    target = target.copy()
+    target[EST_WEIGHT_COL] = normalized_target_weights
     x_target = x_matrix(target, cols)
-    hessian = (x_target.T @ x_target) / len(target)
+    hessian = (x_target.T * normalized_target_weights @ x_target) / len(target)
     hessian_inv = np.linalg.pinv(hessian)
     idx = target_feature_index(target_feature, cols)
-    beta = fit_ols_beta(target, cols)
-    weights_all = x_matrix(df, cols) @ hessian_inv[idx, :]
+    beta = fit_ols_beta(target, cols, weight_col=EST_WEIGHT_COL)
+    weights_all = (x_matrix(df, cols) @ hessian_inv[idx, :]) * normalized_all_weights
     out = df.copy()
+    out[EST_WEIGHT_COL] = normalized_all_weights
     out[IF_WEIGHT_COL] = weights_all
     out[LEGACY_IF_WEIGHT_COL] = weights_all
 
-    target_weights = x_target @ hessian_inv[idx, :]
+    target_weights = (x_target @ hessian_inv[idx, :]) * normalized_target_weights
     target_residual_raw = target[Y_COL].to_numpy(dtype=float) - x_target @ beta
     target_if_residual_raw = target_weights * target_residual_raw
     target_if_residual_scaled = target_if_residual_raw / y_scale.sd
@@ -394,6 +478,9 @@ def compute_inference_setup(
         "hessian_inv": hessian_inv.tolist(),
         "direct_ols_ifvar_target_raw": float(np.var(target_if_residual_raw, ddof=1)),
         "direct_ols_ifvar_target_scaled": float(np.var(target_if_residual_scaled, ddof=1)),
+        "estimation_weight_mean_raw_target": float(target_weight_mean),
+        "estimation_weight_min_normalized_target": float(np.min(normalized_target_weights)),
+        "estimation_weight_max_normalized_target": float(np.max(normalized_target_weights)),
         "target_size": int(len(target)),
     }
     return out, info
@@ -433,6 +520,16 @@ def mse_loss_from_residuals(residual: Any) -> Any:
     return (residual**2).mean()
 
 
+def weighted_mse_loss_from_residuals(residual: Any, sample_weight: Any) -> Any:
+    mean_weight = sample_weight.mean()
+    if hasattr(mean_weight, "clamp"):
+        mean_weight = mean_weight.clamp(min=1e-12)
+    else:
+        mean_weight = max(float(mean_weight), 1e-12)
+    weight = sample_weight / mean_weight
+    return (weight * residual**2).mean()
+
+
 def ifvarq_loss_from_residuals(residual: Any, influence_weight: Any, if_weight_clip: float | None = None) -> Any:
     if if_weight_clip is not None and float(if_weight_clip) > 0:
         influence_weight = influence_weight.clip(min=-float(if_weight_clip), max=float(if_weight_clip))
@@ -451,6 +548,7 @@ def training_loss_from_residuals(
     influence_weight: Any,
     method: MethodSpec | str,
     epoch: int = 1,
+    sample_weight: Any | None = None,
 ) -> Any:
     if isinstance(method, MethodSpec):
         loss = active_loss_name(method, epoch)
@@ -460,6 +558,10 @@ def training_loss_from_residuals(
         clip = None
     if loss == "mse":
         return mse_loss_from_residuals(residual)
+    if loss == "weighted_mse":
+        if sample_weight is None:
+            raise ValueError("weighted_mse requires sample_weight")
+        return weighted_mse_loss_from_residuals(residual, sample_weight)
     if loss == "ifvarq":
         return ifvarq_loss_from_residuals(residual, influence_weight, clip)
     raise ValueError(f"unsupported loss {loss!r}")
@@ -518,6 +620,7 @@ class PairTokenizedDataset:
         self.y_raw = frame["y_raw"].astype(float).to_numpy()
         self.y_scaled = frame["y_scaled"].astype(float).to_numpy()
         self.influence_weight = frame[weight_col].astype(float).to_numpy()
+        self.estimation_weight = frame[EST_WEIGHT_COL].astype(float).to_numpy() if EST_WEIGHT_COL in frame.columns else np.ones(len(frame), dtype=float)
         self.features = frame[cols].astype(float).to_numpy()
         self.a_encodings = tokenizer(
             frame[TEXT_A_COL].astype(str).tolist(),
@@ -546,6 +649,7 @@ class PairTokenizedDataset:
             "y_raw": float(self.y_raw[idx]),
             "y_scaled": float(self.y_scaled[idx]),
             "influence_weight": float(self.influence_weight[idx]),
+            "estimation_weight": float(self.estimation_weight[idx]),
         }
 
 
@@ -571,6 +675,7 @@ def make_pair_collate_fn(tokenizer: Any, torch: Any):
             "features": torch.tensor(np.stack([item["features"] for item in batch]), dtype=torch.float32),
             "labels": torch.tensor([item["y_scaled"] for item in batch], dtype=torch.float32),
             "influence_weight": torch.tensor([item["influence_weight"] for item in batch], dtype=torch.float32),
+            "estimation_weight": torch.tensor([item["estimation_weight"] for item in batch], dtype=torch.float32),
             "sample_id": torch.tensor([item["sample_id"] for item in batch], dtype=torch.long),
             "y_raw": torch.tensor([item["y_raw"] for item in batch], dtype=torch.float32),
         }
@@ -627,13 +732,19 @@ def build_pair_model(
                     param.requires_grad_(False)
                 self.backbone = backbone
             hidden_size = int(backbone.config.hidden_size)
-            self.head = nn.Sequential(
-                nn.Linear(hidden_size + int(n_features), int(config.get("head_hidden_size", 128))),
-                nn.ReLU(),
-                nn.Linear(int(config.get("head_hidden_size", 128)), 1),
-            )
-            nn.init.normal_(self.head[-1].weight, mean=0.0, std=1e-3)
-            nn.init.zeros_(self.head[-1].bias)
+            head_hidden_size = int(config.get("head_hidden_size", 128))
+            if head_hidden_size > 0:
+                self.head = nn.Sequential(
+                    nn.Linear(hidden_size + int(n_features), head_hidden_size),
+                    nn.ReLU(),
+                    nn.Linear(head_hidden_size, 1),
+                )
+                last_layer = self.head[-1]
+            else:
+                self.head = nn.Linear(hidden_size + int(n_features), 1)
+                last_layer = self.head
+            nn.init.normal_(last_layer.weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(last_layer.bias)
 
         def pool(self, input_ids: Any, attention_mask: Any) -> Any:
             if self.train_backbone:
@@ -757,11 +868,12 @@ def train_once(
             inputs = _move_batch(batch, device)
             labels = inputs.pop("labels")
             influence_weight = inputs.pop("influence_weight")
+            estimation_weight = inputs.pop("estimation_weight")
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 pred = model(**inputs)
             residual = labels.float() - pred.float()
-            loss = training_loss_from_residuals(residual, influence_weight.float(), method, epoch)
+            loss = training_loss_from_residuals(residual, influence_weight.float(), method, epoch, estimation_weight.float())
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["max_grad_norm"]))
             optimizer.step()
@@ -879,9 +991,11 @@ def predict_frame(
             y_raw_values = batch["y_raw"].cpu().numpy().astype(float)
             labels = batch["labels"].cpu().numpy().astype(float)
             influence_weight = batch["influence_weight"].cpu().numpy().astype(float)
+            estimation_weight = batch["estimation_weight"].cpu().numpy().astype(float)
             inputs = _move_batch(batch, device)
             inputs.pop("labels")
             inputs.pop("influence_weight")
+            inputs.pop("estimation_weight")
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 pred_scaled = model(**inputs).float().detach().cpu().numpy().astype(float)
             rows.append(
@@ -892,6 +1006,7 @@ def predict_frame(
                         "y_scaled": labels,
                         "pred_scaled": pred_scaled,
                         "pred_raw": raw_y(pred_scaled, y_scale),
+                        EST_WEIGHT_COL: estimation_weight,
                         IF_WEIGHT_COL: influence_weight,
                         LEGACY_IF_WEIGHT_COL: influence_weight,
                     }
@@ -999,7 +1114,7 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
         return output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    df = load_upworthy_pairs(config["input_csv"])
+    df = load_upworthy_pairs(config["input_csv"], config)
     feature_cols = feature_cols_from_config(config)
     target_feature = str(config.get("target_feature", TARGET_FEATURE))
     population = build_population_split(df)
@@ -1092,6 +1207,8 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
         "s_train": int(s_train),
         "model_name": config["model_name"],
         "input_csv": str(config["input_csv"]),
+        "outcome_column": outcome_col_from_config(config),
+        "estimation_weight_scheme": estimation_weight_scheme_from_config(config),
         "target_feature": target_feature,
         "feature_columns": feature_cols,
         "h_scale_size": int(len(population.h_scale_ids)),
@@ -1156,6 +1273,8 @@ def load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
             "s_train": int(metrics["s_train"]),
             "h_scale_size": int(metrics["h_scale_size"]),
             "p_target_size": int(metrics["p_target_size"]),
+            "outcome_column": str(metrics.get("outcome_column", config.get("outcome_column", Y_COL))),
+            "estimation_weight_scheme": str(metrics.get("estimation_weight_scheme", config.get("estimation_weight_scheme", "none"))),
             "target_feature": str(metrics.get("target_feature", config.get("target_feature", TARGET_FEATURE))),
             "feature_columns": ",".join(str(x) for x in feature_columns),
             "n_features": int(len(feature_columns)),
@@ -1198,7 +1317,20 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
     metrics.to_csv(output_dir / "scaling_cell_metrics.csv", index=False)
 
     by_s = (
-        metrics.groupby(["target_feature", "feature_columns", "n_features", "method", "loss", "early_stopping_metric", "s_train"], as_index=False)
+        metrics.groupby(
+            [
+                "outcome_column",
+                "estimation_weight_scheme",
+                "target_feature",
+                "feature_columns",
+                "n_features",
+                "method",
+                "loss",
+                "early_stopping_metric",
+                "s_train",
+            ],
+            as_index=False,
+        )
         .agg(
             n_replications=("replication_id", "nunique"),
             mean_ifvarq_raw=("validation_scale_ifvarq_raw", "mean"),
@@ -1267,7 +1399,7 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
 
 
 def describe_data(config: dict[str, Any]) -> dict[str, Any]:
-    df = load_upworthy_pairs(config["input_csv"])
+    df = load_upworthy_pairs(config["input_csv"], config)
     feature_cols = feature_cols_from_config(config)
     target_feature = str(config.get("target_feature", TARGET_FEATURE))
     population = build_population_split(df)
@@ -1294,6 +1426,8 @@ def describe_data(config: dict[str, Any]) -> dict[str, Any]:
         "target_feature": target_feature,
         "feature_columns": feature_cols,
         "n_features": int(len(feature_cols)),
+        "outcome_column": outcome_col_from_config(config),
+        "estimation_weight_scheme": estimation_weight_scheme_from_config(config),
         "outcome_scale": {"mean": y_scale.mean, "sd": y_scale.sd},
         "question_beta_raw": inference["question_beta_raw"],
         "target_coefficient_raw": inference["target_coefficient_raw"],
