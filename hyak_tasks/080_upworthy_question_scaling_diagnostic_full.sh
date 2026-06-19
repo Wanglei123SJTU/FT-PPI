@@ -197,11 +197,16 @@ cols = [
     "sampling_strategy",
     "train_backbone",
     "mean_ifvarq_raw",
+    "constant_ifvarq_raw",
+    "ratio_to_constant_ifvarq",
+    "drop_from_constant_pct",
+    "ratio_to_direct_ols_ifvarq",
     "mean_mse_scaled",
     "mean_rmse_scaled",
     "mean_corr",
     "mean_epochs_trained",
 ]
+cols = [col for col in cols if col in by_s.columns]
 print(by_s.sort_values(["s_train", "mean_ifvarq_raw"]).groupby("s_train").head(5)[cols].to_string(index=False))
 print("scaling fit")
 print(fits.sort_values("r2", ascending=False).to_string(index=False))

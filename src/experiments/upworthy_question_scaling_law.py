@@ -566,6 +566,32 @@ def raw_y(y_scaled: Any, y_scale: OutcomeScale) -> np.ndarray:
     return y_scale.mean + y_scale.sd * np.asarray(y_scaled, dtype=float)
 
 
+def constant_prediction_frame(frame: pd.DataFrame, y_scale: OutcomeScale) -> pd.DataFrame:
+    """Prediction frame for the no-text surrogate f(x)=E_Hscale[Y]."""
+    weight_col = IF_WEIGHT_COL if IF_WEIGHT_COL in frame.columns else LEGACY_IF_WEIGHT_COL
+    out = pd.DataFrame(
+        {
+            ID_COL: frame[ID_COL].astype(np.int64).to_numpy(),
+            "y_raw": frame["y_raw"].astype(float).to_numpy(),
+            "y_scaled": frame["y_scaled"].astype(float).to_numpy(),
+            "pred_scaled": np.zeros(len(frame), dtype=float),
+            "pred_raw": np.full(len(frame), y_scale.mean, dtype=float),
+            EST_WEIGHT_COL: (
+                frame[EST_WEIGHT_COL].astype(float).to_numpy()
+                if EST_WEIGHT_COL in frame.columns
+                else np.ones(len(frame), dtype=float)
+            ),
+            IF_WEIGHT_COL: frame[weight_col].astype(float).to_numpy(),
+            LEGACY_IF_WEIGHT_COL: frame[weight_col].astype(float).to_numpy(),
+        }
+    )
+    out["residual_scaled"] = out["y_scaled"] - out["pred_scaled"]
+    out["residual_raw"] = out["y_raw"] - out["pred_raw"]
+    out["if_residual_scaled"] = out[IF_WEIGHT_COL] * out["residual_scaled"]
+    out["if_residual_raw"] = out[IF_WEIGHT_COL] * out["residual_raw"]
+    return out
+
+
 def subset_by_ids(df: pd.DataFrame, ids: np.ndarray, role: str, y_scale: OutcomeScale) -> pd.DataFrame:
     ids_df = pd.DataFrame({ID_COL: np.asarray(ids, dtype=np.int64), "_order": np.arange(len(ids))})
     out = ids_df.merge(df, on=ID_COL, how="left", validate="one_to_one").sort_values("_order")
@@ -1196,6 +1222,8 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
     train_df = subset_by_ids(df, train_ids_for_s(split, s_train), "train", y_scale)
     stop_df = subset_by_ids(df, split.v_stop_ids, "validation_stop", y_scale)
     scale_df = subset_by_ids(df, split.v_scale_ids, "validation_scale", y_scale)
+    constant_stop_metrics = prediction_metrics(constant_prediction_frame(stop_df, y_scale))
+    constant_scale_metrics = prediction_metrics(constant_prediction_frame(scale_df, y_scale))
     write_cell_manifest(output_dir, config, method, replication_id, s_train, split, population)
 
     requested_batch = int(method.batch_size if method.batch_size is not None else config["batch_size"])
@@ -1294,6 +1322,8 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
         "validation_scale_size": int(len(split.v_scale_ids)),
         "outcome_scale": {"mean": y_scale.mean, "sd": y_scale.sd},
         "inference": inference,
+        "constant_validation_stop": constant_stop_metrics,
+        "constant_validation_scale": constant_scale_metrics,
         "validation_stop": prediction_metrics(stop_pred),
         "validation_scale": prediction_metrics(scale_pred),
         "runtime": runtime,
@@ -1335,6 +1365,8 @@ def load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
         runtime = metrics.get("runtime", {})
         feature_columns = metrics.get("feature_columns", FEATURE_COLS)
         surrogate_feature_columns = metrics.get("surrogate_feature_columns", feature_columns)
+        constant_stop = metrics.get("constant_validation_stop", {})
+        constant_scale = metrics.get("constant_validation_scale", {})
         row = {
             "method": str(metrics["method"]),
             "loss": str(metrics["loss"]),
@@ -1367,6 +1399,10 @@ def load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
             "target_coefficient_raw": float(metrics["inference"].get("target_coefficient_raw", metrics["inference"]["question_beta_raw"])),
             "direct_ols_ifvar_target_raw": float(metrics["inference"]["direct_ols_ifvar_target_raw"]),
             "direct_ols_ifvar_target_scaled": float(metrics["inference"]["direct_ols_ifvar_target_scaled"]),
+            "constant_validation_stop_ifvarq_raw": float(constant_stop.get("if_residual_var_raw", float("nan"))),
+            "constant_validation_stop_ifvarq_scaled": float(constant_stop.get("if_residual_var_scaled", float("nan"))),
+            "constant_validation_scale_ifvarq_raw": float(constant_scale.get("if_residual_var_raw", float("nan"))),
+            "constant_validation_scale_ifvarq_scaled": float(constant_scale.get("if_residual_var_scaled", float("nan"))),
             "validation_stop_ifvarq_raw": float(metrics["validation_stop"]["if_residual_var_raw"]),
             "validation_stop_ifvarq_scaled": float(metrics["validation_stop"]["if_residual_var_scaled"]),
             "validation_stop_mse_scaled": float(metrics["validation_stop"]["rmse_scaled"]) ** 2,
@@ -1430,6 +1466,8 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
             mean_runtime_seconds=("runtime_seconds", "mean"),
             mean_epochs_trained=("epochs_trained", "mean"),
             direct_ols_ifvar_target_raw=("direct_ols_ifvar_target_raw", "first"),
+            constant_ifvarq_raw=("constant_validation_scale_ifvarq_raw", "mean"),
+            constant_ifvarq_scaled=("constant_validation_scale_ifvarq_scaled", "mean"),
             question_beta_raw=("question_beta_raw", "first"),
             target_coefficient_raw=("target_coefficient_raw", "first"),
             sampling_strategy=("sampling_strategy", "first"),
@@ -1444,6 +1482,10 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
         .reset_index(drop=True)
     )
     by_s["se_ifvarq_raw"] = by_s["sd_ifvarq_raw"] / np.sqrt(by_s["n_replications"])
+    by_s["ratio_to_constant_ifvarq"] = by_s["mean_ifvarq_raw"] / by_s["constant_ifvarq_raw"]
+    by_s["drop_from_constant_pct"] = 100.0 * (1.0 - by_s["ratio_to_constant_ifvarq"])
+    by_s["ratio_to_direct_ols_ifvarq"] = by_s["mean_ifvarq_raw"] / by_s["direct_ols_ifvar_target_raw"]
+    by_s["drop_from_direct_ols_ifvarq_pct"] = 100.0 * (1.0 - by_s["ratio_to_direct_ols_ifvarq"])
     by_s.to_csv(output_dir / "scaling_by_s_summary.csv", index=False)
 
     fit_rows = []
