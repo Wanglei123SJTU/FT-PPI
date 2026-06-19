@@ -1,0 +1,1057 @@
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import math
+import random
+import shutil
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+import numpy as np
+import pandas as pd
+import yaml
+
+from src.experiments.wine_var_scaling_law import fit_scaling_law, ids_hash, is_cuda_oom, write_json
+
+
+Y_COL = "y_logit_ctr_diff"
+TEXT_A_COL = "headline_a"
+TEXT_B_COL = "headline_b"
+ID_COL = "sample_id"
+FEATURE_COLS = [
+    "delta_QUESTION",
+    "delta_NUMERIC",
+    "delta_SIMPLICITY",
+    "delta_COMMON",
+    "delta_LENGTH",
+]
+TARGET_FEATURE = "delta_QUESTION"
+
+
+@dataclass(frozen=True)
+class PopulationSplit:
+    h_scale_ids: np.ndarray
+    p_target_ids: np.ndarray
+
+
+@dataclass(frozen=True)
+class ScalingSplit:
+    train_pool_ids: np.ndarray
+    v_stop_ids: np.ndarray
+    v_scale_ids: np.ndarray
+    train_order_ids: np.ndarray
+
+
+@dataclass(frozen=True)
+class MethodSpec:
+    name: str
+    loss: str
+    early_stopping_metric: str
+
+
+@dataclass(frozen=True)
+class OutcomeScale:
+    mean: float
+    sd: float
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def load_upworthy_pairs(input_csv: str | Path) -> pd.DataFrame:
+    df = pd.read_csv(input_csv)
+    required = {Y_COL, TEXT_A_COL, TEXT_B_COL, "split", *FEATURE_COLS}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"missing required columns: {missing}")
+    out = df.copy()
+    if ID_COL not in out.columns:
+        if "pair_id" in out.columns:
+            out.insert(0, ID_COL, out["pair_id"].astype(np.int64))
+        else:
+            out.insert(0, ID_COL, np.arange(len(out), dtype=np.int64))
+    out[ID_COL] = out[ID_COL].astype(np.int64)
+    if out[ID_COL].duplicated().any():
+        raise ValueError(f"{ID_COL} must be unique")
+    out[Y_COL] = out[Y_COL].astype(float)
+    for col in FEATURE_COLS:
+        out[col] = out[col].astype(float)
+    out[TEXT_A_COL] = out[TEXT_A_COL].astype(str)
+    out[TEXT_B_COL] = out[TEXT_B_COL].astype(str)
+    return out.reset_index(drop=True)
+
+
+def build_population_split(df: pd.DataFrame) -> PopulationSplit:
+    h_scale = df.loc[df["split"].astype(str) == "h_scale", ID_COL].to_numpy(dtype=np.int64)
+    p_target = df.loc[df["split"].astype(str) == "target", ID_COL].to_numpy(dtype=np.int64)
+    if len(h_scale) == 0 or len(p_target) == 0:
+        raise ValueError("input data must contain split values 'h_scale' and 'target'")
+    return PopulationSplit(h_scale_ids=h_scale, p_target_ids=p_target)
+
+
+def method_specs(config: dict[str, Any]) -> list[MethodSpec]:
+    raw = config.get("methods", [{"name": "mse_stop_mse", "loss": "mse", "early_stopping_metric": "mse"}])
+    methods: list[MethodSpec] = []
+    seen: set[str] = set()
+    for item in raw:
+        name = str(item["name"]).lower()
+        loss = str(item.get("loss", name)).lower()
+        stop = str(item.get("early_stopping_metric", loss)).lower()
+        if loss not in {"mse", "ifvarq"}:
+            raise ValueError(f"unsupported loss {loss!r}; expected 'mse' or 'ifvarq'")
+        if stop not in {"mse", "ifvarq"}:
+            raise ValueError(f"unsupported early_stopping_metric {stop!r}; expected 'mse' or 'ifvarq'")
+        if name in seen:
+            raise ValueError(f"duplicate method name {name!r}")
+        seen.add(name)
+        methods.append(MethodSpec(name=name, loss=loss, early_stopping_metric=stop))
+    return methods
+
+
+def method_by_name(config: dict[str, Any], name: str) -> MethodSpec:
+    methods = {method.name: method for method in method_specs(config)}
+    key = str(name).lower()
+    if key not in methods:
+        raise ValueError(f"unknown method {name!r}; expected one of {sorted(methods)}")
+    return methods[key]
+
+
+def rep_seed(config: dict[str, Any], replication_id: int, salt: int = 0) -> int:
+    return int(config.get("seed", 20260618)) + 100_003 * int(replication_id) + int(salt)
+
+
+def build_scaling_split(df: pd.DataFrame, config: dict[str, Any], replication_id: int) -> ScalingSplit:
+    population = build_population_split(df)
+    train_pool_size = int(config["train_pool_size"])
+    v_stop_size = int(config["validation_stop_size"])
+    v_scale_size = int(config["validation_scale_size"])
+    required = train_pool_size + v_stop_size + v_scale_size
+    if required > len(population.h_scale_ids):
+        raise ValueError(f"need {required} H_scale rows, found {len(population.h_scale_ids)}")
+
+    rng = np.random.default_rng(rep_seed(config, replication_id))
+    ordered = rng.permutation(population.h_scale_ids)
+    v_stop_ids = np.asarray(ordered[:v_stop_size], dtype=np.int64)
+    v_scale_ids = np.asarray(ordered[v_stop_size : v_stop_size + v_scale_size], dtype=np.int64)
+    train_pool_ids = np.asarray(ordered[v_stop_size + v_scale_size : required], dtype=np.int64)
+    train_order_ids = rng.permutation(train_pool_ids)
+    split = ScalingSplit(
+        train_pool_ids=train_pool_ids,
+        v_stop_ids=v_stop_ids,
+        v_scale_ids=v_scale_ids,
+        train_order_ids=np.asarray(train_order_ids, dtype=np.int64),
+    )
+    validate_scaling_split(split, config)
+    return split
+
+
+def validate_scaling_split(split: ScalingSplit, config: dict[str, Any]) -> None:
+    train_pool = set(map(int, split.train_pool_ids))
+    v_stop = set(map(int, split.v_stop_ids))
+    v_scale = set(map(int, split.v_scale_ids))
+    if len(train_pool) != len(split.train_pool_ids):
+        raise ValueError("train pool has duplicate sample ids")
+    if len(v_stop) != len(split.v_stop_ids):
+        raise ValueError("validation stop split has duplicate sample ids")
+    if len(v_scale) != len(split.v_scale_ids):
+        raise ValueError("validation scale split has duplicate sample ids")
+    if train_pool & v_stop or train_pool & v_scale or v_stop & v_scale:
+        raise ValueError("train/stop/scale splits must be disjoint")
+    previous: set[int] = set()
+    for s_train in s_grid(config):
+        current = set(map(int, train_ids_for_s(split, s_train)))
+        if not current.issubset(train_pool):
+            raise ValueError(f"train set s={s_train} is not a subset of train pool")
+        if not previous.issubset(current):
+            raise ValueError("nested train sets are not monotone")
+        previous = current
+
+
+def train_ids_for_s(split: ScalingSplit, s_train: int) -> np.ndarray:
+    if int(s_train) > len(split.train_order_ids):
+        raise ValueError(f"s_train={s_train} exceeds train pool size={len(split.train_order_ids)}")
+    return split.train_order_ids[: int(s_train)]
+
+
+def s_grid(config: dict[str, Any]) -> list[int]:
+    return [int(x) for x in config["s_grid"]]
+
+
+def replication_ids(config: dict[str, Any]) -> list[int]:
+    return [int(x) for x in config["replication_ids"]]
+
+
+def x_matrix(frame: pd.DataFrame) -> np.ndarray:
+    return np.column_stack([np.ones(len(frame), dtype=float), frame[FEATURE_COLS].to_numpy(dtype=float)])
+
+
+def target_feature_index(target_feature: str = TARGET_FEATURE) -> int:
+    if target_feature not in FEATURE_COLS:
+        raise ValueError(f"target_feature must be one of {FEATURE_COLS}, got {target_feature!r}")
+    return 1 + FEATURE_COLS.index(target_feature)
+
+
+def fit_ols_beta(frame: pd.DataFrame) -> np.ndarray:
+    x = x_matrix(frame)
+    y = frame[Y_COL].to_numpy(dtype=float)
+    return np.linalg.pinv(x.T @ x) @ x.T @ y
+
+
+def compute_inference_setup(
+    df: pd.DataFrame,
+    p_target_ids: Iterable[int],
+    y_scale: OutcomeScale,
+    target_feature: str = TARGET_FEATURE,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    target = subset_by_ids(df, np.asarray(list(p_target_ids), dtype=np.int64), "target_for_inference", y_scale)
+    x_target = x_matrix(target)
+    hessian = (x_target.T @ x_target) / len(target)
+    hessian_inv = np.linalg.pinv(hessian)
+    idx = target_feature_index(target_feature)
+    beta = fit_ols_beta(target)
+    weights_all = x_matrix(df) @ hessian_inv[idx, :]
+    out = df.copy()
+    out["if_weight_question"] = weights_all
+
+    target_weights = x_target @ hessian_inv[idx, :]
+    target_residual_raw = target[Y_COL].to_numpy(dtype=float) - x_target @ beta
+    target_if_residual_raw = target_weights * target_residual_raw
+    target_if_residual_scaled = target_if_residual_raw / y_scale.sd
+    info = {
+        "target_feature": target_feature,
+        "target_feature_index": int(idx),
+        "feature_columns": ["intercept", *FEATURE_COLS],
+        "target_beta_raw": {name: float(value) for name, value in zip(["intercept", *FEATURE_COLS], beta)},
+        "question_beta_raw": float(beta[idx]),
+        "hessian": hessian.tolist(),
+        "hessian_inv": hessian_inv.tolist(),
+        "direct_ols_ifvar_target_raw": float(np.var(target_if_residual_raw, ddof=1)),
+        "direct_ols_ifvar_target_scaled": float(np.var(target_if_residual_scaled, ddof=1)),
+        "target_size": int(len(target)),
+    }
+    return out, info
+
+
+def outcome_scale_from_h_scale(df: pd.DataFrame, h_scale_ids: Iterable[int]) -> OutcomeScale:
+    h_ids = np.asarray(list(h_scale_ids), dtype=np.int64)
+    h_frame = df.loc[df[ID_COL].isin(h_ids)]
+    mean = float(h_frame[Y_COL].mean())
+    sd = float(h_frame[Y_COL].std(ddof=0))
+    if not np.isfinite(sd) or sd <= 0:
+        raise ValueError("H_scale outcome standard deviation must be positive")
+    return OutcomeScale(mean=mean, sd=sd)
+
+
+def scaled_y(y_raw: Any, y_scale: OutcomeScale) -> np.ndarray:
+    return (np.asarray(y_raw, dtype=float) - y_scale.mean) / y_scale.sd
+
+
+def raw_y(y_scaled: Any, y_scale: OutcomeScale) -> np.ndarray:
+    return y_scale.mean + y_scale.sd * np.asarray(y_scaled, dtype=float)
+
+
+def subset_by_ids(df: pd.DataFrame, ids: np.ndarray, role: str, y_scale: OutcomeScale) -> pd.DataFrame:
+    ids_df = pd.DataFrame({ID_COL: np.asarray(ids, dtype=np.int64), "_order": np.arange(len(ids))})
+    out = ids_df.merge(df, on=ID_COL, how="left", validate="one_to_one").sort_values("_order")
+    if out[Y_COL].isna().any():
+        raise ValueError(f"{role} contains unknown sample ids")
+    out = out.drop(columns=["_order"]).reset_index(drop=True)
+    out["split_role"] = role
+    out["y_raw"] = out[Y_COL].astype(float)
+    out["y_scaled"] = scaled_y(out["y_raw"], y_scale)
+    return out
+
+
+def mse_loss_from_residuals(residual: Any) -> Any:
+    return (residual**2).mean()
+
+
+def ifvarq_loss_from_residuals(residual: Any, influence_weight: Any) -> Any:
+    if_residual = influence_weight * residual
+    return ((if_residual - if_residual.mean()) ** 2).mean()
+
+
+def training_loss_from_residuals(residual: Any, influence_weight: Any, loss_name: str) -> Any:
+    loss = str(loss_name).lower()
+    if loss == "mse":
+        return mse_loss_from_residuals(residual)
+    if loss == "ifvarq":
+        return ifvarq_loss_from_residuals(residual, influence_weight)
+    raise ValueError(f"unsupported loss {loss_name!r}")
+
+
+def stopping_value_from_metrics(metrics: dict[str, float], early_stopping_metric: str) -> float:
+    metric = str(early_stopping_metric).lower()
+    if metric == "mse":
+        return float(metrics["rmse_scaled"]) ** 2
+    if metric == "ifvarq":
+        return float(metrics["if_residual_var_scaled"])
+    raise ValueError(f"unsupported early stopping metric {early_stopping_metric!r}")
+
+
+def steps_per_epoch_for_s(s_train: int, batch_size: int) -> int:
+    return max(1, math.ceil(int(s_train) / int(batch_size)))
+
+
+def _require_training_modules() -> dict[str, Any]:
+    try:
+        import torch
+        from peft import LoraConfig, get_peft_model
+        from transformers import AutoModel, AutoTokenizer
+    except ImportError as exc:
+        raise ImportError("training requires torch, transformers, peft, accelerate, and pyyaml") from exc
+    from torch.utils.data import DataLoader
+
+    return {
+        "torch": torch,
+        "DataLoader": DataLoader,
+        "AutoModel": AutoModel,
+        "AutoTokenizer": AutoTokenizer,
+        "LoraConfig": LoraConfig,
+        "get_peft_model": get_peft_model,
+    }
+
+
+def set_training_seeds(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except ImportError:
+        return
+
+
+class PairTokenizedDataset:
+    def __init__(self, frame: pd.DataFrame, tokenizer: Any, max_length: int):
+        self.sample_ids = frame[ID_COL].astype(int).tolist()
+        self.y_raw = frame["y_raw"].astype(float).to_numpy()
+        self.y_scaled = frame["y_scaled"].astype(float).to_numpy()
+        self.influence_weight = frame["if_weight_question"].astype(float).to_numpy()
+        self.features = frame[FEATURE_COLS].astype(float).to_numpy()
+        self.a_encodings = tokenizer(
+            frame[TEXT_A_COL].astype(str).tolist(),
+            truncation=True,
+            max_length=int(max_length),
+            padding=False,
+        )
+        self.b_encodings = tokenizer(
+            frame[TEXT_B_COL].astype(str).tolist(),
+            truncation=True,
+            max_length=int(max_length),
+            padding=False,
+        )
+
+    def __len__(self) -> int:
+        return len(self.sample_ids)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        return {
+            "sample_id": self.sample_ids[idx],
+            "input_ids_a": self.a_encodings["input_ids"][idx],
+            "attention_mask_a": self.a_encodings["attention_mask"][idx],
+            "input_ids_b": self.b_encodings["input_ids"][idx],
+            "attention_mask_b": self.b_encodings["attention_mask"][idx],
+            "features": self.features[idx],
+            "y_raw": float(self.y_raw[idx]),
+            "y_scaled": float(self.y_scaled[idx]),
+            "influence_weight": float(self.influence_weight[idx]),
+        }
+
+
+def make_pair_collate_fn(tokenizer: Any, torch: Any):
+    def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
+        a_tokens = tokenizer.pad(
+            [{"input_ids": item["input_ids_a"], "attention_mask": item["attention_mask_a"]} for item in batch],
+            padding=True,
+            pad_to_multiple_of=8,
+            return_tensors="pt",
+        )
+        b_tokens = tokenizer.pad(
+            [{"input_ids": item["input_ids_b"], "attention_mask": item["attention_mask_b"]} for item in batch],
+            padding=True,
+            pad_to_multiple_of=8,
+            return_tensors="pt",
+        )
+        return {
+            "input_ids_a": a_tokens["input_ids"],
+            "attention_mask_a": a_tokens["attention_mask"],
+            "input_ids_b": b_tokens["input_ids"],
+            "attention_mask_b": b_tokens["attention_mask"],
+            "features": torch.tensor(np.stack([item["features"] for item in batch]), dtype=torch.float32),
+            "labels": torch.tensor([item["y_scaled"] for item in batch], dtype=torch.float32),
+            "influence_weight": torch.tensor([item["influence_weight"] for item in batch], dtype=torch.float32),
+            "sample_id": torch.tensor([item["sample_id"] for item in batch], dtype=torch.long),
+            "y_raw": torch.tensor([item["y_raw"] for item in batch], dtype=torch.float32),
+        }
+
+    return collate
+
+
+def build_tokenizer(model_name: str, max_length: int, AutoTokenizer: Any) -> Any:
+    tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=max_length)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+    return tokenizer
+
+
+def build_pair_model(config: dict[str, Any], n_features: int, torch: Any, AutoModel: Any, LoraConfig: Any, get_peft_model: Any) -> Any:
+    import torch.nn as nn
+
+    class AntiSymmetricPairRegressionModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            backbone = AutoModel.from_pretrained(
+                config["model_name"],
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+            )
+            if hasattr(backbone.config, "use_cache"):
+                backbone.config.use_cache = False
+            if bool(config.get("gradient_checkpointing", False)) and hasattr(backbone, "gradient_checkpointing_enable"):
+                backbone.gradient_checkpointing_enable()
+            if bool(config.get("gradient_checkpointing", False)) and hasattr(backbone, "enable_input_require_grads"):
+                backbone.enable_input_require_grads()
+            lora_config = LoraConfig(
+                r=int(config["lora_r"]),
+                lora_alpha=int(config["lora_alpha"]),
+                target_modules=config["target_modules"],
+                lora_dropout=float(config["lora_dropout"]),
+                bias="none",
+            )
+            self.backbone = get_peft_model(backbone, lora_config)
+            hidden_size = int(backbone.config.hidden_size)
+            self.head = nn.Sequential(
+                nn.Linear(hidden_size + int(n_features), int(config.get("head_hidden_size", 128))),
+                nn.ReLU(),
+                nn.Linear(int(config.get("head_hidden_size", 128)), 1),
+            )
+            nn.init.normal_(self.head[-1].weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(self.head[-1].bias)
+
+        def pool(self, input_ids: Any, attention_mask: Any) -> Any:
+            outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+            hidden = outputs.last_hidden_state
+            lengths = attention_mask.sum(dim=1).clamp(min=1) - 1
+            return hidden[torch.arange(hidden.shape[0], device=hidden.device), lengths].float()
+
+        def forward(
+            self,
+            input_ids_a: Any,
+            attention_mask_a: Any,
+            input_ids_b: Any,
+            attention_mask_b: Any,
+            features: Any,
+        ) -> Any:
+            h_a = self.pool(input_ids_a, attention_mask_a)
+            h_b = self.pool(input_ids_b, attention_mask_b)
+            z = torch.cat([h_a - h_b, features.float()], dim=1)
+            return 0.5 * (self.head(z).squeeze(-1) - self.head(-z).squeeze(-1))
+
+    return AntiSymmetricPairRegressionModel()
+
+
+def _move_batch(batch: dict[str, Any], device: Any) -> dict[str, Any]:
+    skip = {"sample_id", "y_raw"}
+    return {key: value.to(device) for key, value in batch.items() if key not in skip}
+
+
+def capture_trainable_state(model: Any) -> dict[str, Any]:
+    return {
+        name: param.detach().cpu().clone()
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
+
+
+def restore_trainable_state(model: Any, state: dict[str, Any]) -> None:
+    params = dict(model.named_parameters())
+    for name, value in state.items():
+        params[name].data.copy_(value.to(device=params[name].device, dtype=params[name].dtype))
+
+
+def train_once(
+    config: dict[str, Any],
+    train_df: pd.DataFrame,
+    stop_df: pd.DataFrame,
+    scale_df: pd.DataFrame,
+    y_scale: OutcomeScale,
+    batch_size: int,
+    seed: int,
+    method: MethodSpec,
+) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
+    mods = _require_training_modules()
+    torch = mods["torch"]
+    set_training_seeds(seed)
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for LoRA training")
+    device = torch.device("cuda")
+
+    tokenizer = build_tokenizer(config["model_name"], int(config["max_length"]), mods["AutoTokenizer"])
+    model = build_pair_model(
+        config,
+        len(FEATURE_COLS),
+        torch,
+        mods["AutoModel"],
+        mods["LoraConfig"],
+        mods["get_peft_model"],
+    ).to(device)
+    try:
+        model.backbone.print_trainable_parameters()
+    except Exception:
+        pass
+
+    collate = make_pair_collate_fn(tokenizer, torch)
+    train_dataset = PairTokenizedDataset(train_df, tokenizer, int(config["max_length"]))
+    train_loader = mods["DataLoader"](
+        train_dataset,
+        batch_size=int(batch_size),
+        shuffle=True,
+        collate_fn=collate,
+        num_workers=0,
+        pin_memory=True,
+    )
+    lora_params = [p for p in model.backbone.parameters() if p.requires_grad]
+    head_params = list(model.head.parameters())
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": lora_params, "lr": float(config["lora_lr"]), "weight_decay": float(config["weight_decay"])},
+            {"params": head_params, "lr": float(config["head_lr"]), "weight_decay": float(config["weight_decay"])},
+        ]
+    )
+    max_epochs = int(config.get("max_epochs", 12))
+    min_epochs = int(config.get("min_epochs", 3))
+    patience = int(config.get("early_stopping_patience", 3))
+    min_delta = float(config.get("early_stopping_min_delta", 0.0))
+    best_state: dict[str, Any] | None = None
+    best_value = float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
+    early_stopped = False
+    total_steps = 0
+    losses: list[float] = []
+    epoch_history: list[dict[str, float | int | bool]] = []
+    start = time.time()
+
+    for epoch in range(1, max_epochs + 1):
+        model.train()
+        epoch_losses = []
+        for batch in train_loader:
+            inputs = _move_batch(batch, device)
+            labels = inputs.pop("labels")
+            influence_weight = inputs.pop("influence_weight")
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred = model(**inputs)
+            residual = labels.float() - pred.float()
+            loss = training_loss_from_residuals(residual, influence_weight.float(), method.loss)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["max_grad_norm"]))
+            optimizer.step()
+            value = float(loss.detach().cpu())
+            losses.append(value)
+            epoch_losses.append(value)
+            total_steps += 1
+
+        stop_pred = predict_frame(model, tokenizer, stop_df, config, y_scale, torch, mods["DataLoader"], batch_size)
+        stop_metrics = prediction_metrics(stop_pred)
+        stop_value = stopping_value_from_metrics(stop_metrics, method.early_stopping_metric)
+        improved = stop_value < best_value - min_delta
+        if improved:
+            best_value = stop_value
+            best_epoch = epoch
+            best_state = capture_trainable_state(model)
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+        epoch_history.append(
+            {
+                "epoch": int(epoch),
+                "train_loss_mean": float(np.mean(epoch_losses)) if epoch_losses else float("nan"),
+                "train_loss_last": float(epoch_losses[-1]) if epoch_losses else float("nan"),
+                "validation_stop_mse": float(stop_metrics["rmse_scaled"]) ** 2,
+                "validation_stop_ifvarq": float(stop_metrics["if_residual_var_scaled"]),
+                "validation_stop_rmse": float(stop_metrics["rmse_scaled"]),
+                "early_stopping_metric_value": float(stop_value),
+                "is_best": bool(improved),
+            }
+        )
+        if epoch % int(config.get("log_every_epochs", 1)) == 0 or improved:
+            print(
+                "train_progress",
+                f"method={method.name}",
+                f"loss={method.loss}",
+                f"epoch={epoch}",
+                f"train_loss={epoch_history[-1]['train_loss_mean']:.6f}",
+                f"v_stop_mse={epoch_history[-1]['validation_stop_mse']:.6f}",
+                f"v_stop_ifvarq={epoch_history[-1]['validation_stop_ifvarq']:.6f}",
+                f"best_epoch={best_epoch}",
+                flush=True,
+            )
+        if epoch >= min_epochs and epochs_without_improvement >= patience:
+            early_stopped = True
+            print("early_stop", f"method={method.name}", f"epoch={epoch}", f"best_epoch={best_epoch}", flush=True)
+            break
+
+    if best_state is not None:
+        restore_trainable_state(model, best_state)
+    stop_pred = predict_frame(model, tokenizer, stop_df, config, y_scale, torch, mods["DataLoader"], batch_size)
+    scale_pred = predict_frame(model, tokenizer, scale_df, config, y_scale, torch, mods["DataLoader"], batch_size)
+    runtime = {
+        "runtime_seconds": time.time() - start,
+        "actual_batch_size": int(batch_size),
+        "requested_batch_size": int(config["batch_size"]),
+        "oom_fallback_used": bool(batch_size != int(config["batch_size"])),
+        "max_epochs": int(max_epochs),
+        "min_epochs": int(min_epochs),
+        "early_stopping_patience": int(patience),
+        "early_stopping_min_delta": float(min_delta),
+        "epochs_trained": int(epoch_history[-1]["epoch"]) if epoch_history else 0,
+        "best_epoch": int(best_epoch),
+        "early_stopped": bool(early_stopped),
+        "steps_per_epoch": int(steps_per_epoch_for_s(len(train_df), batch_size)),
+        "total_train_steps": int(total_steps),
+        "best_validation_stop_metric_value": float(best_value),
+        "final_train_loss": float(losses[-1]) if losses else float("nan"),
+        "mean_train_loss": float(np.mean(losses)) if losses else float("nan"),
+        "device": torch.cuda.get_device_name(0),
+        "torch_version": torch.__version__,
+        "epoch_history": epoch_history,
+    }
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    return runtime, stop_pred, scale_pred
+
+
+def predict_frame(
+    model: Any,
+    tokenizer: Any,
+    frame: pd.DataFrame,
+    config: dict[str, Any],
+    y_scale: OutcomeScale,
+    torch: Any,
+    DataLoader: Any,
+    batch_size: int,
+) -> pd.DataFrame:
+    model.eval()
+    dataset = PairTokenizedDataset(frame, tokenizer, int(config["max_length"]))
+    loader = DataLoader(
+        dataset,
+        batch_size=int(config.get("prediction_batch_size", batch_size)),
+        shuffle=False,
+        collate_fn=make_pair_collate_fn(tokenizer, torch),
+        num_workers=0,
+        pin_memory=True,
+    )
+    rows: list[pd.DataFrame] = []
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        for batch in loader:
+            sample_ids = batch["sample_id"].cpu().numpy().astype(np.int64)
+            y_raw_values = batch["y_raw"].cpu().numpy().astype(float)
+            labels = batch["labels"].cpu().numpy().astype(float)
+            influence_weight = batch["influence_weight"].cpu().numpy().astype(float)
+            inputs = _move_batch(batch, device)
+            inputs.pop("labels")
+            inputs.pop("influence_weight")
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                pred_scaled = model(**inputs).float().detach().cpu().numpy().astype(float)
+            rows.append(
+                pd.DataFrame(
+                    {
+                        ID_COL: sample_ids,
+                        "y_raw": y_raw_values,
+                        "y_scaled": labels,
+                        "pred_scaled": pred_scaled,
+                        "pred_raw": raw_y(pred_scaled, y_scale),
+                        "if_weight_question": influence_weight,
+                    }
+                )
+            )
+    out = pd.concat(rows, ignore_index=True)
+    out["residual_scaled"] = out["y_scaled"] - out["pred_scaled"]
+    out["residual_raw"] = out["y_raw"] - out["pred_raw"]
+    out["if_residual_scaled"] = out["if_weight_question"] * out["residual_scaled"]
+    out["if_residual_raw"] = out["if_weight_question"] * out["residual_raw"]
+    return out
+
+
+def prediction_metrics(predictions: pd.DataFrame) -> dict[str, float | int]:
+    y = predictions["y_scaled"].to_numpy(dtype=float)
+    pred = predictions["pred_scaled"].to_numpy(dtype=float)
+    residual = y - pred
+    if len(predictions) > 1 and np.std(y) > 0 and np.std(pred) > 0:
+        corr = float(np.corrcoef(y, pred)[0, 1])
+    else:
+        corr = float("nan")
+    return {
+        "n": int(len(predictions)),
+        "residual_mean_scaled": float(np.mean(residual)),
+        "residual_var_scaled": float(np.var(residual, ddof=1)),
+        "residual_var_raw": float(np.var(predictions["residual_raw"], ddof=1)),
+        "rmse_scaled": float(np.sqrt(np.mean(residual**2))),
+        "rmse_raw": float(np.sqrt(np.mean(np.asarray(predictions["residual_raw"], dtype=float) ** 2))),
+        "prediction_var_scaled": float(np.var(pred, ddof=1)),
+        "correlation": corr,
+        "if_residual_mean_scaled": float(predictions["if_residual_scaled"].mean()),
+        "if_residual_var_scaled": float(predictions["if_residual_scaled"].var(ddof=1)),
+        "if_residual_mean_raw": float(predictions["if_residual_raw"].mean()),
+        "if_residual_var_raw": float(predictions["if_residual_raw"].var(ddof=1)),
+    }
+
+
+def cell_dir(config: dict[str, Any], method_name: str, replication_id: int, s_train: int) -> Path:
+    return Path(config["output_dir"]) / str(method_name).lower() / f"rep_{int(replication_id):02d}" / f"s_{int(s_train):04d}"
+
+
+def write_cell_manifest(
+    output_dir: Path,
+    config: dict[str, Any],
+    method: MethodSpec,
+    replication_id: int,
+    s_train: int,
+    split: ScalingSplit,
+    population: PopulationSplit,
+) -> None:
+    manifest = {
+        "method": method.name,
+        "loss": method.loss,
+        "early_stopping_metric": method.early_stopping_metric,
+        "replication_id": int(replication_id),
+        "s_train": int(s_train),
+        "counts": {
+            "H_scale": int(len(population.h_scale_ids)),
+            "P_target": int(len(population.p_target_ids)),
+            "train_pool": int(len(split.train_pool_ids)),
+            "V_stop": int(len(split.v_stop_ids)),
+            "V_scale": int(len(split.v_scale_ids)),
+            "train": int(s_train),
+        },
+        "hashes": {
+            "H_scale": ids_hash(population.h_scale_ids),
+            "P_target": ids_hash(population.p_target_ids),
+            "train_pool": ids_hash(split.train_pool_ids),
+            "V_stop": ids_hash(split.v_stop_ids),
+            "V_scale": ids_hash(split.v_scale_ids),
+            "train": ids_hash(train_ids_for_s(split, s_train)),
+        },
+        "seed": rep_seed(config, replication_id),
+    }
+    write_json(output_dir / "split_manifest.json", manifest)
+
+
+def cleanup_training_artifacts(output_dir: Path) -> None:
+    for name in ("checkpoint", "checkpoints", "final_adapter"):
+        path = output_dir / name
+        if path.exists():
+            shutil.rmtree(path)
+
+
+def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_train: int) -> Path:
+    method = method_by_name(config, method_name)
+    output_dir = cell_dir(config, method.name, replication_id, s_train)
+    metrics_path = output_dir / "metrics.json"
+    if metrics_path.exists():
+        print(f"skip_completed method={method.name} rep={replication_id} s={s_train} metrics={metrics_path}", flush=True)
+        return output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    df = load_upworthy_pairs(config["input_csv"])
+    population = build_population_split(df)
+    y_scale = outcome_scale_from_h_scale(df, population.h_scale_ids)
+    df, inference = compute_inference_setup(df, population.p_target_ids, y_scale, str(config.get("target_feature", TARGET_FEATURE)))
+    split = build_scaling_split(df, config, replication_id)
+    train_df = subset_by_ids(df, train_ids_for_s(split, s_train), "train", y_scale)
+    stop_df = subset_by_ids(df, split.v_stop_ids, "validation_stop", y_scale)
+    scale_df = subset_by_ids(df, split.v_scale_ids, "validation_scale", y_scale)
+    write_cell_manifest(output_dir, config, method, replication_id, s_train, split, population)
+
+    requested_batch = int(config["batch_size"])
+    batch_candidates = [requested_batch]
+    for value in config.get("oom_fallback_batch_sizes", [64, 32]):
+        batch = int(value)
+        if batch > 0 and batch not in batch_candidates:
+            batch_candidates.append(batch)
+
+    for batch_index, batch_size in enumerate(batch_candidates):
+        try:
+            print(
+                "upworthy_scaling_cell_start",
+                f"method={method.name}",
+                f"loss={method.loss}",
+                f"rep={replication_id}",
+                f"s={s_train}",
+                f"batch_size={batch_size}",
+                flush=True,
+            )
+            runtime, stop_pred, scale_pred = train_once(
+                config,
+                train_df,
+                stop_df,
+                scale_df,
+                y_scale,
+                batch_size=batch_size,
+                seed=rep_seed(config, replication_id, salt=0 if bool(config.get("common_train_seed_within_rep", True)) else int(s_train)),
+                method=method,
+            )
+            break
+        except RuntimeError as exc:
+            if not is_cuda_oom(exc) or batch_index == len(batch_candidates) - 1:
+                raise
+            next_batch = batch_candidates[batch_index + 1]
+            print(f"cuda_oom_retry method={method.name} rep={replication_id} s={s_train} next_batch={next_batch}", flush=True)
+            exc.__traceback__ = None
+            del exc
+            gc.collect()
+            try:
+                import torch
+
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
+    stop_pred["replication_id"] = int(replication_id)
+    stop_pred["s_train"] = int(s_train)
+    stop_pred["split_role"] = "validation_stop"
+    scale_pred["replication_id"] = int(replication_id)
+    scale_pred["s_train"] = int(s_train)
+    scale_pred["split_role"] = "validation_scale"
+    if bool(config.get("save_predictions", False)):
+        stop_pred.to_parquet(output_dir / "validation_stop_predictions.parquet", index=False)
+        scale_pred.to_parquet(output_dir / "validation_scale_predictions.parquet", index=False)
+    epoch_history = runtime.pop("epoch_history", [])
+    if epoch_history:
+        pd.DataFrame(epoch_history).to_csv(output_dir / "epoch_history.csv", index=False)
+
+    metrics = {
+        "method": method.name,
+        "loss": method.loss,
+        "early_stopping_metric": method.early_stopping_metric,
+        "replication_id": int(replication_id),
+        "s_train": int(s_train),
+        "model_name": config["model_name"],
+        "input_csv": str(config["input_csv"]),
+        "target_feature": str(config.get("target_feature", TARGET_FEATURE)),
+        "feature_columns": FEATURE_COLS,
+        "h_scale_size": int(len(population.h_scale_ids)),
+        "p_target_size": int(len(population.p_target_ids)),
+        "train_pool_size": int(len(split.train_pool_ids)),
+        "validation_stop_size": int(len(split.v_stop_ids)),
+        "validation_scale_size": int(len(split.v_scale_ids)),
+        "outcome_scale": {"mean": y_scale.mean, "sd": y_scale.sd},
+        "inference": inference,
+        "validation_stop": prediction_metrics(stop_pred),
+        "validation_scale": prediction_metrics(scale_pred),
+        "runtime": runtime,
+    }
+    write_json(metrics_path, metrics)
+    cleanup_training_artifacts(output_dir)
+    print(f"upworthy_scaling_cell_done method={method.name} rep={replication_id} s={s_train} metrics={metrics_path}", flush=True)
+    return output_dir
+
+
+def aggregate_task_cells(config: dict[str, Any]) -> list[tuple[str, int, int]]:
+    cells: list[tuple[str, int, int]] = []
+    for method in method_specs(config):
+        for rep in replication_ids(config):
+            for s_train in s_grid(config):
+                cells.append((method.name, int(rep), int(s_train)))
+    return cells
+
+
+def task_index_to_cell(config: dict[str, Any], task_index: int) -> tuple[str, int, int]:
+    cells = aggregate_task_cells(config)
+    index = int(task_index)
+    if index < 0 or index >= len(cells):
+        raise ValueError(f"task_index={index} out of range for {len(cells)} cells")
+    return cells[index]
+
+
+def load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    missing = []
+    for method_name, rep, s_train in aggregate_task_cells(config):
+        path = cell_dir(config, method_name, rep, s_train) / "metrics.json"
+        if not path.exists():
+            missing.append(str(path))
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            metrics = json.load(f)
+        row = {
+            "method": str(metrics["method"]),
+            "loss": str(metrics["loss"]),
+            "early_stopping_metric": str(metrics["early_stopping_metric"]),
+            "replication_id": int(metrics["replication_id"]),
+            "s_train": int(metrics["s_train"]),
+            "h_scale_size": int(metrics["h_scale_size"]),
+            "p_target_size": int(metrics["p_target_size"]),
+            "train_pool_size": int(metrics["train_pool_size"]),
+            "validation_stop_size": int(metrics["validation_stop_size"]),
+            "validation_scale_size": int(metrics["validation_scale_size"]),
+            "question_beta_raw": float(metrics["inference"]["question_beta_raw"]),
+            "direct_ols_ifvar_target_raw": float(metrics["inference"]["direct_ols_ifvar_target_raw"]),
+            "direct_ols_ifvar_target_scaled": float(metrics["inference"]["direct_ols_ifvar_target_scaled"]),
+            "validation_stop_ifvarq_raw": float(metrics["validation_stop"]["if_residual_var_raw"]),
+            "validation_stop_ifvarq_scaled": float(metrics["validation_stop"]["if_residual_var_scaled"]),
+            "validation_stop_mse_scaled": float(metrics["validation_stop"]["rmse_scaled"]) ** 2,
+            "validation_stop_rmse_scaled": float(metrics["validation_stop"]["rmse_scaled"]),
+            "validation_stop_corr": float(metrics["validation_stop"]["correlation"]),
+            "validation_scale_ifvarq_raw": float(metrics["validation_scale"]["if_residual_var_raw"]),
+            "validation_scale_ifvarq_scaled": float(metrics["validation_scale"]["if_residual_var_scaled"]),
+            "validation_scale_mse_scaled": float(metrics["validation_scale"]["rmse_scaled"]) ** 2,
+            "validation_scale_rmse_scaled": float(metrics["validation_scale"]["rmse_scaled"]),
+            "validation_scale_corr": float(metrics["validation_scale"]["correlation"]),
+            "actual_batch_size": int(metrics["runtime"]["actual_batch_size"]),
+            "oom_fallback_used": bool(metrics["runtime"]["oom_fallback_used"]),
+            "runtime_seconds": float(metrics["runtime"]["runtime_seconds"]),
+            "epochs_trained": int(metrics["runtime"]["epochs_trained"]),
+            "best_epoch": int(metrics["runtime"]["best_epoch"]),
+            "early_stopped": bool(metrics["runtime"]["early_stopped"]),
+            "total_train_steps": int(metrics["runtime"]["total_train_steps"]),
+            "device": str(metrics["runtime"]["device"]),
+        }
+        rows.append(row)
+    if missing:
+        raise FileNotFoundError("missing metrics.json files:\n" + "\n".join(missing[:20]))
+    return pd.DataFrame(rows).sort_values(["method", "replication_id", "s_train"]).reset_index(drop=True)
+
+
+def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
+    output_dir = Path(config["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics = load_cell_metrics(config)
+    metrics.to_csv(output_dir / "scaling_cell_metrics.csv", index=False)
+
+    by_s = (
+        metrics.groupby(["method", "loss", "early_stopping_metric", "s_train"], as_index=False)
+        .agg(
+            n_replications=("replication_id", "nunique"),
+            mean_ifvarq_raw=("validation_scale_ifvarq_raw", "mean"),
+            sd_ifvarq_raw=("validation_scale_ifvarq_raw", "std"),
+            mean_ifvarq_scaled=("validation_scale_ifvarq_scaled", "mean"),
+            mean_mse_scaled=("validation_scale_mse_scaled", "mean"),
+            mean_rmse_scaled=("validation_scale_rmse_scaled", "mean"),
+            mean_corr=("validation_scale_corr", "mean"),
+            mean_runtime_seconds=("runtime_seconds", "mean"),
+            mean_epochs_trained=("epochs_trained", "mean"),
+            direct_ols_ifvar_target_raw=("direct_ols_ifvar_target_raw", "first"),
+            question_beta_raw=("question_beta_raw", "first"),
+        )
+        .sort_values(["method", "s_train"])
+        .reset_index(drop=True)
+    )
+    by_s["se_ifvarq_raw"] = by_s["sd_ifvarq_raw"] / np.sqrt(by_s["n_replications"])
+    by_s.to_csv(output_dir / "scaling_by_s_summary.csv", index=False)
+
+    fit_rows = []
+    for method, group in by_s.groupby("method", sort=False):
+        fit = fit_scaling_law(
+            group["s_train"].to_numpy(dtype=float),
+            group["mean_ifvarq_raw"].to_numpy(dtype=float),
+            population_var_y=float(group["direct_ols_ifvar_target_raw"].iloc[0]),
+        )
+        fit_rows.append({"method": method, **fit})
+    fits = pd.DataFrame(fit_rows)
+    fits.to_csv(output_dir / "scaling_fit_parameters_raw.csv", index=False)
+
+    break_even_rows = []
+    budgets = [int(x) for x in config.get("diagnostic_budgets", [300, 500, 1000])]
+    for _, row in by_s.iterrows():
+        for budget in budgets:
+            if int(row["s_train"]) >= budget:
+                continue
+            direct = float(row["direct_ols_ifvar_target_raw"]) / float(budget)
+            ppi_proxy = float(row["mean_ifvarq_raw"]) / float(budget - int(row["s_train"]))
+            break_even_rows.append(
+                {
+                    "method": row["method"],
+                    "s_train": int(row["s_train"]),
+                    "budget_B": int(budget),
+                    "direct_labeled_only_var_proxy": direct,
+                    "ppi_var_proxy": ppi_proxy,
+                    "var_ratio_to_labeled_only": ppi_proxy / direct if direct > 0 else float("nan"),
+                    "beats_labeled_only_proxy": bool(ppi_proxy < direct),
+                }
+            )
+    break_even = pd.DataFrame(break_even_rows)
+    break_even.to_csv(output_dir / "break_even_diagnostics.csv", index=False)
+    return {
+        "cell_metrics": output_dir / "scaling_cell_metrics.csv",
+        "by_s_summary": output_dir / "scaling_by_s_summary.csv",
+        "fit_parameters": output_dir / "scaling_fit_parameters_raw.csv",
+        "break_even": output_dir / "break_even_diagnostics.csv",
+    }
+
+
+def describe_data(config: dict[str, Any]) -> dict[str, Any]:
+    df = load_upworthy_pairs(config["input_csv"])
+    population = build_population_split(df)
+    y_scale = outcome_scale_from_h_scale(df, population.h_scale_ids)
+    _, inference = compute_inference_setup(df, population.p_target_ids, y_scale, str(config.get("target_feature", TARGET_FEATURE)))
+    split0 = build_scaling_split(df, config, replication_ids(config)[0])
+    return {
+        "n_rows": int(len(df)),
+        "h_scale_size": int(len(population.h_scale_ids)),
+        "p_target_size": int(len(population.p_target_ids)),
+        "train_pool_size": int(len(split0.train_pool_ids)),
+        "validation_stop_size": int(len(split0.v_stop_ids)),
+        "validation_scale_size": int(len(split0.v_scale_ids)),
+        "s_grid": s_grid(config),
+        "replication_ids": replication_ids(config),
+        "methods": [method.__dict__ for method in method_specs(config)],
+        "outcome_scale": {"mean": y_scale.mean, "sd": y_scale.sd},
+        "question_beta_raw": inference["question_beta_raw"],
+        "direct_ols_ifvar_target_raw": inference["direct_ols_ifvar_target_raw"],
+        "direct_ols_ifvar_target_scaled": inference["direct_ols_ifvar_target_scaled"],
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Upworthy question-coefficient scaling-law validation.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    describe = sub.add_parser("describe")
+    describe.add_argument("--config", required=True)
+    train = sub.add_parser("train-cell")
+    train.add_argument("--config", required=True)
+    group = train.add_mutually_exclusive_group(required=True)
+    group.add_argument("--task-index", type=int)
+    group.add_argument("--cell", nargs=3, metavar=("METHOD", "REP", "S"))
+    aggregate = sub.add_parser("aggregate")
+    aggregate.add_argument("--config", required=True)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_config(args.config)
+    if args.command == "describe":
+        print(json.dumps(describe_data(config), indent=2, sort_keys=True))
+    elif args.command == "train-cell":
+        if args.task_index is not None:
+            method_name, rep, s_train = task_index_to_cell(config, args.task_index)
+        else:
+            method_name, rep, s_train = args.cell[0], int(args.cell[1]), int(args.cell[2])
+        train_cell(config, method_name, int(rep), int(s_train))
+    elif args.command == "aggregate":
+        outputs = aggregate_scaling(config)
+        print("upworthy_question_scaling_aggregate_done")
+        for key, path in outputs.items():
+            print(f"{key}: {path}")
+    else:
+        raise ValueError(f"unsupported command {args.command!r}")
+
+
+if __name__ == "__main__":
+    main()

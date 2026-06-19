@@ -1,0 +1,43 @@
+input_csv: Data/upworthy_pairs_with_text_features.csv
+output_dir: /gscratch/scrubbed/lei0603/ft-ppi/artifacts/upworthy_question_scaling_smoke
+seed: 20260618
+
+target_feature: delta_QUESTION
+train_pool_size: 5000
+validation_stop_size: 1000
+validation_scale_size: 1000
+s_grid: [50, 100, 200, 400]
+replication_ids: [0]
+diagnostic_budgets: [300, 500, 1000]
+
+methods:
+  - name: mse_stop_mse
+    loss: mse
+    early_stopping_metric: mse
+  - name: ifvarq_stop_ifvarq
+    loss: ifvarq
+    early_stopping_metric: ifvarq
+
+model_name: Qwen/Qwen2.5-1.5B-Instruct
+max_length: 80
+target_modules: all-linear
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_lr: 2.0e-4
+head_lr: 5.0e-4
+head_hidden_size: 128
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+batch_size: 64
+oom_fallback_batch_sizes: [32, 16]
+prediction_batch_size: 64
+log_every_epochs: 1
+max_epochs: 8
+min_epochs: 2
+early_stopping_patience: 2
+early_stopping_min_delta: 0.0
+common_train_seed_within_rep: true
+gradient_checkpointing: true
+save_predictions: false
