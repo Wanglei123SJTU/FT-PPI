@@ -17,6 +17,10 @@ import yaml
 
 from src.experiments.wine_var_scaling_law import fit_scaling_law, ids_hash, is_cuda_oom, write_json
 
+try:
+    from src.data.upworthy_text_features import FEATURES as UPWORTHY_TEXT_FEATURES
+except Exception:  # pragma: no cover - keep CLI usable if optional feature deps are missing
+    UPWORTHY_TEXT_FEATURES = []
 
 Y_COL = "y_logit_ctr_diff"
 TEXT_A_COL = "headline_a"
@@ -30,6 +34,7 @@ FEATURE_COLS = [
     "delta_COMMON",
     "delta_LENGTH",
 ]
+KNOWN_FEATURE_COLS = sorted(set(FEATURE_COLS) | {f"delta_{feature}" for feature in UPWORTHY_TEXT_FEATURES})
 TARGET_FEATURE = "delta_QUESTION"
 IF_WEIGHT_COL = "if_weight_target"
 LEGACY_IF_WEIGHT_COL = "if_weight_question"
@@ -183,7 +188,8 @@ def load_upworthy_pairs(input_csv: str | Path, config: dict[str, Any] | None = N
     df = pd.read_csv(input_csv)
     outcome_col = outcome_col_from_config(config)
     outcome_transform = outcome_transform_from_config(config)
-    required = {TEXT_A_COL, TEXT_B_COL, "split", *FEATURE_COLS}
+    feature_cols = feature_cols_from_config(config)
+    required = {TEXT_A_COL, TEXT_B_COL, "split", *feature_cols}
     if outcome_transform in {"", "none"}:
         required.add(outcome_col)
     elif outcome_transform in {"logit_ctr_diff_eb", "ctr_diff_eb"}:
@@ -206,7 +212,7 @@ def load_upworthy_pairs(input_csv: str | Path, config: dict[str, Any] | None = N
         raise ValueError(f"{ID_COL} must be unique")
     out[Y_COL] = out[outcome_col].astype(float)
     out[EST_WEIGHT_COL] = build_estimation_weights(out, estimation_weight_scheme_from_config(config))
-    for col in FEATURE_COLS:
+    for col in feature_cols:
         out[col] = out[col].astype(float)
     out[TEXT_A_COL] = out[TEXT_A_COL].astype(str)
     out[TEXT_B_COL] = out[TEXT_B_COL].astype(str)
@@ -219,9 +225,9 @@ def feature_cols_from_config(config: dict[str, Any] | None = None) -> list[str]:
     cols = [str(col) for col in config["feature_columns"]]
     if not cols:
         raise ValueError("feature_columns must contain at least one feature")
-    unknown = sorted(set(cols) - set(FEATURE_COLS))
+    unknown = sorted(set(cols) - set(KNOWN_FEATURE_COLS))
     if unknown:
-        raise ValueError(f"feature_columns must be drawn from {FEATURE_COLS}, got unknown {unknown}")
+        raise ValueError(f"feature_columns must be drawn from known Upworthy feature columns, got unknown {unknown}")
     if len(cols) != len(set(cols)):
         raise ValueError(f"feature_columns contains duplicates: {cols}")
     return cols
@@ -236,9 +242,9 @@ def surrogate_feature_cols_from_config(config: dict[str, Any] | None = None) -> 
             return []
         raise ValueError("surrogate_feature_columns must be a list of feature names or [] for text-only")
     cols = [str(col) for col in raw]
-    unknown = sorted(set(cols) - set(FEATURE_COLS))
+    unknown = sorted(set(cols) - set(KNOWN_FEATURE_COLS))
     if unknown:
-        raise ValueError(f"surrogate_feature_columns must be drawn from {FEATURE_COLS}, got unknown {unknown}")
+        raise ValueError(f"surrogate_feature_columns must be drawn from known Upworthy feature columns, got unknown {unknown}")
     if len(cols) != len(set(cols)):
         raise ValueError(f"surrogate_feature_columns contains duplicates: {cols}")
     return cols
@@ -499,8 +505,12 @@ def compute_inference_setup(
     y_scale: OutcomeScale,
     target_feature: str = TARGET_FEATURE,
     feature_cols: list[str] | None = None,
+    hessian_ridge: float = 0.0,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     cols = feature_cols if feature_cols is not None else FEATURE_COLS
+    ridge = float(hessian_ridge)
+    if not np.isfinite(ridge) or ridge < 0:
+        raise ValueError("hessian_ridge must be a nonnegative finite value")
     if EST_WEIGHT_COL not in df.columns:
         df = df.copy()
         df[EST_WEIGHT_COL] = 1.0
@@ -515,7 +525,12 @@ def compute_inference_setup(
     target[EST_WEIGHT_COL] = normalized_target_weights
     x_target = x_matrix(target, cols)
     hessian = (x_target.T * normalized_target_weights @ x_target) / len(target)
-    hessian_inv = np.linalg.pinv(hessian)
+    singular_values = np.linalg.svd(hessian, compute_uv=False)
+    min_singular = float(np.min(singular_values))
+    max_singular = float(np.max(singular_values))
+    condition_number = float(max_singular / min_singular) if min_singular > 0 else float("inf")
+    ridge_matrix = hessian + ridge * np.eye(hessian.shape[0], dtype=float)
+    hessian_inv = np.linalg.pinv(ridge_matrix)
     idx = target_feature_index(target_feature, cols)
     beta = fit_ols_beta(target, cols, weight_col=EST_WEIGHT_COL)
     weights_all = (x_matrix(df, cols) @ hessian_inv[idx, :]) * normalized_all_weights
@@ -537,7 +552,17 @@ def compute_inference_setup(
         "target_coefficient_raw": float(beta[idx]),
         "question_beta_raw": float(beta[idx]),
         "hessian": hessian.tolist(),
+        "hessian_singular_values": [float(value) for value in singular_values],
+        "hessian_condition_number": condition_number,
+        "hessian_ridge": ridge,
         "hessian_inv": hessian_inv.tolist(),
+        "if_weight_abs_quantiles": {
+            str(q): float(value)
+            for q, value in zip(
+                [0.5, 0.9, 0.95, 0.99, 0.999, 1.0],
+                np.quantile(np.abs(weights_all), [0.5, 0.9, 0.95, 0.99, 0.999, 1.0]),
+            )
+        },
         "direct_ols_ifvar_target_raw": float(np.var(target_if_residual_raw, ddof=1)),
         "direct_ols_ifvar_target_scaled": float(np.var(target_if_residual_scaled, ddof=1)),
         "estimation_weight_mean_raw_target": float(target_weight_mean),
@@ -1217,7 +1242,14 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
     target_feature = str(config.get("target_feature", TARGET_FEATURE))
     population = build_population_split(df)
     y_scale = outcome_scale_from_h_scale(df, population.h_scale_ids)
-    df, inference = compute_inference_setup(df, population.p_target_ids, y_scale, target_feature, feature_cols)
+    df, inference = compute_inference_setup(
+        df,
+        population.p_target_ids,
+        y_scale,
+        target_feature,
+        feature_cols,
+        hessian_ridge=float(config.get("hessian_ridge", 0.0) or 0.0),
+    )
     split = build_scaling_split(df, config, replication_id, method.sampling_strategy, target_feature=target_feature)
     train_df = subset_by_ids(df, train_ids_for_s(split, s_train), "train", y_scale)
     stop_df = subset_by_ids(df, split.v_stop_ids, "validation_stop", y_scale)
@@ -1399,6 +1431,10 @@ def load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
             "target_coefficient_raw": float(metrics["inference"].get("target_coefficient_raw", metrics["inference"]["question_beta_raw"])),
             "direct_ols_ifvar_target_raw": float(metrics["inference"]["direct_ols_ifvar_target_raw"]),
             "direct_ols_ifvar_target_scaled": float(metrics["inference"]["direct_ols_ifvar_target_scaled"]),
+            "hessian_condition_number": float(metrics["inference"].get("hessian_condition_number", float("nan"))),
+            "hessian_ridge": float(metrics["inference"].get("hessian_ridge", float("nan"))),
+            "if_weight_abs_p99": float(metrics["inference"].get("if_weight_abs_quantiles", {}).get("0.99", float("nan"))),
+            "if_weight_abs_max": float(metrics["inference"].get("if_weight_abs_quantiles", {}).get("1.0", float("nan"))),
             "constant_validation_stop_ifvarq_raw": float(constant_stop.get("if_residual_var_raw", float("nan"))),
             "constant_validation_stop_ifvarq_scaled": float(constant_stop.get("if_residual_var_scaled", float("nan"))),
             "constant_validation_scale_ifvarq_raw": float(constant_scale.get("if_residual_var_raw", float("nan"))),
@@ -1535,7 +1571,14 @@ def describe_data(config: dict[str, Any]) -> dict[str, Any]:
     target_feature = str(config.get("target_feature", TARGET_FEATURE))
     population = build_population_split(df)
     y_scale = outcome_scale_from_h_scale(df, population.h_scale_ids)
-    df, inference = compute_inference_setup(df, population.p_target_ids, y_scale, target_feature, feature_cols)
+    df, inference = compute_inference_setup(
+        df,
+        population.p_target_ids,
+        y_scale,
+        target_feature,
+        feature_cols,
+        hessian_ridge=float(config.get("hessian_ridge", 0.0) or 0.0),
+    )
     methods = method_specs(config)
     split0 = build_scaling_split(
         df,
@@ -1567,6 +1610,9 @@ def describe_data(config: dict[str, Any]) -> dict[str, Any]:
         "outcome_scale": {"mean": y_scale.mean, "sd": y_scale.sd},
         "question_beta_raw": inference["question_beta_raw"],
         "target_coefficient_raw": inference["target_coefficient_raw"],
+        "hessian_condition_number": inference["hessian_condition_number"],
+        "hessian_ridge": inference["hessian_ridge"],
+        "if_weight_abs_quantiles": inference["if_weight_abs_quantiles"],
         "direct_ols_ifvar_target_raw": inference["direct_ols_ifvar_target_raw"],
         "direct_ols_ifvar_target_scaled": inference["direct_ols_ifvar_target_scaled"],
     }

@@ -63,8 +63,11 @@ def read_raw_archives(raw_dir: Path, filenames: list[str] | None = None) -> pd.D
     return pd.concat(frames, ignore_index=True)
 
 
-def clean_arm_level(raw: pd.DataFrame) -> pd.DataFrame:
+def clean_arm_level(raw: pd.DataFrame, min_arm_impressions: int = 0) -> pd.DataFrame:
     """Build a LOLA-style arm-level CTR table without adopting LOLA's winner task."""
+    min_impressions = int(min_arm_impressions)
+    if min_impressions < 0:
+        raise ValueError("min_arm_impressions must be nonnegative")
     df = raw[REQUIRED_COLUMNS + ["source_split"]].copy()
     df = df[df["headline"].notna()]
 
@@ -73,6 +76,8 @@ def clean_arm_level(raw: pd.DataFrame) -> pd.DataFrame:
     df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce", format="mixed")
     df = df.dropna(subset=["clicks", "impressions", "created_at"])
     df = df[(df["impressions"] > 0) & (df["clicks"] >= 0) & (df["clicks"] <= df["impressions"])]
+    if min_impressions > 0:
+        df = df[df["impressions"] >= min_impressions]
 
     text_cols = ["excerpt", "lede", "share_text"]
     for col in text_cols:
@@ -155,13 +160,53 @@ def _split_labels(n: int, h_scale_size: int, target_size: int) -> np.ndarray:
     return labels
 
 
+def _validate_quantile(value: float | None, name: str) -> float | None:
+    if value is None:
+        return None
+    q = float(value)
+    if not 0.0 <= q < 0.5:
+        raise ValueError(f"{name} must be in [0, 0.5)")
+    return q
+
+
+def winsorize_pair_outcomes(
+    pairs: pd.DataFrame,
+    logit_quantile: float | None = None,
+    ctr_quantile: float | None = None,
+) -> pd.DataFrame:
+    """Optionally clip pair outcomes while preserving the unclipped raw columns."""
+    logit_q = _validate_quantile(logit_quantile, "logit_quantile")
+    ctr_q = _validate_quantile(ctr_quantile, "ctr_quantile")
+    out = pairs.copy()
+    for col, raw_col, q in [
+        ("y_logit_ctr_diff", "y_logit_ctr_diff_raw", logit_q),
+        ("y_ctr_diff", "y_ctr_diff_raw", ctr_q),
+    ]:
+        if raw_col not in out.columns:
+            out[raw_col] = out[col]
+        if q is None or q == 0.0 or out.empty:
+            out[f"{col}_winsorized"] = False
+            continue
+        lower = float(out[raw_col].quantile(q))
+        upper = float(out[raw_col].quantile(1.0 - q))
+        out[col] = out[raw_col].clip(lower=lower, upper=upper)
+        out[f"{col}_winsorized"] = out[col] != out[raw_col]
+    return out
+
+
 def make_one_pair_per_test(
     arms: pd.DataFrame,
     seed: int = 20260618,
     h_scale_size: int = 7000,
     target_size: int = 10000,
+    min_pair_total_impressions: int = 0,
+    logit_winsor_quantile: float | None = None,
+    ctr_winsor_quantile: float | None = None,
 ) -> pd.DataFrame:
     """Sample one unordered headline pair per test and randomly orient A/B for regression."""
+    min_total_impressions = int(min_pair_total_impressions)
+    if min_total_impressions < 0:
+        raise ValueError("min_pair_total_impressions must be nonnegative")
     rng = np.random.default_rng(seed)
     rows: list[dict[str, Any]] = []
     for test_id, group in arms.groupby("test_id", sort=True):
@@ -179,6 +224,9 @@ def make_one_pair_per_test(
 
         y_logit = float(first["logit_ctr_smoothed"] - second["logit_ctr_smoothed"])
         y_ctr = float(first["ctr"] - second["ctr"])
+        pair_total_impressions = float(first["impressions"] + second["impressions"])
+        if min_total_impressions > 0 and pair_total_impressions < min_total_impressions:
+            continue
         winner_side = "tie"
         if first["ctr"] > second["ctr"]:
             winner_side = "a"
@@ -206,12 +254,15 @@ def make_one_pair_per_test(
                 "clicks_b": float(second["clicks"]),
                 "impressions_a": float(first["impressions"]),
                 "impressions_b": float(second["impressions"]),
+                "pair_total_impressions": pair_total_impressions,
                 "ctr_a": float(first["ctr"]),
                 "ctr_b": float(second["ctr"]),
                 "logit_ctr_a": float(first["logit_ctr_smoothed"]),
                 "logit_ctr_b": float(second["logit_ctr_smoothed"]),
                 "y_logit_ctr_diff": y_logit,
+                "y_logit_ctr_diff_raw": y_logit,
                 "y_ctr_diff": y_ctr,
+                "y_ctr_diff_raw": y_ctr,
                 "winner_side": winner_side,
             }
         )
@@ -219,6 +270,11 @@ def make_one_pair_per_test(
     pairs = pd.DataFrame(rows)
     if pairs.empty:
         return pairs
+    pairs = winsorize_pair_outcomes(
+        pairs,
+        logit_quantile=logit_winsor_quantile,
+        ctr_quantile=ctr_winsor_quantile,
+    )
     pairs = pairs.sample(frac=1.0, random_state=seed).reset_index(drop=True)
     pairs["pair_id"] = np.arange(len(pairs), dtype=np.int64)
     pairs["split"] = _split_labels(len(pairs), h_scale_size=h_scale_size, target_size=target_size)
@@ -238,10 +294,34 @@ def lola_default_test_count(raw: pd.DataFrame) -> int:
     return int(filtered.groupby(["clickability_test_id", "eyecatcher_id"]).ngroup().nunique())
 
 
-def summarize(raw: pd.DataFrame, arms: pd.DataFrame, pairs: pd.DataFrame) -> dict[str, Any]:
+def summarize(
+    raw: pd.DataFrame,
+    arms: pd.DataFrame,
+    pairs: pd.DataFrame,
+    min_arm_impressions: int = 0,
+    min_pair_total_impressions: int = 0,
+    logit_winsor_quantile: float | None = None,
+    ctr_winsor_quantile: float | None = None,
+) -> dict[str, Any]:
     literal = lola_literal_arm_rows(raw)
     cleaned_tests = int(arms["test_id"].nunique()) if not arms.empty else 0
     return {
+        "preprocessing": {
+            "min_arm_impressions": int(min_arm_impressions),
+            "min_pair_total_impressions": int(min_pair_total_impressions),
+            "logit_winsor_quantile": logit_winsor_quantile,
+            "ctr_winsor_quantile": ctr_winsor_quantile,
+            "winsorized_logit_pairs": (
+                int(pairs["y_logit_ctr_diff_winsorized"].sum())
+                if "y_logit_ctr_diff_winsorized" in pairs
+                else 0
+            ),
+            "winsorized_ctr_pairs": (
+                int(pairs["y_ctr_diff_winsorized"].sum())
+                if "y_ctr_diff_winsorized" in pairs
+                else 0
+            ),
+        },
         "raw_rows": int(len(raw)),
         "lola_literal_tests": int(literal["test_id"].nunique()) if not literal.empty else 0,
         "lola_literal_packages": int(len(literal)),
@@ -265,6 +345,7 @@ def summarize(raw: pd.DataFrame, arms: pd.DataFrame, pairs: pd.DataFrame) -> dic
             "Pair-level data is adapted for linear M-estimation, not LOLA winner classification.",
             "Each pair-level test contributes one randomly oriented pair by default to avoid within-test dependence in the main analysis.",
             "For pair construction only, headline whitespace is stripped before requiring two distinct headline texts.",
+            "Optional minimum-impression filters and outcome winsorization are recorded in preprocessing.",
         ],
     }
 
@@ -276,6 +357,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260618)
     parser.add_argument("--h-scale-size", type=int, default=7000)
     parser.add_argument("--target-size", type=int, default=10000)
+    parser.add_argument("--min-arm-impressions", type=int, default=0)
+    parser.add_argument("--min-pair-total-impressions", type=int, default=0)
+    parser.add_argument("--logit-winsor-quantile", type=float, default=0.0)
+    parser.add_argument("--ctr-winsor-quantile", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -283,12 +368,15 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     raw = read_raw_archives(args.raw_dir)
-    arms = clean_arm_level(raw)
+    arms = clean_arm_level(raw, min_arm_impressions=args.min_arm_impressions)
     pairs = make_one_pair_per_test(
         arms,
         seed=args.seed,
         h_scale_size=args.h_scale_size,
         target_size=args.target_size,
+        min_pair_total_impressions=args.min_pair_total_impressions,
+        logit_winsor_quantile=args.logit_winsor_quantile,
+        ctr_winsor_quantile=args.ctr_winsor_quantile,
     )
 
     arms.to_csv(args.output_dir / "ctr_arms_lola_like.csv", index=False)
@@ -297,7 +385,15 @@ def main() -> None:
         index=False,
     )
     pairs.to_csv(args.output_dir / "pairs_one_per_test.csv", index=False)
-    summary = summarize(raw, arms, pairs)
+    summary = summarize(
+        raw,
+        arms,
+        pairs,
+        min_arm_impressions=args.min_arm_impressions,
+        min_pair_total_impressions=args.min_pair_total_impressions,
+        logit_winsor_quantile=args.logit_winsor_quantile,
+        ctr_winsor_quantile=args.ctr_winsor_quantile,
+    )
     summary["raw_dir"] = str(args.raw_dir)
     summary["output_dir"] = str(args.output_dir)
     summary["seed"] = int(args.seed)

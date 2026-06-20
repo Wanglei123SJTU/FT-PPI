@@ -141,6 +141,9 @@ def test_inference_setup_uses_target_hessian_and_question_weight():
     assert info["target_feature"] == "delta_QUESTION"
     assert info["target_feature_index"] == 1
     assert np.isclose(info["question_beta_raw"], -0.1)
+    assert info["hessian_ridge"] == 0.0
+    assert info["hessian_condition_number"] >= 1.0
+    assert "0.99" in info["if_weight_abs_quantiles"]
     assert info["direct_ols_ifvar_target_raw"] < 1e-20
 
 
@@ -167,6 +170,18 @@ def test_single_feature_target_setup_uses_active_feature_columns():
     assert np.isclose(info["target_coefficient_raw"], expected_beta[1])
 
 
+def test_hessian_ridge_keeps_target_beta_but_changes_influence_weights():
+    df = _toy_frame(n_h=12, n_t=12)
+    population = build_population_split(df)
+    y_scale = outcome_scale_from_h_scale(df, population.h_scale_ids)
+    base, base_info = compute_inference_setup(df, population.p_target_ids, y_scale, hessian_ridge=0.0)
+    ridged, ridged_info = compute_inference_setup(df, population.p_target_ids, y_scale, hessian_ridge=0.1)
+    assert base_info["hessian_ridge"] == 0.0
+    assert ridged_info["hessian_ridge"] == 0.1
+    assert np.isclose(base_info["target_coefficient_raw"], ridged_info["target_coefficient_raw"])
+    assert not np.allclose(base["if_weight_target"].to_numpy(), ridged["if_weight_target"].to_numpy())
+
+
 def test_feature_columns_config_rejects_missing_target():
     config = {"feature_columns": ["delta_LENGTH"]}
     assert feature_cols_from_config(config) == ["delta_LENGTH"]
@@ -186,6 +201,15 @@ def test_surrogate_feature_columns_can_be_text_only():
     assert feature_cols_from_config(config) == ["delta_QUESTION", "delta_LENGTH"]
     assert surrogate_feature_cols_from_config(config) == []
     assert surrogate_feature_cols_from_config({"feature_columns": ["delta_LENGTH"]}) == ["delta_LENGTH"]
+
+
+def test_config_can_select_expanded_text_features():
+    config = {
+        "feature_columns": ["delta_READING_EASE", "delta_VADER_NEG"],
+        "surrogate_feature_columns": ["delta_READING_EASE"],
+    }
+    assert feature_cols_from_config(config) == ["delta_READING_EASE", "delta_VADER_NEG"]
+    assert surrogate_feature_cols_from_config(config) == ["delta_READING_EASE"]
 
 
 def test_ifvarq_loss_is_weighted_residual_variance():
