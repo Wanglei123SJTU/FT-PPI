@@ -1,0 +1,75 @@
+input_csv: Data/upworthy_pairs_with_text_features.csv
+output_dir: /gscratch/scrubbed/lei0603/ft-ppi/artifacts/upworthy_question_vader_current_balanced_focused_1p5b
+seed: 20260623
+
+outcome_column: y_logit_ctr_diff_eb_tau1000
+outcome_transform: logit_ctr_diff_eb
+ctr_shrinkage_tau: 1000
+min_total_impressions: 5000
+
+target_feature: delta_QUESTION
+feature_columns: [delta_QUESTION, delta_VADER_COMPOUND]
+surrogate_feature_columns: []
+train_pool_size: 4000
+validation_stop_size: 1000
+validation_scale_size: 1000
+s_grid: [25, 50, 75, 100, 150, 200, 400, 800]
+replication_ids: [0, 1]
+diagnostic_budgets: [300, 500, 1000, 1500, 2000, 3000, 5000]
+
+methods:
+  - name: mse_uniform
+    loss: mse
+    early_stopping_metric: mse
+    sampling_strategy: uniform
+
+  - name: mse_target_nonzero_balanced
+    loss: mse
+    early_stopping_metric: mse
+    sampling_strategy: target_nonzero_balanced
+
+  - name: mse_target_if_weight_balanced
+    loss: mse
+    early_stopping_metric: mse
+    sampling_strategy: target_if_weight_balanced
+
+  - name: ifvarq_warm2_target_nonzero_balanced_clip4
+    loss: ifvarq
+    warmup_loss: mse
+    warmup_epochs: 2
+    early_stopping_metric: ifvarq
+    sampling_strategy: target_nonzero_balanced
+    if_weight_clip: 4.0
+
+  - name: ifvarq_warm2_target_if_weight_balanced_clip4
+    loss: ifvarq
+    warmup_loss: mse
+    warmup_epochs: 2
+    early_stopping_metric: ifvarq
+    sampling_strategy: target_if_weight_balanced
+    if_weight_clip: 4.0
+
+model_name: Qwen/Qwen2.5-1.5B-Instruct
+max_length: 80
+pooling_strategy: mean
+target_modules: all-linear
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_lr: 2.0e-4
+head_lr: 5.0e-4
+head_hidden_size: 128
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+batch_size: 64
+oom_fallback_batch_sizes: [32, 16]
+prediction_batch_size: 64
+log_every_epochs: 1
+max_epochs: 12
+min_epochs: 3
+early_stopping_patience: 3
+early_stopping_min_delta: 0.0
+common_train_seed_within_rep: true
+gradient_checkpointing: true
+save_predictions: false
