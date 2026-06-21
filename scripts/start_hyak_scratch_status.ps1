@@ -59,11 +59,17 @@ Write-Host "Enter UW password and complete Duo if prompted."
 Write-Host "This status window will not restart the runner or submit jobs."
 Write-Host ""
 
+$EncodedRemoteScript = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($RemoteScript))
+$RemoteCommand = "printf '%s' '$EncodedRemoteScript' | base64 -d | bash"
+$SshExe = Join-Path $env:SystemRoot "System32\OpenSSH\ssh.exe"
+if (-not (Test-Path $SshExe)) {
+  $SshExe = "ssh"
+}
+
 $PreviousErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
-  $RemoteScript |
-    ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target "bash -s" 2>&1 |
+  & $SshExe -n -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target $RemoteCommand 2>&1 |
     ForEach-Object { $_.ToString() } |
     Tee-Object -FilePath $LogPath -Append
   $ExitCode = $LASTEXITCODE

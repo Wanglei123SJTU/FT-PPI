@@ -1,11 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-echo "helpsteer2_qwen_embedding_mlp_scaling_task_start $(date)"
+echo "helpsteer2_qwen_embedding_mlp_scaling_scratch_task_start $(date)"
 
 REPO_DIR="${HYAK_RUNNER_REPO_DIR:-$PWD}"
 cd "$REPO_DIR"
-git status --short --branch
+echo "repo=$(pwd)"
+echo "head=$(git rev-parse --short HEAD 2>/dev/null || true)"
 
 PYTHON_BIN=".venv-hyak/bin/python"
 if [[ ! -x "$PYTHON_BIN" ]]; then
@@ -26,6 +27,11 @@ echo "prepare HelpSteer2 preference pairs"
 $PYTHON_BIN -m src.data.prepare_helpsteer2_preference \
   --output-csv "$PAIR_CSV"
 
+echo "run local OLS screen before embedding"
+$PYTHON_BIN -m src.experiments.helpsteer2_preference_regression \
+  --input-csv "$PAIR_CSV" \
+  --output-dir "artifacts/helpsteer2_preference/regression_screen"
+
 submit_embedding_job() {
   local model_name="$1"
   local safe_name="$2"
@@ -37,7 +43,6 @@ submit_embedding_job() {
 
   if [[ -f "$embed_npz" ]]; then
     echo "embedding_exists=$embed_npz"
-    echo "$embed_npz"
     return 0
   fi
 
@@ -60,11 +65,7 @@ submit_embedding_job() {
   echo "embedding_log_tail"
   tail -n 120 logs/${job_name}_${job_id}.out || true
 
-  if [[ -f "$embed_npz" ]]; then
-    echo "$embed_npz"
-    return 0
-  fi
-  return 1
+  [[ -f "$embed_npz" ]]
 }
 
 EMBED_NPZ=""
@@ -113,4 +114,4 @@ cat "$MLP_OUT/budget_comparison.csv"
 echo "mlp_scaling_report"
 sed -n '1,220p' "$MLP_OUT/mlp_scaling_report.md"
 
-echo "helpsteer2_qwen_embedding_mlp_scaling_task_done $(date)"
+echo "helpsteer2_qwen_embedding_mlp_scaling_scratch_task_done $(date)"

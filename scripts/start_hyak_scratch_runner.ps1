@@ -34,6 +34,7 @@ if [ ! -d "$RUN_REPO/.git" ]; then
   git clone --depth 1 --branch __BRANCH__ https://github.com/Wanglei123SJTU/FT-PPI.git "$RUN_REPO"
 else
   cd "$RUN_REPO"
+  git reset --hard HEAD
   if git status --porcelain --untracked-files=all -- Data/wine_data.csv 2>/dev/null | grep -q '^?? '; then
     rm -f Data/wine_data.csv
     echo "removed untracked Data/wine_data.csv before checkout"
@@ -97,11 +98,17 @@ Write-Host "Enter UW password and complete Duo if prompted."
 Write-Host "After login, this will clone/update the scratch repo and tail the detached runner."
 Write-Host ""
 
+$EncodedRemoteScript = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($RemoteScript))
+$RemoteCommand = "printf '%s' '$EncodedRemoteScript' | base64 -d | bash"
+$SshExe = Join-Path $env:SystemRoot "System32\OpenSSH\ssh.exe"
+if (-not (Test-Path $SshExe)) {
+  $SshExe = "ssh"
+}
+
 $PreviousErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
-  $RemoteScript |
-    ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target "bash -s" 2>&1 |
+  & $SshExe -n -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target $RemoteCommand 2>&1 |
     ForEach-Object { $_.ToString() } |
     Tee-Object -FilePath $LogPath -Append
   $ExitCode = $LASTEXITCODE

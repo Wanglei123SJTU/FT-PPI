@@ -3,7 +3,8 @@ set -euo pipefail
 
 echo "helpsteer2_preference_ols_screen_task_start $(date)"
 
-cd ~/FT-PPI
+REPO_DIR="${HYAK_RUNNER_REPO_DIR:-$PWD}"
+cd "$REPO_DIR"
 git status --short --branch
 
 PYTHON_BIN=".venv-hyak/bin/python"
