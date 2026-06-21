@@ -17,7 +17,9 @@ from src.experiments.upworthy_question_scaling_law import (
     feature_cols_from_config,
     ifvarq_loss_from_residuals,
     load_upworthy_pairs,
+    method_specs,
     outcome_scale_from_h_scale,
+    partition_ids_for_scaling_roles,
     surrogate_feature_cols_from_config,
     target_feature_index,
     task_index_to_cell,
@@ -123,6 +125,20 @@ def test_load_upworthy_pairs_can_build_eb_logit_outcome():
     assert np.allclose(df["y_logit_ctr_diff_eb_tau1000"].to_numpy(dtype=float), expected)
 
 
+def test_load_upworthy_pairs_can_winsorize_runtime_outcome():
+    path = Path(".pytest_tmp/upworthy_question_scaling_toy_winsor.csv")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = _toy_frame().drop(columns=["sample_id"])
+    raw.loc[0, "y_logit_ctr_diff"] = 100.0
+    raw.to_csv(path, index=False)
+    df = load_upworthy_pairs(path, {"outcome_winsorize_quantiles": [0.1, 0.9]})
+    expected = np.clip(
+        raw["y_logit_ctr_diff"].to_numpy(dtype=float),
+        *np.quantile(raw["y_logit_ctr_diff"].to_numpy(dtype=float), [0.1, 0.9]),
+    )
+    assert np.allclose(df[Y_COL].to_numpy(dtype=float), expected)
+
+
 def test_scaling_split_is_disjoint_and_nested():
     df = _toy_frame()
     split = build_scaling_split(df, _config(), replication_id=0)
@@ -130,6 +146,44 @@ def test_scaling_split_is_disjoint_and_nested():
     assert len(set(split.train_pool_ids) & set(split.v_scale_ids)) == 0
     assert set(train_ids_for_s(split, 2)).issubset(set(train_ids_for_s(split, 4)))
     assert set(train_ids_for_s(split, 4)).issubset(set(train_ids_for_s(split, 8)))
+
+
+def test_scaling_split_can_use_target_as_validation_scale():
+    df = _toy_frame(n_h=12, n_t=10)
+    config = {
+        **_config(),
+        "validation_scale_source": "target",
+        "validation_scale_size": "all",
+    }
+    split = build_scaling_split(df, config, replication_id=0)
+    population = build_population_split(df)
+    assert set(split.v_scale_ids) == set(population.p_target_ids)
+    assert len(split.v_stop_ids) == config["validation_stop_size"]
+    assert len(split.train_pool_ids) == config["train_pool_size"]
+    assert len(set(split.train_pool_ids) & set(split.v_stop_ids)) == 0
+
+
+def test_partition_ids_for_scaling_roles_keeps_groups_together():
+    df = pd.DataFrame(
+        {
+            ID_COL: np.arange(8, dtype=np.int64),
+            "test_id": [1, 1, 2, 2, 3, 3, 4, 4],
+        }
+    )
+    parts = partition_ids_for_scaling_roles(
+        df,
+        source_ids=df[ID_COL].to_numpy(dtype=np.int64),
+        requested_sizes=[2, 2, 4],
+        rng=np.random.default_rng(0),
+        group_col="test_id",
+    )
+    id_to_role = {}
+    for role, ids in enumerate(parts):
+        for sample_id in ids:
+            id_to_role[int(sample_id)] = role
+    for _, group in df.groupby("test_id"):
+        roles = {id_to_role[int(sample_id)] for sample_id in group[ID_COL]}
+        assert len(roles) == 1
 
 
 def test_inference_setup_uses_target_hessian_and_question_weight():
@@ -240,6 +294,20 @@ def test_warmup_loss_uses_mse_before_ifvarq():
     )
     assert np.isclose(training_loss_from_residuals(residual, weight, method, epoch=1), np.mean(residual**2))
     assert np.isclose(training_loss_from_residuals(residual, weight, method, epoch=3), ifvarq_loss_from_residuals(residual, weight))
+
+
+def test_method_specs_can_parse_gradient_accumulation_steps():
+    config = {
+        "methods": [
+            {
+                "name": "mse_accum",
+                "loss": "mse",
+                "early_stopping_metric": "mse",
+                "gradient_accumulation_steps": 4,
+            }
+        ]
+    }
+    assert method_specs(config)[0].gradient_accumulation_steps == 4
 
 
 def test_weighted_mse_loss_uses_sample_weights():

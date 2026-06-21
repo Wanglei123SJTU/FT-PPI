@@ -67,6 +67,7 @@ class MethodSpec:
     lora_lr: float | None = None
     head_lr: float | None = None
     batch_size: int | None = None
+    gradient_accumulation_steps: int | None = None
     max_epochs: int | None = None
     min_epochs: int | None = None
     early_stopping_patience: int | None = None
@@ -184,6 +185,20 @@ def compute_transformed_outcome(df: pd.DataFrame, transform: str, config: dict[s
     raise ValueError(f"unsupported outcome_transform {transform!r}")
 
 
+def winsorize_values(values: np.ndarray, quantiles: Any) -> np.ndarray:
+    if quantiles in (None, "", False):
+        return np.asarray(values, dtype=float)
+    if not isinstance(quantiles, (list, tuple)) or len(quantiles) != 2:
+        raise ValueError("outcome_winsorize_quantiles must be a two-element list like [0.01, 0.99]")
+    lower = float(quantiles[0])
+    upper = float(quantiles[1])
+    if not (0.0 <= lower < upper <= 1.0):
+        raise ValueError("outcome_winsorize_quantiles must satisfy 0 <= lower < upper <= 1")
+    y = np.asarray(values, dtype=float)
+    lo, hi = np.quantile(y, [lower, upper])
+    return np.clip(y, lo, hi).astype(float)
+
+
 def load_upworthy_pairs(input_csv: str | Path, config: dict[str, Any] | None = None) -> pd.DataFrame:
     df = pd.read_csv(input_csv)
     outcome_col = outcome_col_from_config(config)
@@ -202,6 +217,8 @@ def load_upworthy_pairs(input_csv: str | Path, config: dict[str, Any] | None = N
     out = apply_row_filters(df.copy(), config)
     if outcome_transform not in {"", "none"}:
         out[outcome_col] = compute_transformed_outcome(out, outcome_transform, config)
+    if config is not None and config.get("outcome_winsorize_quantiles") not in (None, "", False):
+        out[outcome_col] = winsorize_values(out[outcome_col].to_numpy(dtype=float), config["outcome_winsorize_quantiles"])
     if ID_COL not in out.columns:
         if "pair_id" in out.columns:
             out.insert(0, ID_COL, out["pair_id"].astype(np.int64))
@@ -225,9 +242,10 @@ def feature_cols_from_config(config: dict[str, Any] | None = None) -> list[str]:
     cols = [str(col) for col in config["feature_columns"]]
     if not cols:
         raise ValueError("feature_columns must contain at least one feature")
-    unknown = sorted(set(cols) - set(KNOWN_FEATURE_COLS))
-    if unknown:
-        raise ValueError(f"feature_columns must be drawn from known Upworthy feature columns, got unknown {unknown}")
+    if not bool(config.get("allow_unknown_feature_columns", False)):
+        unknown = sorted(set(cols) - set(KNOWN_FEATURE_COLS))
+        if unknown:
+            raise ValueError(f"feature_columns must be drawn from known Upworthy feature columns, got unknown {unknown}")
     if len(cols) != len(set(cols)):
         raise ValueError(f"feature_columns contains duplicates: {cols}")
     return cols
@@ -242,9 +260,10 @@ def surrogate_feature_cols_from_config(config: dict[str, Any] | None = None) -> 
             return []
         raise ValueError("surrogate_feature_columns must be a list of feature names or [] for text-only")
     cols = [str(col) for col in raw]
-    unknown = sorted(set(cols) - set(KNOWN_FEATURE_COLS))
-    if unknown:
-        raise ValueError(f"surrogate_feature_columns must be drawn from known Upworthy feature columns, got unknown {unknown}")
+    if not bool(config.get("allow_unknown_feature_columns", False)):
+        unknown = sorted(set(cols) - set(KNOWN_FEATURE_COLS))
+        if unknown:
+            raise ValueError(f"surrogate_feature_columns must be drawn from known Upworthy feature columns, got unknown {unknown}")
     if len(cols) != len(set(cols)):
         raise ValueError(f"surrogate_feature_columns contains duplicates: {cols}")
     return cols
@@ -313,6 +332,9 @@ def method_specs(config: dict[str, Any]) -> list[MethodSpec]:
                 lora_lr=None if item.get("lora_lr") in (None, "") else float(item["lora_lr"]),
                 head_lr=None if item.get("head_lr") in (None, "") else float(item["head_lr"]),
                 batch_size=None if item.get("batch_size") in (None, "") else int(item["batch_size"]),
+                gradient_accumulation_steps=None
+                if item.get("gradient_accumulation_steps") in (None, "")
+                else int(item["gradient_accumulation_steps"]),
                 max_epochs=None if item.get("max_epochs") in (None, "") else int(item["max_epochs"]),
                 min_epochs=None if item.get("min_epochs") in (None, "") else int(item["min_epochs"]),
                 early_stopping_patience=None
@@ -359,6 +381,56 @@ def _interleave_permuted_groups(groups: list[np.ndarray], cycle: list[int], rng:
             ]
             order.extend(rng.permutation(np.asarray(leftovers, dtype=np.int64)).tolist())
     return np.asarray(order, dtype=np.int64)
+
+
+def partition_ids_for_scaling_roles(
+    df: pd.DataFrame,
+    source_ids: np.ndarray,
+    requested_sizes: list[int],
+    rng: np.random.Generator,
+    group_col: str | None = None,
+) -> list[np.ndarray]:
+    ids = np.asarray(source_ids, dtype=np.int64)
+    if group_col in (None, ""):
+        ordered = rng.permutation(ids)
+        parts = []
+        start = 0
+        for size in requested_sizes:
+            end = start + int(size)
+            parts.append(np.asarray(ordered[start:end], dtype=np.int64))
+            start = end
+        return parts
+
+    group_name = str(group_col)
+    if group_name not in df.columns:
+        raise ValueError(f"scaling_split_group_column={group_name!r} is not in the data")
+    frame = (
+        pd.DataFrame({ID_COL: ids, "_source_order": np.arange(len(ids), dtype=np.int64)})
+        .merge(df[[ID_COL, group_name]], on=ID_COL, how="left", validate="one_to_one")
+        .sort_values("_source_order")
+    )
+    if frame[group_name].isna().any():
+        raise ValueError(f"scaling split group column {group_name!r} has missing values")
+    grouped = [
+        np.asarray(group[ID_COL].to_numpy(dtype=np.int64), dtype=np.int64)
+        for _, group in frame.groupby(group_name, sort=False)
+    ]
+    group_order = rng.permutation(len(grouped))
+    parts: list[list[np.ndarray]] = [[] for _ in requested_sizes]
+    counts = [0 for _ in requested_sizes]
+    part_index = 0
+    for group_index in group_order:
+        while part_index < len(requested_sizes) - 1 and counts[part_index] >= int(requested_sizes[part_index]):
+            part_index += 1
+        group_ids = rng.permutation(grouped[int(group_index)])
+        parts[part_index].append(group_ids)
+        counts[part_index] += len(group_ids)
+        if all(counts[index] >= int(size) for index, size in enumerate(requested_sizes)):
+            break
+    return [
+        np.concatenate(part) if part else np.asarray([], dtype=np.int64)
+        for part in parts
+    ]
 
 
 def build_train_order(
@@ -421,16 +493,44 @@ def build_scaling_split(
     population = build_population_split(df)
     train_pool_size = int(config["train_pool_size"])
     v_stop_size = int(config["validation_stop_size"])
-    v_scale_size = int(config["validation_scale_size"])
-    required = train_pool_size + v_stop_size + v_scale_size
-    if required > len(population.h_scale_ids):
-        raise ValueError(f"need {required} H_scale rows, found {len(population.h_scale_ids)}")
+    validation_scale_source = str(config.get("validation_scale_source", "h_scale")).lower().replace("-", "_")
+    if validation_scale_source not in {"h_scale", "target", "p_target"}:
+        raise ValueError("validation_scale_source must be 'h_scale' or 'target'")
 
     rng = np.random.default_rng(rep_seed(config, replication_id))
-    ordered = rng.permutation(population.h_scale_ids)
-    v_stop_ids = np.asarray(ordered[:v_stop_size], dtype=np.int64)
-    v_scale_ids = np.asarray(ordered[v_stop_size : v_stop_size + v_scale_size], dtype=np.int64)
-    train_pool_ids = np.asarray(ordered[v_stop_size + v_scale_size : required], dtype=np.int64)
+    group_col = config.get("scaling_split_group_column", config.get("split_group_column"))
+    if validation_scale_source == "h_scale":
+        v_scale_size = int(config["validation_scale_size"])
+        required = train_pool_size + v_stop_size + v_scale_size
+        if required > len(population.h_scale_ids):
+            raise ValueError(f"need {required} H_scale rows, found {len(population.h_scale_ids)}")
+        v_stop_ids, v_scale_ids, train_pool_ids = partition_ids_for_scaling_roles(
+            df,
+            population.h_scale_ids,
+            [v_stop_size, v_scale_size, train_pool_size],
+            rng,
+            group_col=group_col,
+        )
+    else:
+        required = train_pool_size + v_stop_size
+        if required > len(population.h_scale_ids):
+            raise ValueError(f"need {required} H_scale rows, found {len(population.h_scale_ids)}")
+        v_stop_ids, train_pool_ids = partition_ids_for_scaling_roles(
+            df,
+            population.h_scale_ids,
+            [v_stop_size, train_pool_size],
+            rng,
+            group_col=group_col,
+        )
+        raw_v_scale_size = config.get("validation_scale_size", "all")
+        target_order = rng.permutation(population.p_target_ids)
+        if raw_v_scale_size in (None, "", "all", "target", "full"):
+            v_scale_ids = np.asarray(target_order, dtype=np.int64)
+        else:
+            v_scale_size = int(raw_v_scale_size)
+            if v_scale_size > len(population.p_target_ids):
+                raise ValueError(f"need {v_scale_size} target rows for validation_scale, found {len(population.p_target_ids)}")
+            v_scale_ids = np.asarray(target_order[:v_scale_size], dtype=np.int64)
     train_order_ids = build_train_order(df, train_pool_ids, rng, sampling_strategy, target_feature=target_feature)
     split = ScalingSplit(
         train_pool_ids=train_pool_ids,
@@ -971,6 +1071,13 @@ def train_once(
         else config.get("early_stopping_patience", 3)
     )
     min_delta = float(config.get("early_stopping_min_delta", 0.0))
+    gradient_accumulation_steps = int(
+        method.gradient_accumulation_steps
+        if method.gradient_accumulation_steps is not None
+        else config.get("gradient_accumulation_steps", 1)
+    )
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
     best_state: dict[str, Any] | None = None
     best_value = float("inf")
     best_epoch = 0
@@ -984,19 +1091,22 @@ def train_once(
     for epoch in range(1, max_epochs + 1):
         model.train()
         epoch_losses = []
-        for batch in train_loader:
+        optimizer.zero_grad(set_to_none=True)
+        for batch_index, batch in enumerate(train_loader, start=1):
             inputs = _move_batch(batch, device)
             labels = inputs.pop("labels")
             influence_weight = inputs.pop("influence_weight")
             estimation_weight = inputs.pop("estimation_weight")
-            optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 pred = model(**inputs)
             residual = labels.float() - pred.float()
             loss = training_loss_from_residuals(residual, influence_weight.float(), method, epoch, estimation_weight.float())
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["max_grad_norm"]))
-            optimizer.step()
+            (loss / gradient_accumulation_steps).backward()
+            should_step = batch_index % gradient_accumulation_steps == 0 or batch_index == len(train_loader)
+            if should_step:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["max_grad_norm"]))
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             value = float(loss.detach().cpu())
             losses.append(value)
             epoch_losses.append(value)
@@ -1051,6 +1161,8 @@ def train_once(
     runtime = {
         "runtime_seconds": time.time() - start,
         "actual_batch_size": int(batch_size),
+        "gradient_accumulation_steps": int(gradient_accumulation_steps),
+        "effective_batch_size": int(batch_size * gradient_accumulation_steps),
         "requested_batch_size": int(method.batch_size if method.batch_size is not None else config["batch_size"]),
         "oom_fallback_used": bool(batch_size != int(method.batch_size if method.batch_size is not None else config["batch_size"])),
         "train_backbone": bool(method.train_backbone),
@@ -1068,6 +1180,7 @@ def train_once(
         "best_epoch": int(best_epoch),
         "early_stopped": bool(early_stopped),
         "steps_per_epoch": int(steps_per_epoch_for_s(len(train_df), batch_size)),
+        "optimizer_steps_per_epoch": int(math.ceil(steps_per_epoch_for_s(len(train_df), batch_size) / gradient_accumulation_steps)),
         "total_train_steps": int(total_steps),
         "best_validation_stop_metric_value": float(best_value),
         "final_train_loss": float(losses[-1]) if losses else float("nan"),
@@ -1191,11 +1304,14 @@ def write_cell_manifest(
         "lora_lr": method.lora_lr,
         "head_lr": method.head_lr,
         "batch_size": method.batch_size,
+        "gradient_accumulation_steps": method.gradient_accumulation_steps,
         "max_epochs": method.max_epochs,
         "min_epochs": method.min_epochs,
         "early_stopping_patience": method.early_stopping_patience,
         "replication_id": int(replication_id),
         "s_train": int(s_train),
+        "validation_scale_source": str(config.get("validation_scale_source", "h_scale")).lower(),
+        "scaling_split_group_column": config.get("scaling_split_group_column", config.get("split_group_column")),
         "target_feature": str(config.get("target_feature", TARGET_FEATURE)),
         "feature_columns": feature_cols,
         "surrogate_feature_columns": surrogate_feature_cols,
@@ -1331,6 +1447,7 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
             "lora_lr": method.lora_lr,
             "head_lr": method.head_lr,
             "batch_size": method.batch_size,
+            "gradient_accumulation_steps": method.gradient_accumulation_steps,
             "max_epochs": method.max_epochs,
             "min_epochs": method.min_epochs,
             "early_stopping_patience": method.early_stopping_patience,
@@ -1342,7 +1459,10 @@ def train_cell(config: dict[str, Any], method_name: str, replication_id: int, s_
         "outcome_column": outcome_col_from_config(config),
         "outcome_transform": outcome_transform_from_config(config),
         "ctr_shrinkage_tau": config.get("ctr_shrinkage_tau"),
+        "outcome_winsorize_quantiles": config.get("outcome_winsorize_quantiles"),
         "estimation_weight_scheme": estimation_weight_scheme_from_config(config),
+        "validation_scale_source": str(config.get("validation_scale_source", "h_scale")).lower(),
+        "scaling_split_group_column": config.get("scaling_split_group_column", config.get("split_group_column")),
         "pooling_strategy": str(config.get("pooling_strategy", "last")).lower(),
         "target_feature": target_feature,
         "feature_columns": feature_cols,
@@ -1410,6 +1530,14 @@ def load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
             "train_backbone": bool(method_config.get("train_backbone", runtime.get("train_backbone", True))),
             "lora_lr": runtime.get("lora_lr", method_config.get("lora_lr")),
             "head_lr": runtime.get("head_lr", method_config.get("head_lr")),
+            "gradient_accumulation_steps": int(
+                runtime.get(
+                    "gradient_accumulation_steps",
+                    method_config.get("gradient_accumulation_steps", config.get("gradient_accumulation_steps", 1)),
+                )
+                or 1
+            ),
+            "effective_batch_size": int(runtime.get("effective_batch_size", runtime.get("actual_batch_size", config.get("batch_size", 1)))),
             "replication_id": int(metrics["replication_id"]),
             "s_train": int(metrics["s_train"]),
             "h_scale_size": int(metrics["h_scale_size"]),
@@ -1417,7 +1545,10 @@ def load_cell_metrics(config: dict[str, Any]) -> pd.DataFrame:
             "outcome_column": str(metrics.get("outcome_column", config.get("outcome_column", Y_COL))),
             "outcome_transform": str(metrics.get("outcome_transform", config.get("outcome_transform", ""))),
             "ctr_shrinkage_tau": metrics.get("ctr_shrinkage_tau", config.get("ctr_shrinkage_tau")),
+            "outcome_winsorize_quantiles": str(metrics.get("outcome_winsorize_quantiles", config.get("outcome_winsorize_quantiles", ""))),
             "estimation_weight_scheme": str(metrics.get("estimation_weight_scheme", config.get("estimation_weight_scheme", "none"))),
+            "validation_scale_source": str(metrics.get("validation_scale_source", config.get("validation_scale_source", "h_scale"))),
+            "scaling_split_group_column": str(metrics.get("scaling_split_group_column", config.get("scaling_split_group_column", config.get("split_group_column", "")))),
             "pooling_strategy": str(metrics.get("pooling_strategy", config.get("pooling_strategy", "last"))),
             "target_feature": str(metrics.get("target_feature", config.get("target_feature", TARGET_FEATURE))),
             "feature_columns": ",".join(str(x) for x in feature_columns),
@@ -1476,7 +1607,10 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
                 "outcome_column",
                 "outcome_transform",
                 "ctr_shrinkage_tau",
+                "outcome_winsorize_quantiles",
                 "estimation_weight_scheme",
+                "validation_scale_source",
+                "scaling_split_group_column",
                 "pooling_strategy",
                 "target_feature",
                 "feature_columns",
@@ -1494,8 +1628,12 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
         .agg(
             n_replications=("replication_id", "nunique"),
             mean_ifvarq_raw=("validation_scale_ifvarq_raw", "mean"),
+            median_ifvarq_raw=("validation_scale_ifvarq_raw", "median"),
+            q25_ifvarq_raw=("validation_scale_ifvarq_raw", lambda x: float(np.quantile(x, 0.25))),
+            q75_ifvarq_raw=("validation_scale_ifvarq_raw", lambda x: float(np.quantile(x, 0.75))),
             sd_ifvarq_raw=("validation_scale_ifvarq_raw", "std"),
             mean_ifvarq_scaled=("validation_scale_ifvarq_scaled", "mean"),
+            median_ifvarq_scaled=("validation_scale_ifvarq_scaled", "median"),
             mean_mse_scaled=("validation_scale_mse_scaled", "mean"),
             mean_rmse_scaled=("validation_scale_rmse_scaled", "mean"),
             mean_corr=("validation_scale_corr", "mean"),
@@ -1513,14 +1651,18 @@ def aggregate_scaling(config: dict[str, Any]) -> dict[str, Path]:
             if_weight_clip=("if_weight_clip", "first"),
             lora_lr=("lora_lr", "first"),
             head_lr=("head_lr", "first"),
+            gradient_accumulation_steps=("gradient_accumulation_steps", "first"),
+            effective_batch_size=("effective_batch_size", "first"),
         )
         .sort_values(["method", "s_train"])
         .reset_index(drop=True)
     )
     by_s["se_ifvarq_raw"] = by_s["sd_ifvarq_raw"] / np.sqrt(by_s["n_replications"])
     by_s["ratio_to_constant_ifvarq"] = by_s["mean_ifvarq_raw"] / by_s["constant_ifvarq_raw"]
+    by_s["median_ratio_to_constant_ifvarq"] = by_s["median_ifvarq_raw"] / by_s["constant_ifvarq_raw"]
     by_s["drop_from_constant_pct"] = 100.0 * (1.0 - by_s["ratio_to_constant_ifvarq"])
     by_s["ratio_to_direct_ols_ifvarq"] = by_s["mean_ifvarq_raw"] / by_s["direct_ols_ifvar_target_raw"]
+    by_s["median_ratio_to_direct_ols_ifvarq"] = by_s["median_ifvarq_raw"] / by_s["direct_ols_ifvar_target_raw"]
     by_s["drop_from_direct_ols_ifvarq_pct"] = 100.0 * (1.0 - by_s["ratio_to_direct_ols_ifvarq"])
     by_s.to_csv(output_dir / "scaling_by_s_summary.csv", index=False)
 
@@ -1605,7 +1747,10 @@ def describe_data(config: dict[str, Any]) -> dict[str, Any]:
         "outcome_column": outcome_col_from_config(config),
         "outcome_transform": outcome_transform_from_config(config),
         "ctr_shrinkage_tau": config.get("ctr_shrinkage_tau"),
+        "outcome_winsorize_quantiles": config.get("outcome_winsorize_quantiles"),
         "estimation_weight_scheme": estimation_weight_scheme_from_config(config),
+        "validation_scale_source": str(config.get("validation_scale_source", "h_scale")).lower(),
+        "scaling_split_group_column": config.get("scaling_split_group_column", config.get("split_group_column")),
         "pooling_strategy": str(config.get("pooling_strategy", "last")).lower(),
         "outcome_scale": {"mean": y_scale.mean, "sd": y_scale.sd},
         "question_beta_raw": inference["question_beta_raw"],
