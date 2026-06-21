@@ -1,0 +1,74 @@
+input_csv: Data/upworthy_pairs_with_text_features_v2.csv.gz
+output_dir: /gscratch/scrubbed/lei0603/ft-ppi/artifacts/upworthy_question_vader_clean_diagnostic_v2_1p5b
+seed: 20260627
+
+outcome_column: y_logit_ctr_diff_eb_tau1000_winsor01_runtime
+outcome_transform: logit_ctr_diff_eb
+ctr_shrinkage_tau: 1000
+outcome_winsorize_quantiles: [0.01, 0.99]
+min_total_impressions: 5000
+
+target_feature: delta_QUESTION
+feature_columns: [delta_QUESTION, delta_VADER_COMPOUND]
+surrogate_feature_columns: []
+allow_unknown_feature_columns: false
+hessian_ridge: 1.0e-4
+
+train_pool_size: 3500
+validation_stop_size: 2500
+validation_scale_source: target
+validation_scale_size: all
+scaling_split_group_column: test_id
+s_grid: [100, 150, 200, 300, 500, 800, 1200, 1600]
+replication_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+diagnostic_budgets: [500, 1000, 1500, 2000, 3000, 5000]
+
+methods:
+  - name: mse_stop_mse_uniform
+    loss: mse
+    early_stopping_metric: mse
+    sampling_strategy: uniform
+
+  - name: mse_stop_ifvarq_uniform
+    loss: mse
+    early_stopping_metric: ifvarq
+    sampling_strategy: uniform
+
+  - name: mse_stop_mse_target_if_weight_balanced
+    loss: mse
+    early_stopping_metric: mse
+    sampling_strategy: target_if_weight_balanced
+
+  - name: ifvarq_warm3_target_if_weight_balanced_clip4
+    loss: ifvarq
+    warmup_loss: mse
+    warmup_epochs: 3
+    early_stopping_metric: ifvarq
+    sampling_strategy: target_if_weight_balanced
+    if_weight_clip: 4.0
+
+model_name: Qwen/Qwen2.5-1.5B-Instruct
+max_length: 80
+pooling_strategy: mean
+target_modules: all-linear
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_lr: 2.0e-4
+head_lr: 5.0e-4
+head_hidden_size: 128
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+batch_size: 64
+gradient_accumulation_steps: 4
+oom_fallback_batch_sizes: [32, 16]
+prediction_batch_size: 64
+log_every_epochs: 1
+max_epochs: 16
+min_epochs: 4
+early_stopping_patience: 4
+early_stopping_min_delta: 0.0
+common_train_seed_within_rep: true
+gradient_checkpointing: true
+save_predictions: false
