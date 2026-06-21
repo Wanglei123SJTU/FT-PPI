@@ -80,7 +80,7 @@ PY
     fi
     echo "GPU_ARGS=$GPU_ARGS"
 
-    SAFE_NAME="$(basename "$CONFIG" .yaml | tr -cd 'A-Za-z0-9_-.')"
+    SAFE_NAME="$(basename "$CONFIG" .yaml | tr -cd 'A-Za-z0-9_.-')"
     PINNED_SBATCH="$SCRATCH_LOG_DIR/upworthy-clean-${SAFE_NAME}-${HYAK_RUNNER_TASK_ID:-manual}-$(date +%Y%m%d_%H%M%S).sbatch"
     {
       echo "#!/bin/bash"
