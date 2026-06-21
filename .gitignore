@@ -3,13 +3,26 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest_tmp/
+.pytest_tmp_run/
 .mypy_cache/
 .ruff_cache/
+.codex-alt-index
+.codex-objects/
 
 # Runtime outputs and local smoke artifacts
 artifacts/
 logs/
 .hyak_runner/
+
+# Downloaded public datasets generated locally
+Data/helpsteer2_preference*.csv
+Data/helpsteer2_preference*.json
+Data/helpsteer2_preference*.jsonl
+Data/helpsteer2_preference*.jsonl.gz
+
+# Local reference papers and working drafts
+docs/references/*.pdf
+docs/drafts/*.docx
 
 # LaTeX build products
 *.aux

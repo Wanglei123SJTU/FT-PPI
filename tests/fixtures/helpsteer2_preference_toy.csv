@@ -1,0 +1,9 @@
+split,prompt,response_1,response_2,preference_strength
+train,Explain retention tactics,Keep customers with offers,1. Segment customers 2. Offer loyalty rewards,2
+train,Explain retention tactics,1. Segment customers 2. Offer loyalty rewards,Keep customers with offers,-2
+train,Explain churn prevention,Use reminders,Use reminders and proactive outreach,1
+train,Explain churn prevention,Use reminders and proactive outreach,Use reminders,-1
+validation,Explain onboarding,Send setup email,- Send setup email - Track activation,1
+validation,Explain onboarding,- Send setup email - Track activation,Send setup email,-1
+validation,Explain pricing,Offer discount for annual plans,Offer discount,0
+validation,Explain pricing,Offer discount,Offer discount for annual plans,0
