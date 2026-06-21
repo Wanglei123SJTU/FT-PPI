@@ -48,9 +48,11 @@ fi
 echo "VENV_DIR=$VENV_DIR"
 echo "VENV_REAL=$VENV_REAL"
 echo "python=$(command -v python)"
-python --version
+PYTHON_BIN="$VENV_REAL/bin/python"
+echo "PYTHON_BIN=$PYTHON_BIN"
+"$PYTHON_BIN" --version
 
-python - <<'PY'
+"$PYTHON_BIN" - <<'PY'
 import torch
 print("torch", torch.__version__)
 print("cuda_available", torch.cuda.is_available())
@@ -72,7 +74,7 @@ MAX_EPOCHS="${MAX_EPOCHS:-8}"
 PATIENCE="${PATIENCE:-2}"
 
 echo "helpsteer2_lora_cell_start task_index=${TASK_INDEX} output_dir=${OUTPUT_DIR}"
-python -m src.experiments.helpsteer2_lora_scaling \
+"$PYTHON_BIN" -m src.experiments.helpsteer2_lora_scaling \
   --input-csv "$INPUT_CSV" \
   --output-dir "$OUTPUT_DIR" \
   --features "$FEATURES" \
