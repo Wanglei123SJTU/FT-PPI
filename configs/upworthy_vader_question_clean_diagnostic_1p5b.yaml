@@ -11,7 +11,7 @@ min_total_impressions: 5000
 target_feature: delta_VADER_COMPOUND
 feature_columns: [delta_VADER_COMPOUND, delta_QUESTION]
 surrogate_feature_columns: []
-allow_unknown_feature_columns: true
+allow_unknown_feature_columns: false
 hessian_ridge: 1.0e-4
 
 train_pool_size: 3500
