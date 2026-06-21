@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-echo "helpsteer2_qwen_embedding_mlp_scaling_scratch_retry_task_start $(date)"
+echo "helpsteer2_qwen_embedding_mlp_scaling_python_retry_task_start $(date)"
 
 REPO_DIR="${HYAK_RUNNER_REPO_DIR:-$PWD}"
 cd "$REPO_DIR"
@@ -116,4 +116,4 @@ cat "$MLP_OUT/budget_comparison.csv"
 echo "mlp_scaling_report"
 sed -n '1,220p' "$MLP_OUT/mlp_scaling_report.md"
 
-echo "helpsteer2_qwen_embedding_mlp_scaling_scratch_retry_task_done $(date)"
+echo "helpsteer2_qwen_embedding_mlp_scaling_python_retry_task_done $(date)"
