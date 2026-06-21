@@ -33,13 +33,20 @@ choose_venv_dir() {
 }
 
 VENV_DIR="$(choose_venv_dir)"
+mkdir -p "$(dirname "$VENV_DIR")"
+LOCK_FILE="$(dirname "$VENV_DIR")/setup_hyak_env.lock"
+exec 9>"$LOCK_FILE"
+if command -v flock >/dev/null 2>&1; then
+  echo "Acquiring setup lock: $LOCK_FILE"
+  flock 9
+fi
+
 if [ "$VENV_DIR" != ".venv-hyak" ]; then
   if [ -e ".venv-hyak" ] && [ ! -L ".venv-hyak" ]; then
     mv ".venv-hyak" ".venv-hyak.home.old.$(date +%Y%m%d_%H%M%S)"
   fi
   ln -sfn "$VENV_DIR" ".venv-hyak"
 fi
-mkdir -p "$(dirname "$VENV_DIR")"
 echo "VENV_DIR=$VENV_DIR"
 
 CACHE_ROOT="${HYAK_CACHE_DIR:-$(dirname "$VENV_DIR")/cache}"
@@ -106,7 +113,6 @@ PY
 }
 
 if [ "${FORCE_INSTALL:-0}" != "1" ] && check_env; then
-  python -m pytest tests -q
   echo "Hyak environment ready at: $VENV_DIR"
   exit 0
 fi
@@ -116,8 +122,6 @@ python -m pip cache purge || true
 python -m pip install --no-cache-dir -r requirements.txt
 python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu124 "torch==2.5.1+cu124"
 python -m pip install --no-cache-dir --no-deps accelerate==1.2.1 peft==0.14.0 bitsandbytes==0.45.1
-
-python -m pytest tests -q
 
 check_env
 
