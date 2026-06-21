@@ -18,6 +18,21 @@ if [ ! -x .venv-hyak/bin/python ]; then
   bash scripts/setup_hyak_env.sh
 fi
 
+if ! .venv-hyak/bin/python - <<'PY'
+import importlib.util
+import sys
+
+mods = ["torch", "transformers", "datasets", "accelerate", "peft", "bitsandbytes"]
+missing = [mod for mod in mods if importlib.util.find_spec(mod) is None]
+if missing:
+    print("missing_gpu_deps=" + ",".join(missing))
+    sys.exit(1)
+PY
+then
+  echo "repairing incomplete Hyak Python environment"
+  FORCE_INSTALL=1 bash scripts/setup_hyak_env.sh
+fi
+
 VENV_DIR="${HYAK_VENV_DIR:-.venv-hyak}"
 VENV_REAL="$(readlink -f "$VENV_DIR" 2>/dev/null || echo "$VENV_DIR")"
 CACHE_ROOT="${HYAK_CACHE_DIR:-$(dirname "$VENV_REAL")/cache}"
