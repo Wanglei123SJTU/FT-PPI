@@ -54,17 +54,18 @@ tail -n 0 -F .hyak_runner/runner.out
 Write-Host "Target: $Target"
 Write-Host "Remote scratch repo: /gscratch/scrubbed/`$USER/ft-ppi/FT-PPI-runner"
 Write-Host "Local log: $LogPath"
-Write-Host ""
-Write-Host "Enter UW password and complete Duo if prompted."
-Write-Host "This status window will not restart the runner or submit jobs."
-Write-Host ""
 
 $EncodedRemoteScript = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($RemoteScript))
 $RemoteCommand = "printf '%s' '$EncodedRemoteScript' | base64 -d | bash"
 $SshExe = Join-Path $env:SystemRoot "System32\OpenSSH\ssh.exe"
 if (-not (Test-Path $SshExe)) {
-  $SshExe = "ssh"
+  throw "Windows OpenSSH not found at $SshExe. Refusing to use PATH ssh because Codex sandbox can shadow it."
 }
+Write-Host "SSH executable: $SshExe"
+Write-Host ""
+Write-Host "Enter UW password and complete Duo if prompted."
+Write-Host "This status window will not restart the runner or submit jobs."
+Write-Host ""
 
 $PreviousErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"

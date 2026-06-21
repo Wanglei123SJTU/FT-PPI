@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from src.experiments.helpsteer2_preference_regression import Y_COL
+from src.formatting import dataframe_to_markdown
 
 
 DEFAULT_FEATURES = ["delta_log_length", "delta_prompt_coverage", "delta_format"]
@@ -428,11 +429,11 @@ def write_report(
         "",
         "## Best IFVar Settings",
         "",
-        best.to_markdown(index=False, floatfmt=".4f") if not best.empty else "(no trained models)",
+        dataframe_to_markdown(best, index=False, floatfmt=".4f") if not best.empty else "(no trained models)",
         "",
         "## Direct-Regression Budget Comparison",
         "",
-        budget_best.to_markdown(index=False, floatfmt=".4f") if not budget_best.empty else "(no budget rows)",
+        dataframe_to_markdown(budget_best, index=False, floatfmt=".4f") if not budget_best.empty else "(no budget rows)",
         "",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")

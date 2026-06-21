@@ -61,7 +61,7 @@ $EncodedRemoteScript = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.Ge
 $RemoteCommand = "printf '%s' '$EncodedRemoteScript' | base64 -d | bash"
 $SshExe = Join-Path $env:SystemRoot "System32\OpenSSH\ssh.exe"
 if (-not (Test-Path $SshExe)) {
-  $SshExe = "ssh"
+  throw "Windows OpenSSH not found at $SshExe. Refusing to use PATH ssh because Codex sandbox can shadow it."
 }
 
 $PreviousErrorActionPreference = $ErrorActionPreference

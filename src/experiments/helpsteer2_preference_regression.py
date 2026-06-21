@@ -10,6 +10,8 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from src.formatting import dataframe_to_markdown
+
 
 Y_COL = "y_preference_strength"
 DEFAULT_FEATURES = ["delta_log_length", "delta_prompt_coverage", "delta_format"]
@@ -254,7 +256,7 @@ def write_report(
         "",
         "## Controlled Coefficients",
         "",
-        controlled[
+        dataframe_to_markdown(controlled[
             [
                 "target",
                 "beta",
@@ -264,15 +266,15 @@ def write_report(
                 "nonzero_share",
                 "hessian_condition",
             ]
-        ].to_markdown(index=False, floatfmt=".4f"),
+        ], index=False, floatfmt=".4f"),
         "",
         "## Direct Label-Only CI Proxy",
         "",
-        budget_focus[["target", "budget", "ci95_length_proxy"]].to_markdown(index=False, floatfmt=".4f"),
+        dataframe_to_markdown(budget_focus[["target", "budget", "ci95_length_proxy"]], index=False, floatfmt=".4f"),
         "",
         "## Ranked Targets",
         "",
-        ranked[
+        dataframe_to_markdown(ranked[
             [
                 "target",
                 "stable",
@@ -282,7 +284,7 @@ def write_report(
                 "nonzero_share",
                 "management_note",
             ]
-        ].to_markdown(index=False, floatfmt=".4f")
+        ], index=False, floatfmt=".4f")
         if not ranked.empty
         else "(no controlled target rows)",
         "",

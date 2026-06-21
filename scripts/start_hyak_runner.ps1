@@ -31,7 +31,7 @@ if ($UseDetached) {
 }
 $SshExe = Join-Path $env:SystemRoot "System32\OpenSSH\ssh.exe"
 if (-not (Test-Path $SshExe)) {
-  $SshExe = "ssh"
+  throw "Windows OpenSSH not found at $SshExe. Refusing to use PATH ssh because Codex sandbox can shadow it."
 }
 
 Write-Host "Target: $Target"
@@ -40,6 +40,7 @@ Write-Host "Branch: $Branch"
 Write-Host "Poll seconds: $PollSeconds"
 Write-Host "Mode: $(if ($UseDetached) { 'detached remote runner with local tail' } else { 'foreground SSH runner' })"
 Write-Host "Local log: $LogPath"
+Write-Host "SSH executable: $SshExe"
 Write-Host ""
 Write-Host "Enter UW password and complete Duo if prompted."
 if ($UseDetached) {
