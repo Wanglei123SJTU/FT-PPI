@@ -3,7 +3,7 @@ set -euo pipefail
 
 echo "helpsteer2_lora_length_two_feature_pilot_task_start $(date)"
 
-cd ~/FT-PPI
+cd "${HYAK_RUNNER_REPO_DIR:-$PWD}"
 git status --short --branch
 
 module purge
