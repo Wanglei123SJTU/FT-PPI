@@ -11,10 +11,10 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-from src.experiments.helpsteer2_preference_regression import Y_COL
 from src.formatting import dataframe_to_markdown
 
 
+Y_COL = "y_preference_strength"
 DEFAULT_FEATURES = ["delta_log_length", "delta_prompt_coverage", "delta_format"]
 DEFAULT_TARGET = "delta_format"
 DEFAULT_S_GRID = [0, 50, 100, 250, 500, 750, 1000, 1500, 3000]

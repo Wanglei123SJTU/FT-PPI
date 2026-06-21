@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import numpy as np
 import pandas as pd
 
@@ -10,36 +8,15 @@ from src.data.prepare_helpsteer2_preference import (
     has_structured_format,
     prompt_coverage,
 )
-from src.experiments.helpsteer2_preference_regression import (
-    build_budget_ci_proxy,
-    build_regression_summary,
-    fit_ols_result,
-)
 from src.experiments.helpsteer2_embedding_extraction import pairwise_difference
 from src.experiments.helpsteer2_embedding_mlp_scaling import antisymmetric_from_scores
-
-
-def _toy_preference_frame(n: int = 80) -> pd.DataFrame:
-    rows = []
-    for i in range(n):
-        prompt = "Explain customer retention strategy with examples"
-        structured = i % 2 == 0
-        if structured:
-            response_1 = "Segment customers by lifecycle, identify churn signals, and offer targeted incentives."
-            response_2 = "- Segment customers by lifecycle\n- Identify churn signals\n- Offer targeted incentives"
-        else:
-            response_1 = "Segment customers by lifecycle, identify churn signals, and offer targeted incentives."
-            response_2 = "Segment customers by lifecycle, identify churn signals, and offer targeted incentives."
-        rows.append(
-            {
-                "split": "train",
-                "prompt": prompt,
-                "response_1": response_1,
-                "response_2": response_2,
-                "preference_strength": 1.5 * structured + 0.8,
-            }
-        )
-    return pd.DataFrame(rows)
+from src.experiments.helpsteer2_lora_scaling import (
+    DEFAULT_METHODS,
+    build_pair_texts,
+    compute_ols_and_if_weights,
+    make_cell_plan,
+    normalize_helpsteer_features,
+)
 
 
 def test_prompt_coverage_uses_prompt_tokens():
@@ -79,35 +56,6 @@ def test_build_helpsteer2_preference_frame_sign_convention():
     assert "response_2 minus response_1" in summary["sign_convention"]
 
 
-def test_fit_ols_result_recovers_toy_format_signal():
-    raw = _toy_preference_frame(n=100)
-    frame, _ = build_helpsteer2_preference_frame(raw)
-    result = fit_ols_result(
-        frame,
-        target="delta_format",
-        feature_columns=["delta_log_length", "delta_prompt_coverage", "delta_format"],
-        model="controlled",
-    )
-    assert result.beta > 0.5
-    assert result.nonzero_share > 0.4
-    assert np.isfinite(result.ifvar)
-    assert result.if_weight_p99 < 50.0
-
-
-def test_regression_summary_and_ci_proxy_include_targets():
-    raw = _toy_preference_frame(n=100)
-    frame, _ = build_helpsteer2_preference_frame(raw)
-    summary = build_regression_summary(frame)
-    controlled = summary.loc[summary["model"] == "controlled"]
-    assert set(controlled["target"]) == {"delta_log_length", "delta_prompt_coverage", "delta_format"}
-    ci = build_budget_ci_proxy(summary, budgets=[500])
-    assert set(ci["budget"]) == {500}
-    row = ci.iloc[0]
-    source = summary.loc[(summary["model"] == row["model"]) & (summary["target"] == row["target"])].iloc[0]
-    expected = 2.0 * 1.96 * math.sqrt(source["ifvar"] / 500)
-    assert math.isclose(row["ci95_length_proxy"], expected)
-
-
 def test_pairwise_difference_is_response2_minus_response1():
     emb_1 = np.array([[1.0, 2.0], [3.0, 1.0]])
     emb_2 = np.array([[4.0, 1.0], [2.0, 5.0]])
@@ -124,3 +72,52 @@ def test_antisymmetric_scores_flip_sign_under_swap():
     yhat_swapped = antisymmetric_from_scores(score_neg_h, score_h)
     assert np.allclose(yhat, np.array([1.0, -3.0, 0.5]))
     assert np.allclose(yhat_swapped, -yhat)
+
+
+def test_lora_pair_texts_include_forward_and_swapped_candidates():
+    raw = pd.DataFrame(
+        [
+            {
+                "prompt": "Explain churn",
+                "response_1": "Short answer.",
+                "response_2": "Detailed answer.",
+            }
+        ]
+    )
+    forward, swapped = build_pair_texts(raw)
+    assert "Candidate A:\nShort answer." in forward[0]
+    assert "Candidate B:\nDetailed answer." in forward[0]
+    assert "Candidate A:\nDetailed answer." in swapped[0]
+    assert "Candidate B:\nShort answer." in swapped[0]
+
+
+def test_two_feature_if_weights_are_finite():
+    raw = pd.DataFrame(
+        {
+            "y_preference_strength": [-1.0, 0.0, 1.0, 2.0],
+            "delta_log_length": [-0.8, -0.2, 0.3, 1.1],
+            "delta_log_sentences": [-0.6, 0.1, 0.4, 0.9],
+        }
+    )
+    frame = normalize_helpsteer_features(raw)
+    beta, hessian, if_weights = compute_ols_and_if_weights(
+        frame,
+        target="delta_log_length_scale",
+        feature_columns=["delta_log_length_scale", "delta_log_sentences_scale"],
+    )
+    assert beta.shape == (3,)
+    assert hessian.shape == (3, 3)
+    assert if_weights.shape == (4,)
+    assert np.isfinite(if_weights).all()
+
+
+def test_lora_cell_plan_counts_targets_methods_s_and_reps():
+    plan = make_cell_plan(
+        targets=["delta_log_length_scale", "delta_log_sentences_scale"],
+        methods=DEFAULT_METHODS[:2],
+        s_grid=[50, 100],
+        replications=3,
+    )
+    assert len(plan) == 2 * 2 * 2 * 3
+    assert plan["task_index"].tolist() == list(range(len(plan)))
+    assert set(plan["method"]) == {"mse_stop_mse", "mse_stop_ifvar"}
