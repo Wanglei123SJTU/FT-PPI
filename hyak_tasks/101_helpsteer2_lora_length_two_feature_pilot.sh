@@ -35,6 +35,7 @@ fi
 
 VENV_DIR="${HYAK_VENV_DIR:-.venv-hyak}"
 VENV_REAL="$(readlink -f "$VENV_DIR" 2>/dev/null || echo "$VENV_DIR")"
+export HYAK_VENV_DIR="$VENV_REAL"
 CACHE_ROOT="${HYAK_CACHE_DIR:-$(dirname "$VENV_REAL")/cache}"
 mkdir -p "$CACHE_ROOT/huggingface" "$CACHE_ROOT/hf_datasets" "$CACHE_ROOT/torch" "$CACHE_ROOT/conda_pkgs"
 export HF_HOME="${HF_HOME:-$CACHE_ROOT/huggingface}"
@@ -105,7 +106,7 @@ SBATCH_CMD=(
   sbatch
   $GPU_ARGS
   --array=0-"$LAST_INDEX"%"$ARRAY_CONCURRENCY"
-  --export=ALL,INPUT_CSV="$INPUT_CSV",OUTPUT_DIR="$OUTPUT_DIR",PLAN_CSV="$PLAN_CSV",FEATURES="$FEATURES",MODEL_NAME="$MODEL_NAME"
+  --export=ALL,HYAK_VENV_DIR="$VENV_REAL",INPUT_CSV="$INPUT_CSV",OUTPUT_DIR="$OUTPUT_DIR",PLAN_CSV="$PLAN_CSV",FEATURES="$FEATURES",MODEL_NAME="$MODEL_NAME"
   slurm/run_helpsteer2_lora_scaling.sbatch
 )
 echo "submitting: ${SBATCH_CMD[*]}"

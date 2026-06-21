@@ -19,6 +19,9 @@ module load foster/python/miniconda/3.8 2>/dev/null || \
   module load coenv/python/3.11.9
 
 VENV_DIR="${HYAK_VENV_DIR:-.venv-hyak}"
+if [ ! -x "$VENV_DIR/bin/python" ] && [ -x ".venv-hyak/bin/python" ]; then
+  VENV_DIR=".venv-hyak"
+fi
 VENV_REAL="$(readlink -f "$VENV_DIR" 2>/dev/null || echo "$VENV_DIR")"
 CACHE_ROOT="${HYAK_CACHE_DIR:-$(dirname "$VENV_REAL")/cache}"
 mkdir -p "$CACHE_ROOT/huggingface" "$CACHE_ROOT/hf_datasets" "$CACHE_ROOT/torch" "$CACHE_ROOT/conda_pkgs"
@@ -41,6 +44,11 @@ if [ -d "$VENV_DIR/conda-meta" ] && command -v conda >/dev/null 2>&1; then
 else
   source "$VENV_DIR/bin/activate"
 fi
+
+echo "VENV_DIR=$VENV_DIR"
+echo "VENV_REAL=$VENV_REAL"
+echo "python=$(command -v python)"
+python --version
 
 python - <<'PY'
 import torch
