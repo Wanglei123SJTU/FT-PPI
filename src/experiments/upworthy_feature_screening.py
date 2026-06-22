@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -10,746 +11,689 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 from scipy import sparse
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error
 
-from src.data.upworthy_text_features import FEATURE_METADATA
-from src.experiments.upworthy_question_scaling_law import (
-    ID_COL,
-    TEXT_A_COL,
-    TEXT_B_COL,
-    Y_COL,
-    load_upworthy_pairs,
+from src.data.upworthy_text_features import (
+    COMMON_WORDS,
+    DIGIT_RE,
+    INTERROGATIVE_WORDS,
+    NUMBER_WORDS,
+    QUESTION_START_WORDS,
+    count_syllables,
+    tokenize,
 )
+from src.formatting import dataframe_to_markdown
+
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+except ImportError:  # pragma: no cover - dependency is in requirements, fallback keeps diagnostics usable.
+    SentimentIntensityAnalyzer = None
+
+try:
+    from wordfreq import zipf_frequency
+except ImportError:  # pragma: no cover
+    zipf_frequency = None
 
 
-DEFAULT_CORE_CONTROLS = [
-    "delta_QUESTION",
-    "delta_NUMERIC",
-    "delta_COMMON",
-    "delta_SIMPLICITY",
-    "delta_LENGTH",
-    "delta_VADER_COMPOUND",
-]
-DEFAULT_S_GRID = [0, 50, 100, 250, 500, 750, 1000, 1500, 3000]
-DEFAULT_BUDGETS = [500, 1000, 1500, 3000]
-DEFAULT_ALPHAS = [0.1, 1.0, 10.0, 100.0, 1000.0]
-TEXT_FEATURIZERS = {"word", "char", "word_char"}
-SURROGATE_FEATURIZERS = {*TEXT_FEATURIZERS, "structured", "word_char_structured"}
-TRAINING_OBJECTIVES = {"mse", "ifvar"}
+Y_COL = "y_logit_ctr_diff"
+TEXT_A_COL = "headline_a"
+TEXT_B_COL = "headline_b"
+DEFAULT_OUTPUT_DIR = Path("artifacts/upworthy_m_estimation/feature_screening_v2")
+DEFAULT_CI_BUDGETS = [500, 1000, 1500, 3000]
 
-LENGTH_READABILITY_FEATURES = {
-    "delta_SIMPLICITY",
-    "delta_LENGTH",
-    "delta_READING_EASE",
-    "delta_FK_GRADE",
-    "delta_AVG_WORD_LENGTH",
-    "delta_CHAR_LENGTH",
-    "delta_LONG_WORD_SHARE",
-}
-HIGH_PRIORITY_FEATURES = {
-    "QUESTION",
-    "NUMERIC",
-    "COMMON",
-    "SIMPLICITY",
-    "READING_EASE",
-    "NEGATION",
-    "VADER_POS",
-    "VADER_NEG",
-    "VADER_COMPOUND",
-    "SENTIMENT_EXTREMITY",
-    "SENTIMENT_INTENSITY",
-}
-BACKUP_ONLY_FEATURES = {
-    "LENGTH",
-    "CHAR_LENGTH",
-    "QUESTION_MARKS",
-    "EXCLAMATION",
-    "EXCLAMATION_MARKS",
-    "CAPS_SHARE",
-    "HAS_QUOTES",
+WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+(?:[,.]\d+)*(?:st|nd|rd|th)?", re.IGNORECASE)
+LETTER_RE = re.compile(r"[A-Za-z]")
+SENTENCE_RE = re.compile(r"[.!?]+")
+SECOND_PERSON = {"you", "your", "yours", "yourself", "yourselves", "u"}
+FIRST_PERSON = {"i", "me", "my", "mine", "we", "us", "our", "ours"}
+NEGATIONS = {"no", "not", "never", "none", "nothing", "nobody", "nowhere", "neither", "nor", "without", "can't", "won't", "don't", "doesn't", "isn't", "aren't"}
+DEMONSTRATIVES = {"this", "that", "these", "those"}
+SUPERLATIVES = {"best", "worst", "most", "least", "biggest", "smallest", "greatest", "largest", "easiest", "hardest"}
+URGENCY = {"now", "today", "before", "after", "soon", "urgent", "immediately", "finally"}
+SURPRISE = {"surprising", "shocking", "unbelievable", "amazing", "weird", "secret", "truth", "actually", "really"}
+CURIOSITY = {
+    "why",
+    "how",
+    "what",
+    "this",
+    "these",
+    "that",
+    "reason",
+    "reasons",
+    "secret",
+    "secrets",
+    "happens",
+    "happened",
+    "happen",
+    "thing",
+    "things",
 }
 
 
 @dataclass(frozen=True)
-class OlsStats:
-    target: str
-    feature_columns: list[str]
-    beta: float
-    abs_beta: float
-    ifvar: float
-    hessian_condition: float
-    if_weight_p50: float
-    if_weight_p90: float
-    if_weight_p95: float
-    if_weight_p99: float
-    if_weight_max: float
-    hessian_inv_target_row: np.ndarray
+class FeatureInfo:
+    feature: str
+    raw_column: str
+    family: str
+    kind: str
+    note: str
+    priority: int = 2
 
 
-@dataclass(frozen=True)
-class SurrogateFeaturizer:
-    mode: str
-    text_vectorizer: TfidfVectorizer | list[TfidfVectorizer] | None
-    structured_columns: tuple[str, ...] = ()
+def _word_tokens(text: str) -> list[str]:
+    return [token.lower() for token in WORD_RE.findall(str(text)) if LETTER_RE.search(token)]
 
 
-def discover_candidate_features(df: pd.DataFrame, max_features: int | None = None) -> list[str]:
-    candidates = [
-        col
-        for col in df.columns
-        if col.startswith("delta_") and not col.endswith("_raw") and not col.endswith("_scale")
-    ]
-    candidates = [col for col in candidates if pd.api.types.is_numeric_dtype(df[col])]
-    if max_features is not None:
-        return candidates[: int(max_features)]
-    return candidates
+def _content_tokens(text: str) -> list[str]:
+    return [token for token in _word_tokens(text) if token not in ENGLISH_STOP_WORDS]
 
 
-def core_controls_for_target(
-    target: str,
-    available_columns: Iterable[str],
-    core_controls: Iterable[str] = DEFAULT_CORE_CONTROLS,
-) -> list[str]:
-    available = set(available_columns)
-    controls = [col for col in core_controls if col in available and col != target]
-    if target in LENGTH_READABILITY_FEATURES:
-        controls = [col for col in controls if col not in {"delta_SIMPLICITY", "delta_LENGTH"}]
+def _safe_div(num: float, den: float) -> float:
+    return float(num / den) if den else 0.0
+
+
+def _sentence_count(text: str) -> int:
+    parts = [part for part in SENTENCE_RE.split(str(text)) if part.strip()]
+    return max(len(parts), 1)
+
+
+def _zipf(word: str) -> float:
+    if zipf_frequency is None:
+        return 4.5 if word in COMMON_WORDS else 3.0
+    return float(zipf_frequency(word, "en"))
+
+
+def _share(tokens: list[str], vocabulary: set[str]) -> float:
+    return _safe_div(sum(1 for token in tokens if token in vocabulary), len(tokens))
+
+
+def _question_cue(text: str, words: list[str]) -> float:
+    if "?" in str(text):
+        return 1.0
+    return float(bool(words) and words[0] in QUESTION_START_WORDS)
+
+
+def _numeric_cue(tokens: list[str]) -> float:
+    return float(any(DIGIT_RE.search(token) or token in NUMBER_WORDS for token in tokens))
+
+
+def _readability(words: list[str], sentence_count: int) -> tuple[float, float]:
+    if not words:
+        return 0.0, 0.0
+    syllables = sum(count_syllables(word) for word in words)
+    words_per_sentence = len(words) / max(sentence_count, 1)
+    syllables_per_word = syllables / len(words)
+    reading_ease = 206.835 - 1.015 * words_per_sentence - 84.6 * syllables_per_word
+    fk_grade = 0.39 * words_per_sentence + 11.8 * syllables_per_word - 15.59
+    return float(reading_ease), float(fk_grade)
+
+
+def _coverage(headline_tokens: list[str], context_tokens: list[str]) -> float:
+    headline_set = set(headline_tokens)
+    if not headline_set:
+        return 0.0
+    context_set = set(context_tokens)
+    return float(len(headline_set & context_set) / len(headline_set))
+
+
+def _jaccard(left: list[str], right: list[str]) -> float:
+    left_set = set(left)
+    right_set = set(right)
+    denom = len(left_set | right_set)
+    if denom == 0:
+        return 0.0
+    return float(len(left_set & right_set) / denom)
+
+
+def _vader_scores(texts: pd.Series) -> pd.DataFrame:
+    if SentimentIntensityAnalyzer is None:
+        zeros = np.zeros(len(texts), dtype=float)
+        return pd.DataFrame({"vader_compound": zeros, "vader_pos": zeros, "vader_neg": zeros, "vader_neu": zeros})
+    analyzer = SentimentIntensityAnalyzer()
+    scores = [analyzer.polarity_scores(str(text)) for text in texts]
+    return pd.DataFrame(
+        {
+            "vader_compound": [score["compound"] for score in scores],
+            "vader_pos": [score["pos"] for score in scores],
+            "vader_neg": [score["neg"] for score in scores],
+            "vader_neu": [score["neu"] for score in scores],
+        }
+    )
+
+
+def _make_context(frame: pd.DataFrame, suffix: str) -> pd.Series:
+    pieces = []
+    for stem in ["excerpt", "lede", "share_text"]:
+        col = f"{stem}_{suffix}"
+        if col in frame.columns:
+            pieces.append(frame[col].fillna("").astype(str))
+    if not pieces:
+        return pd.Series([""] * len(frame), index=frame.index)
+    out = pieces[0]
+    for item in pieces[1:]:
+        out = out + " " + item
+    return out
+
+
+def _arm_feature_frame(text: pd.Series, context: pd.Series, prefix: str) -> pd.DataFrame:
+    rows: list[dict[str, float]] = []
+    for headline, ctx in zip(text.fillna("").astype(str), context.fillna("").astype(str)):
+        tokens = tokenize(headline)
+        words = _word_tokens(headline)
+        content = [word for word in words if word not in ENGLISH_STOP_WORDS]
+        ctx_content = _content_tokens(ctx)
+        n_words = len(words)
+        n_content = len(content)
+        n_chars = len(str(headline))
+        n_sent = _sentence_count(headline)
+        word_lengths = [len(re.sub(r"[^a-z]", "", word)) for word in words]
+        avg_word_length = _safe_div(sum(word_lengths), n_words)
+        reading_ease, fk_grade = _readability(words, n_sent)
+        zipfs = [_zipf(word) for word in words]
+        content_zipfs = [_zipf(word) for word in content]
+        rare_words = sum(1 for value in content_zipfs if value < 3.5)
+        common_words = sum(1 for value in zipfs if value >= 4.5)
+        uppercase_words = sum(1 for raw in str(headline).split() if len(raw) > 1 and raw.isupper())
+        punctuation = sum(1 for ch in str(headline) if ch in "!?;:-")
+
+        rows.append(
+            {
+                "question": _question_cue(headline, words),
+                "numeric": _numeric_cue(tokens),
+                "word_count": float(n_words),
+                "log_word_count": math.log1p(n_words),
+                "char_count": float(n_chars),
+                "log_char_count": math.log1p(n_chars),
+                "avg_word_length": float(avg_word_length),
+                "sentence_count": float(n_sent),
+                "reading_ease": reading_ease,
+                "fk_grade": fk_grade,
+                "simplicity": float(-math.log1p(n_words) - avg_word_length),
+                "common_zipf": float(np.mean(zipfs)) if zipfs else 0.0,
+                "content_common_zipf": float(np.mean(content_zipfs)) if content_zipfs else 0.0,
+                "rare_word_share": _safe_div(rare_words, n_content),
+                "common_word_share": _safe_div(common_words, n_words),
+                "content_word_share": _safe_div(n_content, n_words),
+                "context_coverage": _coverage(content, ctx_content),
+                "context_jaccard": _jaccard(content, ctx_content),
+                "second_person_share": _share(words, SECOND_PERSON),
+                "has_second_person": float(any(word in SECOND_PERSON for word in words)),
+                "first_person_share": _share(words, FIRST_PERSON),
+                "negation_share": _share(words, NEGATIONS),
+                "has_negation": float(any(word in NEGATIONS for word in words)),
+                "demonstrative_share": _share(words, DEMONSTRATIVES),
+                "has_demonstrative": float(any(word in DEMONSTRATIVES for word in words)),
+                "superlative_share": _share(words, SUPERLATIVES),
+                "curiosity_share": _share(words, CURIOSITY),
+                "urgency_share": _share(words, URGENCY),
+                "surprise_share": _share(words, SURPRISE),
+                "question_mark_count": float(str(headline).count("?")),
+                "exclamation_count": float(str(headline).count("!")),
+                "colon_dash_count": float(str(headline).count(":") + str(headline).count("-")),
+                "quote_count": float(str(headline).count('"') + str(headline).count("'")),
+                "uppercase_word_share": _safe_div(uppercase_words, n_words),
+                "punctuation_intensity": _safe_div(punctuation, max(n_chars, 1)),
+            }
+        )
+    out = pd.DataFrame(rows, index=text.index)
+    vader = _vader_scores(text)
+    vader.index = out.index
+    out = pd.concat([out, vader], axis=1)
+    out["vader_intensity"] = out["vader_compound"].abs()
+    out["vader_emotion"] = out["vader_pos"] + out["vader_neg"]
+    out["curiosity_style"] = (
+        out["question"]
+        + out["has_second_person"]
+        + out["has_demonstrative"]
+        + (out["curiosity_share"] > 0).astype(float)
+        + (out["surprise_share"] > 0).astype(float)
+    )
+    return out.add_prefix(f"{prefix}_")
+
+
+def _scale_no_center(values: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(values, errors="coerce").astype(float).fillna(0.0)
+    sd = float(numeric.std(ddof=0))
+    if not np.isfinite(sd) or sd <= 0:
+        return pd.Series(np.zeros(len(numeric)), index=values.index)
+    return numeric / sd
+
+
+def _kind(raw: pd.Series) -> str:
+    unique = raw.dropna().unique()
+    if len(unique) <= 5 and set(np.round(unique, 8)).issubset({-1.0, 0.0, 1.0}):
+        return "ternary"
+    if len(unique) <= 2:
+        return "binary"
+    return "continuous"
+
+
+def _family(name: str) -> str:
+    for key in ["length", "word_count", "char_count", "sentence", "read", "fk", "simplicity"]:
+        if key in name:
+            return "readability_length"
+    for key in ["vader", "emotion", "negation", "surprise"]:
+        if key in name:
+            return "sentiment"
+    for key in ["coverage", "jaccard", "context"]:
+        if key in name:
+            return "context_alignment"
+    for key in ["common", "rare", "zipf", "content_word"]:
+        if key in name:
+            return "specificity_commonness"
+    for key in ["question", "numeric", "second_person", "demonstrative", "curiosity", "superlative", "urgency"]:
+        if key in name:
+            return "curiosity_style"
+    for key in ["punctuation", "colon", "quote", "uppercase", "exclamation"]:
+        if key in name:
+            return "format_emphasis"
+    return "other"
+
+
+def _note(name: str, family: str) -> str:
+    if name == "context_coverage":
+        return "Share of headline content words that appear in the article context; headline-message alignment."
+    if name == "context_jaccard":
+        return "Jaccard overlap between headline content words and article context words."
+    if name.startswith("vader_"):
+        return "Open-source VADER headline sentiment cue."
+    if name in {"common_zipf", "content_common_zipf"}:
+        return "Mean word frequency from wordfreq; higher means more common/simple language."
+    if name == "rare_word_share":
+        return "Share of uncommon content words; proxy for specificity or complexity."
+    if name == "curiosity_style":
+        return "Aggregated curiosity/clickbait-style cue from question, second person, demonstratives, curiosity, and surprise words."
+    if family == "readability_length":
+        return "Transparent headline length/readability cue."
+    if family == "format_emphasis":
+        return "Headline punctuation or emphasis cue."
+    return "Deterministic headline text feature."
+
+
+def _priority(name: str, family: str) -> int:
+    if name in {"context_coverage", "context_jaccard", "vader_intensity", "vader_neg", "rare_word_share", "curiosity_style"}:
+        return 0
+    if family in {"sentiment", "context_alignment", "specificity_commonness", "curiosity_style"}:
+        return 1
+    if family == "readability_length":
+        return 2
+    return 3
+
+
+def build_candidate_features(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    context_a = _make_context(frame, "a")
+    context_b = _make_context(frame, "b")
+    arm_a = _arm_feature_frame(frame[TEXT_A_COL], context_a, "a")
+    arm_b = _arm_feature_frame(frame[TEXT_B_COL], context_b, "b")
+    out = pd.concat([frame.copy(), arm_a, arm_b], axis=1)
+
+    feature_names = [column.removeprefix("a_") for column in arm_a.columns]
+    info_rows: list[FeatureInfo] = []
+    for name in feature_names:
+        raw_col = f"delta_{name}_raw"
+        feature_col = f"delta_{name}"
+        raw = out[f"a_{name}"].astype(float) - out[f"b_{name}"].astype(float)
+        out[raw_col] = raw
+        kind = _kind(raw)
+        if kind == "continuous":
+            out[feature_col] = _scale_no_center(raw)
+        else:
+            out[feature_col] = raw.fillna(0.0).astype(float)
+        family = _family(name)
+        info_rows.append(
+            FeatureInfo(
+                feature=feature_col,
+                raw_column=raw_col,
+                family=family,
+                kind=kind,
+                note=_note(name, family),
+                priority=_priority(name, family),
+            )
+        )
+
+    metadata = pd.DataFrame([info.__dict__ for info in info_rows])
+    return out, metadata
+
+
+def design_matrix(frame: pd.DataFrame, columns: list[str]) -> np.ndarray:
+    return np.column_stack([np.ones(len(frame)), frame[columns].astype(float).to_numpy()])
+
+
+def fit_ols(frame: pd.DataFrame, y_col: str, columns: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    y = frame[y_col].astype(float).to_numpy()
+    x = design_matrix(frame, columns)
+    xtx = x.T @ x
+    beta = np.linalg.pinv(xtx) @ x.T @ y
+    hessian = xtx / len(frame)
+    residual = y - x @ beta
+    return beta, hessian, residual
+
+
+def if_weight(x: np.ndarray, hessian: np.ndarray, target_position: int) -> np.ndarray:
+    h_inv = np.linalg.pinv(hessian)
+    return x @ h_inv[target_position, :]
+
+
+def ess_share(weights: np.ndarray) -> float:
+    denom = float(np.sum(weights**4))
+    if denom <= 0:
+        return 0.0
+    ess = float(np.sum(weights**2) ** 2 / denom)
+    return ess / len(weights)
+
+
+def vif_for_target(frame: pd.DataFrame, target: str, controls: list[str]) -> float:
+    if not controls:
+        return 1.0
+    y = frame[target].astype(float).to_numpy()
+    x = design_matrix(frame, controls)
+    beta = np.linalg.pinv(x.T @ x) @ x.T @ y
+    pred = x @ beta
+    sst = float(np.sum((y - y.mean()) ** 2))
+    if sst <= 0:
+        return float("inf")
+    r2 = 1.0 - float(np.sum((y - pred) ** 2)) / sst
+    if r2 >= 1:
+        return float("inf")
+    return float(1.0 / max(1.0 - r2, 1e-12))
+
+
+def _eligible_controls(target: str, all_controls: list[str], metadata: pd.DataFrame, frame: pd.DataFrame) -> list[str]:
+    family = metadata.set_index("feature").loc[target, "family"]
+    meta = metadata.set_index("feature")
+    controls: list[str] = []
+    for control in all_controls:
+        if control == target or control not in frame.columns:
+            continue
+        if control in meta.index and meta.loc[control, "family"] == family:
+            continue
+        corr = frame[[target, control]].corr().iloc[0, 1]
+        if np.isfinite(corr) and abs(float(corr)) >= 0.85:
+            continue
+        controls.append(control)
     return controls
 
 
-def feature_set_for_target(target: str, available_columns: Iterable[str], core_controls: Iterable[str]) -> list[str]:
-    return [target, *core_controls_for_target(target, available_columns, core_controls)]
-
-
-def x_matrix(frame: pd.DataFrame, feature_cols: list[str]) -> np.ndarray:
-    return np.column_stack([np.ones(len(frame), dtype=float), frame[feature_cols].to_numpy(dtype=float)])
-
-
-def fit_ols_stats(frame: pd.DataFrame, target: str, feature_cols: list[str]) -> OlsStats:
-    x = x_matrix(frame, feature_cols)
-    y = frame[Y_COL].to_numpy(dtype=float)
-    beta = np.linalg.pinv(x.T @ x) @ x.T @ y
-    hessian = (x.T @ x) / len(frame)
-    singular_values = np.linalg.svd(hessian, compute_uv=False)
-    min_singular = float(np.min(singular_values))
-    max_singular = float(np.max(singular_values))
-    condition = float(max_singular / min_singular) if min_singular > 0 else float("inf")
-    hessian_inv = np.linalg.pinv(hessian)
-    idx = 1 + feature_cols.index(target)
-    if_weights = x @ hessian_inv[idx, :]
-    residual = y - x @ beta
-    if_residual = if_weights * residual
-    quantiles = np.quantile(np.abs(if_weights), [0.5, 0.9, 0.95, 0.99, 1.0])
-    return OlsStats(
-        target=target,
-        feature_columns=feature_cols,
-        beta=float(beta[idx]),
-        abs_beta=float(abs(beta[idx])),
-        ifvar=float(np.var(if_residual, ddof=1)),
-        hessian_condition=condition,
-        if_weight_p50=float(quantiles[0]),
-        if_weight_p90=float(quantiles[1]),
-        if_weight_p95=float(quantiles[2]),
-        if_weight_p99=float(quantiles[3]),
-        if_weight_max=float(quantiles[4]),
-        hessian_inv_target_row=hessian_inv[idx, :],
+def _tfidf_text(frame: pd.DataFrame) -> pd.Series:
+    return (
+        "Headline A: "
+        + frame[TEXT_A_COL].fillna("").astype(str)
+        + "\nHeadline B: "
+        + frame[TEXT_B_COL].fillna("").astype(str)
+        + "\nContext: "
+        + _make_context(frame, "a")
     )
 
 
-def feature_name(delta_col: str) -> str:
-    return delta_col.removeprefix("delta_")
-
-
-def feature_priority(delta_col: str) -> int:
-    name = feature_name(delta_col)
-    if name in HIGH_PRIORITY_FEATURES or name.startswith("VADER_"):
-        return 0
-    if name in BACKUP_ONLY_FEATURES or delta_col in LENGTH_READABILITY_FEATURES:
-        return 2
-    return 1
-
-
-def feature_source(delta_col: str) -> str:
-    return FEATURE_METADATA.get(feature_name(delta_col), {}).get("source", "unknown")
-
-
-def feature_note(delta_col: str) -> str:
-    return FEATURE_METADATA.get(feature_name(delta_col), {}).get("note", "")
-
-
-def pair_tfidf_matrix(vectorizer: TfidfVectorizer | list[TfidfVectorizer], frame: pd.DataFrame) -> sparse.csr_matrix:
-    if isinstance(vectorizer, list):
-        return sparse.hstack([pair_tfidf_matrix(item, frame) for item in vectorizer], format="csr")
-    a = vectorizer.transform(frame[TEXT_A_COL].astype(str))
-    b = vectorizer.transform(frame[TEXT_B_COL].astype(str))
-    return (a - b).tocsr()
-
-
-def fit_tfidf_vectorizer(frame: pd.DataFrame, max_features: int, min_df: int) -> TfidfVectorizer:
+def fit_tfidf_surrogate(
+    frame: pd.DataFrame,
+    *,
+    train_mask: pd.Series,
+    eval_mask: pd.Series,
+    max_features: int,
+) -> tuple[np.ndarray, dict[str, float]]:
+    texts = _tfidf_text(frame)
+    train_texts = texts.loc[train_mask].tolist()
+    eval_texts = texts.loc[eval_mask].tolist()
+    y_train = frame.loc[train_mask, Y_COL].astype(float).to_numpy()
+    y_eval = frame.loc[eval_mask, Y_COL].astype(float).to_numpy()
     vectorizer = TfidfVectorizer(
         ngram_range=(1, 2),
-        min_df=min_df,
+        min_df=3,
         max_features=max_features,
         strip_accents="unicode",
+        lowercase=True,
     )
-    corpus = pd.concat([frame[TEXT_A_COL].astype(str), frame[TEXT_B_COL].astype(str)], ignore_index=True)
-    vectorizer.fit(corpus)
-    return vectorizer
-
-
-def fit_text_featurizer(
-    frame: pd.DataFrame,
-    *,
-    mode: str,
-    max_features: int,
-    min_df: int,
-) -> TfidfVectorizer | list[TfidfVectorizer]:
-    if mode not in TEXT_FEATURIZERS:
-        raise ValueError(f"text featurizer must be one of {sorted(TEXT_FEATURIZERS)}, got {mode!r}")
-    corpus = pd.concat([frame[TEXT_A_COL].astype(str), frame[TEXT_B_COL].astype(str)], ignore_index=True)
-    if mode == "word":
-        return fit_tfidf_vectorizer(frame, max_features=max_features, min_df=min_df)
-    char = TfidfVectorizer(
-        analyzer="char_wb",
-        ngram_range=(3, 5),
-        min_df=min_df,
-        max_features=max_features,
-        strip_accents="unicode",
-    )
-    char.fit(corpus)
-    if mode == "char":
-        return char
-    word = fit_tfidf_vectorizer(frame, max_features=max_features, min_df=min_df)
-    return [word, char]
-
-
-def fit_surrogate_featurizer(
-    frame: pd.DataFrame,
-    *,
-    mode: str,
-    max_features: int,
-    min_df: int,
-    structured_columns: Iterable[str] = (),
-) -> SurrogateFeaturizer:
-    if mode not in SURROGATE_FEATURIZERS:
-        raise ValueError(f"surrogate featurizer must be one of {sorted(SURROGATE_FEATURIZERS)}, got {mode!r}")
-    structured = tuple(str(col) for col in structured_columns)
-    if mode == "structured":
-        if not structured:
-            raise ValueError("structured surrogate requires at least one structured column")
-        return SurrogateFeaturizer(mode=mode, text_vectorizer=None, structured_columns=structured)
-    if mode == "word_char_structured":
-        if not structured:
-            raise ValueError("word_char_structured surrogate requires at least one structured column")
-        vectorizer = fit_text_featurizer(frame, mode="word_char", max_features=max_features, min_df=min_df)
-        return SurrogateFeaturizer(mode=mode, text_vectorizer=vectorizer, structured_columns=structured)
-    vectorizer = fit_text_featurizer(frame, mode=mode, max_features=max_features, min_df=min_df)
-    return SurrogateFeaturizer(mode=mode, text_vectorizer=vectorizer)
-
-
-def surrogate_matrix(featurizer: SurrogateFeaturizer, frame: pd.DataFrame) -> sparse.csr_matrix:
-    parts: list[sparse.csr_matrix] = []
-    if featurizer.text_vectorizer is not None:
-        parts.append(pair_tfidf_matrix(featurizer.text_vectorizer, frame))
-    if featurizer.structured_columns:
-        missing = sorted(set(featurizer.structured_columns) - set(frame.columns))
-        if missing:
-            raise ValueError(f"structured surrogate columns are missing: {missing}")
-        structured = frame.loc[:, list(featurizer.structured_columns)].to_numpy(dtype=float)
-        parts.append(sparse.csr_matrix(structured))
-    if not parts:
-        raise ValueError("surrogate featurizer produced no matrix parts")
-    if len(parts) == 1:
-        return parts[0].tocsr()
-    return sparse.hstack(parts, format="csr")
-
-
-def train_ridge_select_alpha(
-    x_train: sparse.csr_matrix,
-    y_train: np.ndarray,
-    x_stop: sparse.csr_matrix,
-    y_stop: np.ndarray,
-    alphas: list[float],
-) -> tuple[Ridge, float, float]:
-    best_model: Ridge | None = None
-    best_alpha = float(alphas[0])
-    best_mse = float("inf")
-    for alpha in alphas:
-        model = Ridge(alpha=float(alpha), fit_intercept=True, solver="lsqr")
+    x_train = vectorizer.fit_transform(train_texts)
+    x_eval = vectorizer.transform(eval_texts)
+    best: tuple[float, float, Ridge] | None = None
+    for alpha in [0.1, 1.0, 10.0, 100.0, 1000.0]:
+        model = Ridge(alpha=alpha, random_state=0)
         model.fit(x_train, y_train)
-        mse = float(mean_squared_error(y_stop, model.predict(x_stop)))
-        if mse < best_mse:
-            best_model = model
-            best_alpha = float(alpha)
-            best_mse = mse
-    if best_model is None:
-        raise RuntimeError("no ridge model was fit")
-    return best_model, best_alpha, best_mse
+        pred = model.predict(x_eval)
+        mse = mean_squared_error(y_eval, pred)
+        if best is None or mse < best[1]:
+            best = (alpha, float(mse), model)
+    assert best is not None
+    alpha, mse, model = best
+    pred_all = np.zeros(len(frame), dtype=float)
+    matrix_all = vectorizer.transform(texts.tolist())
+    pred_all[:] = model.predict(matrix_all)
+    return pred_all, {"tfidf_alpha": float(alpha), "tfidf_eval_mse": float(mse), "tfidf_n_features": float(len(vectorizer.vocabulary_))}
 
 
-def _positive_sample_weights(values: np.ndarray, clip_quantile: float | None) -> np.ndarray:
-    weights = np.square(np.asarray(values, dtype=float))
-    if clip_quantile is not None and 0.0 < clip_quantile < 1.0 and len(weights) > 1:
-        cap = float(np.quantile(weights, clip_quantile))
-        if np.isfinite(cap) and cap > 0:
-            weights = np.minimum(weights, cap)
-    mean = float(np.mean(weights))
-    if not np.isfinite(mean) or mean <= 0:
-        return np.ones_like(weights, dtype=float)
-    return weights / mean
+def _safe_abs_corr(frame: pd.DataFrame, target: str, controls: list[str]) -> float:
+    if not controls:
+        return 0.0
+    corr = frame[[target, *controls]].corr()[target].drop(target).abs()
+    corr = corr[np.isfinite(corr)]
+    return float(corr.max()) if not corr.empty else 0.0
 
 
-def train_ridge_select_alpha_ifvar(
-    x_train: sparse.csr_matrix,
-    y_train: np.ndarray,
-    if_weights_train: np.ndarray,
-    x_stop: sparse.csr_matrix,
-    y_stop: np.ndarray,
-    if_weights_stop: np.ndarray,
-    alphas: list[float],
+def summarize_candidates(
+    frame: pd.DataFrame,
+    metadata: pd.DataFrame,
     *,
-    weight_clip_quantile: float | None = 0.99,
-) -> tuple[Ridge, float, float]:
-    best_model: Ridge | None = None
-    best_alpha = float(alphas[0])
-    best_metric = float("inf")
-    sample_weight = _positive_sample_weights(if_weights_train, weight_clip_quantile)
-    for alpha in alphas:
-        model = Ridge(alpha=float(alpha), fit_intercept=True, solver="lsqr")
-        model.fit(x_train, y_train, sample_weight=sample_weight)
-        residual = y_stop - model.predict(x_stop)
-        metric = float(np.var(if_weights_stop * residual, ddof=1))
-        if metric < best_metric:
-            best_model = model
-            best_alpha = float(alpha)
-            best_metric = metric
-    if best_model is None:
-        raise RuntimeError("no target-aware ridge model was fit")
-    return best_model, best_alpha, best_metric
-
-
-def make_screening_split(
-    n_rows: int,
-    rng: np.random.Generator,
-    train_pool_size: int,
-    validation_stop_size: int,
-    validation_scale_size: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    needed = train_pool_size + validation_stop_size + validation_scale_size
-    if needed > n_rows:
-        raise ValueError(f"screening split needs {needed} rows but H_scale only has {n_rows}")
-    order = rng.permutation(n_rows)
-    train = order[:train_pool_size]
-    stop = order[train_pool_size : train_pool_size + validation_stop_size]
-    scale = order[train_pool_size + validation_stop_size : needed]
-    return train, stop, scale
-
-
-def compute_candidate_summaries(
-    df: pd.DataFrame,
-    candidates: list[str],
-    core_controls: list[str],
     budgets: list[int],
-) -> tuple[pd.DataFrame, dict[str, OlsStats], dict[str, OlsStats]]:
-    target = df.loc[df["split"].astype(str) == "target"].reset_index(drop=True)
+    max_features: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float]]:
+    target = frame.loc[frame["split"] == "target"].copy()
+    h_scale_mask = frame["split"] == "h_scale"
+    target_mask = frame["split"] == "target"
+
+    pred_tfidf, tfidf_meta = fit_tfidf_surrogate(
+        frame,
+        train_mask=h_scale_mask,
+        eval_mask=target_mask,
+        max_features=max_features,
+    )
+    target_pred = pred_tfidf[target_mask.to_numpy()]
+    y = target[Y_COL].astype(float).to_numpy()
+
+    core_controls = [
+        "delta_question",
+        "delta_numeric",
+        "delta_log_word_count",
+        "delta_context_coverage",
+        "delta_vader_compound",
+        "delta_common_zipf",
+        "delta_reading_ease",
+        "delta_curiosity_style",
+    ]
+    candidates = metadata["feature"].tolist()
     rows = []
-    marginal_stats: dict[str, OlsStats] = {}
-    controlled_stats: dict[str, OlsStats] = {}
-    for candidate in candidates:
-        marginal = fit_ols_stats(target, candidate, [candidate])
-        controlled_cols = feature_set_for_target(candidate, candidates, core_controls)
-        controlled = fit_ols_stats(target, candidate, controlled_cols)
-        marginal_stats[candidate] = marginal
-        controlled_stats[candidate] = controlled
-        nonzero_share = float((df[candidate].to_numpy(dtype=float) != 0).mean())
-        row = {
-            "feature": feature_name(candidate),
-            "delta_col": candidate,
-            "source": feature_source(candidate),
-            "note": feature_note(candidate),
-            "nonzero_share": nonzero_share,
-            "management_priority": feature_priority(candidate),
-            "marginal_beta": marginal.beta,
-            "marginal_abs_beta": marginal.abs_beta,
-            "marginal_ifvar": marginal.ifvar,
-            "controlled_beta": controlled.beta,
-            "controlled_abs_beta": controlled.abs_beta,
-            "controlled_ifvar": controlled.ifvar,
-            "controlled_hessian_condition": controlled.hessian_condition,
-            "if_weight_p50": controlled.if_weight_p50,
-            "if_weight_p90": controlled.if_weight_p90,
-            "if_weight_p95": controlled.if_weight_p95,
-            "if_weight_p99": controlled.if_weight_p99,
-            "if_weight_max": controlled.if_weight_max,
-            "controlled_feature_columns": ",".join(controlled.feature_columns),
-            "passes_stability": bool(
-                nonzero_share >= 0.15
-                and controlled.if_weight_p99 <= 10.0
-                and math.isfinite(controlled.hessian_condition)
-            ),
+    budget_rows = []
+    for feature in candidates:
+        controls = _eligible_controls(feature, core_controls, metadata, target)
+        x_columns = [feature, *controls]
+        beta, hessian, residual = fit_ols(target, Y_COL, x_columns)
+        x = design_matrix(target, x_columns)
+        weights = if_weight(x, hessian, target_position=1)
+        if_resid = weights * residual
+        zero_if = weights * y
+        tfidf_if = weights * (y - target_pred)
+        ols_ifvar = float(np.var(if_resid, ddof=0))
+        zero_ifvar = float(np.var(zero_if, ddof=0))
+        tfidf_ifvar = float(np.var(tfidf_if, ddof=0))
+        raw_col = metadata.set_index("feature").loc[feature, "raw_column"]
+        raw = target[raw_col].astype(float)
+        abs_weights = np.abs(weights)
+        nonzero_share = float((np.abs(raw) > 1e-12).mean())
+        unique_values = int(raw.nunique(dropna=True))
+        direct_ci_rows = {
+            f"direct_ci_halfwidth_B{budget}": 1.96 * math.sqrt(max(ols_ifvar, 0.0) / budget)
+            for budget in budgets
         }
         for budget in budgets:
-            row[f"direct_ci_halfwidth_B{budget}"] = 1.96 * math.sqrt(max(controlled.ifvar, 0.0) / budget)
-        rows.append(row)
-    return pd.DataFrame(rows), marginal_stats, controlled_stats
-
-
-def compute_tfidf_scaling(
-    df: pd.DataFrame,
-    candidates: list[str],
-    controlled_stats: dict[str, OlsStats],
-    *,
-    s_values: list[int],
-    replications: int,
-    seed: int,
-    train_pool_size: int,
-    validation_stop_size: int,
-    validation_scale_size: int,
-    alphas: list[float],
-    max_features: int,
-    min_df: int,
-    text_featurizer: str = "word",
-    structured_columns: list[str] | None = None,
-    training_objective: str = "mse",
-    train_if_weight_clip_quantile: float | None = 0.99,
-) -> pd.DataFrame:
-    h_scale = df.loc[df["split"].astype(str) == "h_scale"].reset_index(drop=True)
-    if h_scale.empty:
-        raise ValueError("input must include split='h_scale'")
-    if training_objective not in TRAINING_OBJECTIVES:
-        raise ValueError(f"training_objective must be one of {sorted(TRAINING_OBJECTIVES)}, got {training_objective!r}")
-    surrogate = fit_surrogate_featurizer(
-        h_scale,
-        mode=text_featurizer,
-        max_features=max_features,
-        min_df=min_df,
-        structured_columns=structured_columns or [],
-    )
-    x_text = surrogate_matrix(surrogate, h_scale)
-    y = h_scale[Y_COL].to_numpy(dtype=float)
-    global_mean = float(np.mean(y))
-    max_s = max(s_values)
-    if train_pool_size < max_s:
-        raise ValueError("train_pool_size must be at least max(s_grid)")
-
-    weights_by_feature: dict[str, np.ndarray] = {}
-    for candidate, stats in controlled_stats.items():
-        x_cov = x_matrix(h_scale, stats.feature_columns)
-        weights_by_feature[candidate] = x_cov @ stats.hessian_inv_target_row
-
-    rows = []
-    for rep in range(int(replications)):
-        rng = np.random.default_rng(seed + rep)
-        train_pool, stop_idx, scale_idx = make_screening_split(
-            len(h_scale), rng, train_pool_size, validation_stop_size, validation_scale_size
-        )
-        y_scale = y[scale_idx]
-        rep_ifvar0: dict[str, float] = {}
-        for s in s_values:
-            if s == 0:
-                pred_scale = np.full(len(scale_idx), global_mean, dtype=float)
-                selected_alpha = np.nan
-                stop_mse = np.nan
-                stop_metric = np.nan
-                residual = y_scale - pred_scale
-                for candidate in candidates:
-                    if_residual = weights_by_feature[candidate][scale_idx] * residual
-                    ifvar = float(np.var(if_residual, ddof=1))
-                    rep_ifvar0[candidate] = ifvar
-                    rows.append(
-                        {
-                            "replication": rep,
-                            "s": int(s),
-                            "feature": feature_name(candidate),
-                            "delta_col": candidate,
-                            "ifvar": ifvar,
-                            "ifvar_ratio_to_s0": 1.0,
-                            "selected_alpha": selected_alpha,
-                            "stop_mse": stop_mse,
-                            "stop_metric": stop_metric,
-                            "text_featurizer": text_featurizer,
-                            "training_objective": training_objective,
-                        }
-                    )
-                continue
-            if training_objective == "mse":
-                train_idx = train_pool[:s]
-                model, selected_alpha, stop_mse = train_ridge_select_alpha(
-                    x_text[train_idx], y[train_idx], x_text[stop_idx], y[stop_idx], alphas
-                )
-                pred_scale = model.predict(x_text[scale_idx])
-                residual = y_scale - pred_scale
-                for candidate in candidates:
-                    if_residual = weights_by_feature[candidate][scale_idx] * residual
-                    ifvar = float(np.var(if_residual, ddof=1))
-                    base = rep_ifvar0.get(candidate, np.nan)
-                    rows.append(
-                        {
-                            "replication": rep,
-                            "s": int(s),
-                            "feature": feature_name(candidate),
-                            "delta_col": candidate,
-                            "ifvar": ifvar,
-                            "ifvar_ratio_to_s0": float(ifvar / base) if np.isfinite(base) and base > 0 else np.nan,
-                            "selected_alpha": selected_alpha,
-                            "stop_mse": stop_mse,
-                            "stop_metric": stop_mse,
-                            "text_featurizer": text_featurizer,
-                            "training_objective": training_objective,
-                        }
-                    )
-            else:
-                train_idx = train_pool[:s]
-                for candidate in candidates:
-                    if_weights = weights_by_feature[candidate]
-                    model, selected_alpha, stop_metric = train_ridge_select_alpha_ifvar(
-                        x_text[train_idx],
-                        y[train_idx],
-                        if_weights[train_idx],
-                        x_text[stop_idx],
-                        y[stop_idx],
-                        if_weights[stop_idx],
-                        alphas,
-                        weight_clip_quantile=train_if_weight_clip_quantile,
-                    )
-                    pred_scale = model.predict(x_text[scale_idx])
-                    stop_mse = float(mean_squared_error(y[stop_idx], model.predict(x_text[stop_idx])))
-                    if_residual = if_weights[scale_idx] * (y_scale - pred_scale)
-                    ifvar = float(np.var(if_residual, ddof=1))
-                    base = rep_ifvar0.get(candidate, np.nan)
-                    rows.append(
-                        {
-                            "replication": rep,
-                            "s": int(s),
-                            "feature": feature_name(candidate),
-                            "delta_col": candidate,
-                            "ifvar": ifvar,
-                            "ifvar_ratio_to_s0": float(ifvar / base) if np.isfinite(base) and base > 0 else np.nan,
-                            "selected_alpha": selected_alpha,
-                            "stop_mse": stop_mse,
-                            "stop_metric": stop_metric,
-                            "text_featurizer": text_featurizer,
-                            "training_objective": training_objective,
-                        }
-                    )
-    return pd.DataFrame(rows)
-
-
-def build_budget_win_table(scaling: pd.DataFrame, budgets: list[int]) -> pd.DataFrame:
-    grouped = (
-        scaling.groupby(["delta_col", "feature", "s"], as_index=False)
-        .agg(mean_ifvar=("ifvar", "mean"), mean_ratio=("ifvar_ratio_to_s0", "mean"), median_ratio=("ifvar_ratio_to_s0", "median"))
-        .sort_values(["delta_col", "s"])
-    )
-    rows = []
-    for (delta_col, feature), feature_rows in grouped.groupby(["delta_col", "feature"], sort=False):
-        for budget in budgets:
-            eligible = feature_rows.loc[(feature_rows["s"] > 0) & (feature_rows["s"] < budget)].copy()
-            eligible["win_threshold"] = (budget - eligible["s"]) / budget
-            winners = eligible.loc[eligible["mean_ratio"] < eligible["win_threshold"]].sort_values("s")
-            if winners.empty:
-                best = eligible.sort_values("mean_ratio").head(1)
-                if best.empty:
-                    rows.append(
-                        {
-                            "delta_col": delta_col,
-                            "feature": feature,
-                            "budget": budget,
-                            "wins": False,
-                            "best_s": np.nan,
-                            "best_mean_ratio": np.nan,
-                            "win_threshold_at_best_s": np.nan,
-                        }
-                    )
-                else:
-                    row = best.iloc[0]
-                    rows.append(
-                        {
-                            "delta_col": delta_col,
-                            "feature": feature,
-                            "budget": budget,
-                            "wins": False,
-                            "best_s": int(row["s"]),
-                            "best_mean_ratio": float(row["mean_ratio"]),
-                            "win_threshold_at_best_s": float(row["win_threshold"]),
-                        }
-                    )
-            else:
-                row = winners.iloc[0]
-                rows.append(
+            # This is only a cheap feasibility proxy: use one h_scale-trained TF-IDF surrogate
+            # and ask whether the target IF variance reduction would offset labels spent on training.
+            for s in [50, 100, 250, 500, 750, 1000, 1500]:
+                if s >= budget:
+                    continue
+                ratio = (tfidf_ifvar / (budget - s)) / (zero_ifvar / budget) if zero_ifvar > 0 else np.nan
+                budget_rows.append(
                     {
-                        "delta_col": delta_col,
                         "feature": feature,
-                        "budget": budget,
-                        "wins": True,
-                        "best_s": int(row["s"]),
-                        "best_mean_ratio": float(row["mean_ratio"]),
-                        "win_threshold_at_best_s": float(row["win_threshold"]),
+                        "budget": int(budget),
+                        "s_proxy": int(s),
+                        "tfidf_variance_ratio_vs_direct_zero": float(ratio),
+                        "passes_proxy": bool(np.isfinite(ratio) and ratio < 1.0),
                     }
                 )
-    return pd.DataFrame(rows)
 
+        row = {
+            "feature": feature,
+            "family": metadata.set_index("feature").loc[feature, "family"],
+            "kind": metadata.set_index("feature").loc[feature, "kind"],
+            "priority": int(metadata.set_index("feature").loc[feature, "priority"]),
+            "note": metadata.set_index("feature").loc[feature, "note"],
+            "controls": ",".join(controls),
+            "beta_controlled": float(beta[1]),
+            "abs_beta_controlled": float(abs(beta[1])),
+            "nonzero_share": nonzero_share,
+            "unique_values": unique_values,
+            "sd_raw": float(raw.std(ddof=0)),
+            "target_vif": vif_for_target(target, feature, controls),
+            "max_abs_corr_with_controls": _safe_abs_corr(target, feature, controls),
+            "hessian_condition": float(np.linalg.cond(hessian)),
+            "ols_ifvar": ols_ifvar,
+            "zero_surrogate_ifvar": zero_ifvar,
+            "tfidf_ifvar": tfidf_ifvar,
+            "tfidf_ifvar_ratio_vs_zero": float(tfidf_ifvar / zero_ifvar) if zero_ifvar > 0 else np.nan,
+            "tfidf_ifvar_ratio_vs_ols": float(tfidf_ifvar / ols_ifvar) if ols_ifvar > 0 else np.nan,
+            "if_weight_p50_abs": float(np.quantile(abs_weights, 0.50)),
+            "if_weight_p90_abs": float(np.quantile(abs_weights, 0.90)),
+            "if_weight_p95_abs": float(np.quantile(abs_weights, 0.95)),
+            "if_weight_p99_abs": float(np.quantile(abs_weights, 0.99)),
+            "if_weight_max_abs": float(np.max(abs_weights)),
+            "if_ess_share": ess_share(weights),
+            **direct_ci_rows,
+        }
+        rows.append(row)
 
-def rank_candidates(summary: pd.DataFrame, budget_table: pd.DataFrame) -> pd.DataFrame:
-    wins = budget_table.loc[budget_table["wins"]].sort_values(["delta_col", "budget", "best_s"])
-    first_win = wins.groupby("delta_col", as_index=False).first()
-    ranked = summary.merge(
-        first_win[["delta_col", "budget", "best_s", "best_mean_ratio", "win_threshold_at_best_s"]].rename(
-            columns={
-                "budget": "smallest_winning_budget",
-                "best_s": "best_s_at_smallest_winning_budget",
-                "best_mean_ratio": "best_ratio_at_smallest_winning_budget",
-                "win_threshold_at_best_s": "threshold_at_smallest_winning_budget",
-            }
-        ),
-        on="delta_col",
-        how="left",
+    diagnostics = pd.DataFrame(rows)
+    budget = pd.DataFrame(budget_rows)
+    diagnostics["passes_nonzero"] = diagnostics["nonzero_share"] >= 0.50
+    diagnostics["passes_if_weights"] = (diagnostics["if_weight_p99_abs"] <= 10.0) & (diagnostics["if_ess_share"] >= 0.15)
+    diagnostics["passes_collinearity"] = (diagnostics["target_vif"] <= 5.0) & (diagnostics["hessian_condition"] <= 25.0)
+    diagnostics["passes_coef"] = diagnostics["abs_beta_controlled"] >= 0.02
+    diagnostics["passes_tfidf_proxy"] = diagnostics["tfidf_ifvar_ratio_vs_zero"] < 0.95
+    diagnostics["screen_score"] = (
+        diagnostics["passes_nonzero"].astype(int) * 20
+        + diagnostics["passes_if_weights"].astype(int) * 20
+        + diagnostics["passes_collinearity"].astype(int) * 20
+        + diagnostics["passes_coef"].astype(int) * 15
+        + diagnostics["passes_tfidf_proxy"].astype(int) * 15
+        + (4 - diagnostics["priority"].clip(0, 4)) * 2
+        + diagnostics["abs_beta_controlled"].clip(0, 0.2) * 10
+        - diagnostics["tfidf_ifvar_ratio_vs_zero"].clip(0, 2) * 2
     )
-    ranked["smallest_winning_budget_sort"] = ranked["smallest_winning_budget"].fillna(np.inf)
-    ranked = ranked.sort_values(
-        [
-            "passes_stability",
-            "smallest_winning_budget_sort",
-            "controlled_abs_beta",
-            "management_priority",
-            "if_weight_p99",
-        ],
-        ascending=[False, True, False, True, True],
+    diagnostics = diagnostics.sort_values(
+        ["screen_score", "passes_tfidf_proxy", "abs_beta_controlled", "if_weight_p99_abs"],
+        ascending=[False, False, False, True],
     ).reset_index(drop=True)
-    ranked.insert(0, "rank", np.arange(1, len(ranked) + 1))
-    ranked["recommended_top6"] = ranked["rank"] <= 6
-    return ranked.drop(columns=["smallest_winning_budget_sort"])
+    return diagnostics, budget, tfidf_meta
 
 
 def write_report(
     output_dir: Path,
-    ranked: pd.DataFrame,
-    budget_table: pd.DataFrame,
-    args: argparse.Namespace,
+    *,
+    diagnostics: pd.DataFrame,
+    budget: pd.DataFrame,
+    metadata: pd.DataFrame,
+    tfidf_meta: dict[str, float],
 ) -> None:
-    top = ranked.head(10)[
-        [
-            "rank",
-            "feature",
-            "source",
-            "controlled_beta",
-            "controlled_abs_beta",
-            "nonzero_share",
-            "if_weight_p99",
-            "smallest_winning_budget",
-            "best_s_at_smallest_winning_budget",
-        ]
+    shortlist_cols = [
+        "feature",
+        "family",
+        "kind",
+        "beta_controlled",
+        "nonzero_share",
+        "target_vif",
+        "if_weight_p99_abs",
+        "if_ess_share",
+        "tfidf_ifvar_ratio_vs_zero",
+        "screen_score",
+        "note",
     ]
+    top = diagnostics.head(20)[shortlist_cols]
+    proxy = (
+        budget.sort_values("tfidf_variance_ratio_vs_direct_zero")
+        .groupby(["feature", "budget"], as_index=False)
+        .head(1)
+        .sort_values(["budget", "tfidf_variance_ratio_vs_direct_zero"])
+        .groupby("budget", as_index=False)
+        .head(10)
+    )
     lines = [
-        "# Upworthy Feature Screening Report",
+        "# Upworthy Candidate Feature Screening",
         "",
-        f"- Input: `{args.input_csv}`",
-        f"- Replications: {args.replications}",
-        f"- s grid: {args.s_grid}",
-        f"- budgets: {args.budgets}",
-        f"- TF-IDF max features: {args.tfidf_max_features}",
-        f"- surrogate featurizer: {args.text_featurizer}",
-        f"- training objective: {args.training_objective}",
+        "This is a fast target-selection diagnostic. It does not replace Qwen/LoRA evidence.",
         "",
-        "## Top Ranked Features",
+        "## TF-IDF Surrogate",
         "",
-        top.to_markdown(index=False),
+        json.dumps(tfidf_meta, indent=2, sort_keys=True),
         "",
-        "## Budget Win Counts",
+        "## Top Candidate Coefficients",
         "",
-        budget_table.groupby("budget")["wins"].sum().reset_index(name="n_winning_features").to_markdown(index=False),
+        dataframe_to_markdown(top, index=False, floatfmt=".4f"),
         "",
-        "Interpretation: a budget win means at least one training size `s < B` has mean `nu_j(s)/nu_j(0) < (B-s)/B`.",
+        "## Best Cheap Proxy Budget Rows",
+        "",
+        dataframe_to_markdown(proxy.head(40), index=False, floatfmt=".4f") if not proxy.empty else "(none)",
+        "",
+        "## Feature Families",
+        "",
+        dataframe_to_markdown(
+            metadata.groupby(["family", "kind"], as_index=False).size().sort_values(["family", "kind"]),
+            index=False,
+        ),
         "",
     ]
-    (output_dir / "screening_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (output_dir / "screening_report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Fast CPU feature screening for Upworthy M-estimation targets.")
+    parser = argparse.ArgumentParser(description="Screen Upworthy headline features for coefficient-targeted FT+PPI.")
     parser.add_argument("--input-csv", type=Path, default=Path("Data/upworthy_pairs_with_text_features.csv"))
-    parser.add_argument("--output-dir", type=Path, default=Path("artifacts/upworthy_m_estimation/feature_screening"))
-    parser.add_argument("--replications", type=int, default=30)
-    parser.add_argument("--seed", type=int, default=20260619)
-    parser.add_argument("--s-grid", type=int, nargs="+", default=DEFAULT_S_GRID)
-    parser.add_argument("--budgets", type=int, nargs="+", default=DEFAULT_BUDGETS)
-    parser.add_argument("--alphas", type=float, nargs="+", default=DEFAULT_ALPHAS)
-    parser.add_argument("--core-controls", nargs="+", default=DEFAULT_CORE_CONTROLS)
-    parser.add_argument("--train-pool-size", type=int, default=3000)
-    parser.add_argument("--validation-stop-size", type=int, default=1000)
-    parser.add_argument("--validation-scale-size", type=int, default=1000)
-    parser.add_argument("--tfidf-max-features", type=int, default=50000)
-    parser.add_argument("--tfidf-min-df", type=int, default=3)
-    parser.add_argument("--text-featurizer", choices=sorted(SURROGATE_FEATURIZERS), default="word")
-    parser.add_argument("--training-objective", choices=sorted(TRAINING_OBJECTIVES), default="mse")
-    parser.add_argument("--train-if-weight-clip-quantile", type=float, default=0.99)
-    parser.add_argument("--candidate-features", nargs="+", default=None)
-    parser.add_argument("--outcome-column", default=Y_COL)
-    parser.add_argument("--outcome-transform", default="")
-    parser.add_argument("--ctr-shrinkage-tau", type=float, default=0.0)
-    parser.add_argument("--min-impressions-per-arm", type=float, default=None)
-    parser.add_argument("--min-total-impressions", type=float, default=None)
-    parser.add_argument("--min-clicks-per-arm", type=float, default=None)
-    parser.add_argument("--max-features-to-screen", type=int, default=None)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--max-tfidf-features", type=int, default=50000)
+    parser.add_argument("--budgets", default=",".join(str(item) for item in DEFAULT_CI_BUDGETS))
     return parser.parse_args()
+
+
+def _parse_ints(value: str | Iterable[int]) -> list[int]:
+    if isinstance(value, str):
+        return [int(part.strip()) for part in value.split(",") if part.strip()]
+    return [int(item) for item in value]
 
 
 def main() -> None:
     args = parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    load_config = {
-        "feature_columns": discover_candidate_features(pd.read_csv(args.input_csv, nrows=5)),
-        "outcome_column": args.outcome_column,
-        "outcome_transform": args.outcome_transform,
-        "ctr_shrinkage_tau": args.ctr_shrinkage_tau,
-        "min_impressions_per_arm": args.min_impressions_per_arm,
-        "min_total_impressions": args.min_total_impressions,
-        "min_clicks_per_arm": args.min_clicks_per_arm,
-    }
-    df = load_upworthy_pairs(args.input_csv, load_config)
-    candidates = discover_candidate_features(df, max_features=args.max_features_to_screen)
-    if args.candidate_features:
-        requested = [
-            str(item) if str(item).startswith("delta_") else f"delta_{item}"
-            for item in args.candidate_features
-        ]
-        missing = sorted(set(requested) - set(candidates))
-        if missing:
-            raise ValueError(f"requested candidate features are unavailable: {missing}")
-        candidates = requested
-    if not candidates:
-        raise ValueError("no candidate delta_* features found")
-    summary, _, controlled_stats = compute_candidate_summaries(df, candidates, list(args.core_controls), list(args.budgets))
-    scaling = compute_tfidf_scaling(
-        df,
-        candidates,
-        controlled_stats,
-        s_values=sorted(set(int(s) for s in args.s_grid)),
-        replications=int(args.replications),
-        seed=int(args.seed),
-        train_pool_size=int(args.train_pool_size),
-        validation_stop_size=int(args.validation_stop_size),
-        validation_scale_size=int(args.validation_scale_size),
-        alphas=[float(alpha) for alpha in args.alphas],
-        max_features=int(args.tfidf_max_features),
-        min_df=int(args.tfidf_min_df),
-        text_featurizer=str(args.text_featurizer),
-        structured_columns=candidates,
-        training_objective=str(args.training_objective),
-        train_if_weight_clip_quantile=float(args.train_if_weight_clip_quantile),
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frame = pd.read_csv(args.input_csv)
+    candidate_frame, metadata = build_candidate_features(frame)
+    diagnostics, budget, tfidf_meta = summarize_candidates(
+        candidate_frame,
+        metadata,
+        budgets=_parse_ints(args.budgets),
+        max_features=args.max_tfidf_features,
     )
-    budget_table = build_budget_win_table(scaling, list(args.budgets))
-    ranked = rank_candidates(summary, budget_table)
-
-    summary.to_csv(args.output_dir / "candidate_screening_summary.csv", index=False)
-    scaling.to_csv(args.output_dir / "tfidf_scaling_by_feature_s.csv", index=False)
-    budget_table.to_csv(args.output_dir / "budget_win_table.csv", index=False)
-    ranked.to_csv(args.output_dir / "ranked_shortlist.csv", index=False)
-    (args.output_dir / "screening_args.json").write_text(json.dumps(vars(args), default=str, indent=2) + "\n", encoding="utf-8")
-    write_report(args.output_dir, ranked, budget_table, args)
-    print(json.dumps({"output_dir": str(args.output_dir), "n_features": len(candidates), "top_features": ranked.head(6)["feature"].tolist()}, indent=2))
+    candidate_frame.to_csv(output_dir / "upworthy_pairs_candidate_features.csv", index=False)
+    metadata.to_csv(output_dir / "candidate_feature_metadata.csv", index=False)
+    diagnostics.to_csv(output_dir / "candidate_diagnostics.csv", index=False)
+    budget.to_csv(output_dir / "cheap_tfidf_budget_proxy.csv", index=False)
+    candidate_cols = metadata["feature"].tolist()
+    candidate_frame.loc[candidate_frame["split"] == "target", candidate_cols].corr().to_csv(
+        output_dir / "candidate_correlations_target.csv"
+    )
+    (output_dir / "tfidf_surrogate_metadata.json").write_text(json.dumps(tfidf_meta, indent=2, sort_keys=True) + "\n")
+    write_report(output_dir, diagnostics=diagnostics, budget=budget, metadata=metadata, tfidf_meta=tfidf_meta)
+    print(f"wrote {output_dir}")
+    print(dataframe_to_markdown(diagnostics.head(15), index=False, floatfmt=".4f"))
 
 
 if __name__ == "__main__":
