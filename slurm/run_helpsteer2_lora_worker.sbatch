@@ -33,6 +33,9 @@ export WANDB_DISABLED="${WANDB_DISABLED:-true}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 
 if [ ! -x "$VENV_DIR/bin/python" ]; then
   echo "Missing $VENV_DIR. Run: bash scripts/setup_hyak_env.sh"
@@ -53,13 +56,22 @@ PYTHON_BIN="$VENV_REAL/bin/python"
 echo "PYTHON_BIN=$PYTHON_BIN"
 "$PYTHON_BIN" --version
 
-"$PYTHON_BIN" - <<'PY'
+echo "torch_preflight_start $(date)"
+set +e
+timeout "${TORCH_PREFLIGHT_TIMEOUT:-180}" "$PYTHON_BIN" - <<'PY'
 import torch
 print("torch", torch.__version__)
 print("cuda_available", torch.cuda.is_available())
 print("device", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
 print("bf16_supported", torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False)
 PY
+code="$?"
+set -e
+if [ "$code" -ne 0 ]; then
+  echo "torch_preflight_failed_or_timed_out code=$code timeout=${TORCH_PREFLIGHT_TIMEOUT:-180} $(date)"
+  exit "$code"
+fi
+echo "torch_preflight_done $(date)"
 
 WORKER_INDEX="${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID is required}"
 NUM_WORKERS="${NUM_WORKERS:?NUM_WORKERS is required}"
