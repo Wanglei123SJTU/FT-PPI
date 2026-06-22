@@ -165,6 +165,13 @@ def nested_train_indices(train_pool: np.ndarray, *, seed: int, replication: int,
     return np.sort(order[:s])
 
 
+def limit_indices(indices: np.ndarray, *, limit: int | None, seed: int) -> np.ndarray:
+    if limit is None or limit <= 0 or limit >= len(indices):
+        return indices
+    rng = np.random.default_rng(seed)
+    return np.sort(rng.choice(indices, size=limit, replace=False))
+
+
 def evaluate_predictions(y_true: np.ndarray, y_pred: np.ndarray, if_weights: np.ndarray) -> dict[str, float]:
     residual = y_true - y_pred
     if_residual = if_weights * residual
@@ -207,6 +214,15 @@ def make_cell_plan(
     plan = pd.DataFrame(rows)
     plan.insert(0, "task_index", np.arange(len(plan), dtype=int))
     return plan
+
+
+def plan_for_worker(plan: pd.DataFrame, *, worker_index: int, num_workers: int) -> pd.DataFrame:
+    if num_workers <= 0:
+        raise ValueError("num_workers must be positive")
+    if worker_index < 0 or worker_index >= num_workers:
+        raise ValueError(f"worker_index={worker_index} must be in [0, {num_workers})")
+    task_index = plan["task_index"].astype(int)
+    return plan.loc[task_index % num_workers == worker_index].copy()
 
 
 def _load_tokenizer_and_model(
@@ -275,6 +291,24 @@ def _load_tokenizer_and_model(
     return tokenizer, model
 
 
+def _trainable_parameter_state(model) -> dict[str, object]:
+    return {
+        name: parameter.detach().cpu().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+
+
+def _load_trainable_parameter_state(model, state: dict[str, object]) -> None:
+    parameters = dict(model.named_parameters())
+    with __import__("torch").no_grad():
+        for name, value in state.items():
+            if name not in parameters:
+                raise KeyError(f"missing trainable parameter in model: {name}")
+            parameter = parameters[name]
+            parameter.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
+
+
 def _tokenize_texts(tokenizer, texts: list[str], *, max_length: int):
     return tokenizer(
         texts,
@@ -326,7 +360,7 @@ def _predict_indices(
     return np.concatenate(values) if values else np.array([], dtype=float)
 
 
-def train_lora_cell(
+def train_lora_cell_cached(
     frame: pd.DataFrame,
     *,
     target: str,
@@ -336,11 +370,15 @@ def train_lora_cell(
     evaluation_idx: np.ndarray,
     method: MethodSpec,
     seed: int,
-    model_name: str,
-    load_in_4bit: bool,
-    dtype: str,
-    trust_remote_code: bool,
-    max_length: int,
+    model,
+    encoded_forward: dict,
+    encoded_swapped: dict,
+    y: np.ndarray,
+    if_weights: np.ndarray,
+    initial_trainable_state: dict[str, object],
+    beta_intercept: float,
+    beta_target: float,
+    hessian_condition: float,
     train_batch_size: int,
     eval_batch_size: int,
     gradient_accumulation_steps: int,
@@ -348,58 +386,28 @@ def train_lora_cell(
     weight_decay: float,
     max_epochs: int,
     patience: int,
-    lora_r: int,
-    lora_alpha: int,
-    lora_dropout: float,
-    target_modules: list[str],
-    gradient_checkpointing: bool,
-    hessian_ridge: float,
 ) -> dict[str, float | str | int]:
     import torch
 
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    _load_trainable_parameter_state(model, initial_trainable_state)
+    model.train()
     print(
         "train_lora_cell_start "
         f"target={target} method={method.method} seed={seed} train_size={len(train_idx)}",
         flush=True,
     )
 
-    beta, hessian, if_weights = compute_ols_and_if_weights(
-        frame,
-        target=target,
-        feature_columns=feature_columns,
-        hessian_ridge=hessian_ridge,
-    )
     print(
         "computed_if_weights "
-        f"hessian_condition={np.linalg.cond(hessian):.4f} baseline_eval_ifvar="
+        f"hessian_condition={hessian_condition:.4f} baseline_eval_ifvar="
         f"{baseline_metrics(frame, if_weights, evaluation_idx)['ifvar']:.6f}",
         flush=True,
     )
     baseline_eval = baseline_metrics(frame, if_weights, evaluation_idx)
-    forward_texts, swapped_texts = build_pair_texts(frame)
-    print(f"loading_model model_name={model_name}", flush=True)
-    tokenizer, model = _load_tokenizer_and_model(
-        model_name=model_name,
-        load_in_4bit=load_in_4bit,
-        dtype=dtype,
-        trust_remote_code=trust_remote_code,
-        lora_r=lora_r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        target_modules=target_modules,
-        gradient_checkpointing=gradient_checkpointing,
-    )
     device = next(model.parameters()).device
-    print(f"model_loaded device={device}", flush=True)
-    print(f"tokenizing n_texts={len(forward_texts)} max_length={max_length}", flush=True)
-    encoded_forward = _tokenize_texts(tokenizer, forward_texts, max_length=max_length)
-    encoded_swapped = _tokenize_texts(tokenizer, swapped_texts, max_length=max_length)
-    print("tokenized", flush=True)
-
-    y = frame[Y_COL].astype(float).to_numpy(dtype=np.float32)
     y_tensor = torch.from_numpy(y).to(device)
     if_tensor = torch.from_numpy(if_weights.astype(np.float32)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -460,7 +468,7 @@ def train_lora_cell(
         if metric < best_metric - 1e-7:
             best_metric = metric
             best_epoch = epoch
-            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            best_state = _trainable_parameter_state(model)
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -468,10 +476,7 @@ def train_lora_cell(
                 break
 
     if best_state is not None:
-        # bitsandbytes 4-bit modules may expose non-parameter quantization
-        # state in state_dict; PEFT can ignore those keys when restoring the
-        # best trainable checkpoint for pilot evaluation.
-        model.load_state_dict(best_state, strict=False)
+        _load_trainable_parameter_state(model, best_state)
     model.eval()
     eval_pred = _predict_indices(
         model,
@@ -516,10 +521,95 @@ def train_lora_cell(
         "baseline_eval_mse": baseline_eval["mse"],
         "baseline_eval_ifvar": baseline_eval["ifvar"],
         "baseline_eval_ifmean": baseline_eval["ifmean"],
-        "beta_intercept": float(beta[0]),
-        "beta_target": float(beta[feature_columns.index(target) + 1]),
-        "hessian_condition": float(np.linalg.cond(hessian)),
+        "beta_intercept": float(beta_intercept),
+        "beta_target": float(beta_target),
+        "hessian_condition": float(hessian_condition),
     }
+    return result
+
+
+def train_lora_cell(
+    frame: pd.DataFrame,
+    *,
+    target: str,
+    feature_columns: list[str],
+    train_idx: np.ndarray,
+    validation_idx: np.ndarray,
+    evaluation_idx: np.ndarray,
+    method: MethodSpec,
+    seed: int,
+    model_name: str,
+    load_in_4bit: bool,
+    dtype: str,
+    trust_remote_code: bool,
+    max_length: int,
+    train_batch_size: int,
+    eval_batch_size: int,
+    gradient_accumulation_steps: int,
+    learning_rate: float,
+    weight_decay: float,
+    max_epochs: int,
+    patience: int,
+    lora_r: int,
+    lora_alpha: int,
+    lora_dropout: float,
+    target_modules: list[str],
+    gradient_checkpointing: bool,
+    hessian_ridge: float,
+) -> dict[str, float | str | int]:
+    import torch
+
+    beta, hessian, if_weights = compute_ols_and_if_weights(
+        frame,
+        target=target,
+        feature_columns=feature_columns,
+        hessian_ridge=hessian_ridge,
+    )
+    forward_texts, swapped_texts = build_pair_texts(frame)
+    print(f"loading_model model_name={model_name}", flush=True)
+    tokenizer, model = _load_tokenizer_and_model(
+        model_name=model_name,
+        load_in_4bit=load_in_4bit,
+        dtype=dtype,
+        trust_remote_code=trust_remote_code,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=target_modules,
+        gradient_checkpointing=gradient_checkpointing,
+    )
+    print(f"model_loaded device={next(model.parameters()).device}", flush=True)
+    print(f"tokenizing n_texts={len(forward_texts)} max_length={max_length}", flush=True)
+    encoded_forward = _tokenize_texts(tokenizer, forward_texts, max_length=max_length)
+    encoded_swapped = _tokenize_texts(tokenizer, swapped_texts, max_length=max_length)
+    print("tokenized", flush=True)
+    initial_trainable_state = _trainable_parameter_state(model)
+    result = train_lora_cell_cached(
+        frame,
+        target=target,
+        feature_columns=feature_columns,
+        train_idx=train_idx,
+        validation_idx=validation_idx,
+        evaluation_idx=evaluation_idx,
+        method=method,
+        seed=seed,
+        model=model,
+        encoded_forward=encoded_forward,
+        encoded_swapped=encoded_swapped,
+        y=frame[Y_COL].astype(float).to_numpy(dtype=np.float32),
+        if_weights=if_weights,
+        initial_trainable_state=initial_trainable_state,
+        beta_intercept=float(beta[0]),
+        beta_target=float(beta[feature_columns.index(target) + 1]),
+        hessian_condition=float(np.linalg.cond(hessian)),
+        train_batch_size=train_batch_size,
+        eval_batch_size=eval_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        max_epochs=max_epochs,
+        patience=patience,
+    )
     del model, tokenizer, encoded_forward, encoded_swapped
     gc.collect()
     if torch.cuda.is_available():
@@ -777,14 +867,24 @@ def train_cell_command(args: argparse.Namespace) -> None:
         replication=int(cell["replication"]),
         s=int(cell["s"]),
     )
+    validation_idx = limit_indices(
+        splits["validation"],
+        limit=args.validation_limit,
+        seed=args.seed + 20_001 + int(cell["task_index"]),
+    )
+    evaluation_idx = limit_indices(
+        splits["evaluation"],
+        limit=args.evaluation_limit,
+        seed=args.seed + 40_001 + int(cell["task_index"]),
+    )
     start = time.time()
     result = train_lora_cell(
         frame,
         target=str(cell["target"]),
         feature_columns=feature_columns,
         train_idx=train_idx,
-        validation_idx=splits["validation"],
-        evaluation_idx=splits["evaluation"],
+        validation_idx=validation_idx,
+        evaluation_idx=evaluation_idx,
         method=method,
         seed=args.seed + 17 * int(cell["task_index"]) + 101,
         model_name=args.model_name,
@@ -816,6 +916,8 @@ def train_cell_command(args: argparse.Namespace) -> None:
             "max_length": args.max_length,
             "train_batch_size": args.train_batch_size,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "validation_size": int(len(validation_idx)),
+            "evaluation_size": int(len(evaluation_idx)),
         }
     )
     cell_dir = output_dir / "cells"
@@ -823,6 +925,158 @@ def train_cell_command(args: argparse.Namespace) -> None:
     path = cell_dir / f"cell_{int(cell['task_index']):04d}.json"
     write_json(path, result)
     print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def train_worker_command(args: argparse.Namespace) -> None:
+    import torch
+
+    output_dir = Path(args.output_dir)
+    cell_dir = output_dir / "cells"
+    cell_dir.mkdir(parents=True, exist_ok=True)
+    plan = pd.read_csv(args.plan_csv)
+    worker_plan = plan_for_worker(plan, worker_index=args.worker_index, num_workers=args.num_workers)
+    if worker_plan.empty:
+        print(
+            f"train_worker_no_cells worker_index={args.worker_index} num_workers={args.num_workers}",
+            flush=True,
+        )
+        return
+
+    frame = normalize_helpsteer_features(pd.read_csv(args.input_csv))
+    feature_columns = parse_csv_list(args.features)
+    splits = split_indices(len(frame), seed=args.seed)
+    y = frame[Y_COL].astype(float).to_numpy(dtype=np.float32)
+    forward_texts, swapped_texts = build_pair_texts(frame)
+
+    print(
+        "train_worker_start "
+        f"worker_index={args.worker_index}/{args.num_workers} n_cells={len(worker_plan)} "
+        f"model_name={args.model_name}",
+        flush=True,
+    )
+    tokenizer, model = _load_tokenizer_and_model(
+        model_name=args.model_name,
+        load_in_4bit=not args.no_4bit,
+        dtype=args.dtype,
+        trust_remote_code=args.trust_remote_code,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=parse_csv_list(args.target_modules),
+        gradient_checkpointing=not args.no_gradient_checkpointing,
+    )
+    print(f"worker_model_loaded device={next(model.parameters()).device}", flush=True)
+    print(f"worker_tokenizing n_texts={len(forward_texts)} max_length={args.max_length}", flush=True)
+    encoded_forward = _tokenize_texts(tokenizer, forward_texts, max_length=args.max_length)
+    encoded_swapped = _tokenize_texts(tokenizer, swapped_texts, max_length=args.max_length)
+    print("worker_tokenized", flush=True)
+    initial_trainable_state = _trainable_parameter_state(model)
+
+    target_cache: dict[str, tuple[float, float, float, np.ndarray]] = {}
+    completed = 0
+    skipped = 0
+    for _, cell_row in worker_plan.sort_values("task_index").iterrows():
+        cell = cell_row.to_dict()
+        task_index = int(cell["task_index"])
+        path = cell_dir / f"cell_{task_index:04d}.json"
+        if path.exists():
+            print(f"train_worker_skip_existing task_index={task_index} path={path}", flush=True)
+            skipped += 1
+            continue
+
+        target = str(cell["target"])
+        if target not in target_cache:
+            beta, hessian, if_weights = compute_ols_and_if_weights(
+                frame,
+                target=target,
+                feature_columns=feature_columns,
+                hessian_ridge=args.hessian_ridge,
+            )
+            target_cache[target] = (
+                float(beta[0]),
+                float(beta[feature_columns.index(target) + 1]),
+                float(np.linalg.cond(hessian)),
+                if_weights,
+            )
+        beta_intercept, beta_target, hessian_condition, if_weights = target_cache[target]
+        method = MethodSpec(
+            method=str(cell["method"]),
+            objective=str(cell["objective"]),
+            stop_metric=str(cell["stop_metric"]),
+            label=str(cell["method_label"]),
+        )
+        train_idx = nested_train_indices(
+            splits["train_pool"],
+            seed=args.seed,
+            replication=int(cell["replication"]),
+            s=int(cell["s"]),
+        )
+        validation_idx = limit_indices(
+            splits["validation"],
+            limit=args.validation_limit,
+            seed=args.seed + 20_001 + task_index,
+        )
+        evaluation_idx = limit_indices(
+            splits["evaluation"],
+            limit=args.evaluation_limit,
+            seed=args.seed + 40_001 + task_index,
+        )
+        start = time.time()
+        result = train_lora_cell_cached(
+            frame,
+            target=target,
+            feature_columns=feature_columns,
+            train_idx=train_idx,
+            validation_idx=validation_idx,
+            evaluation_idx=evaluation_idx,
+            method=method,
+            seed=args.seed + 17 * task_index + 101,
+            model=model,
+            encoded_forward=encoded_forward,
+            encoded_swapped=encoded_swapped,
+            y=y,
+            if_weights=if_weights,
+            initial_trainable_state=initial_trainable_state,
+            beta_intercept=beta_intercept,
+            beta_target=beta_target,
+            hessian_condition=hessian_condition,
+            train_batch_size=args.train_batch_size,
+            eval_batch_size=args.eval_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            max_epochs=args.max_epochs,
+            patience=args.patience,
+        )
+        result.update(
+            {
+                "task_index": task_index,
+                "replication": int(cell["replication"]),
+                "s": int(cell["s"]),
+                "seconds": time.time() - start,
+                "model_name": args.model_name,
+                "max_length": args.max_length,
+                "train_batch_size": args.train_batch_size,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "validation_size": int(len(validation_idx)),
+                "evaluation_size": int(len(evaluation_idx)),
+                "worker_index": int(args.worker_index),
+                "num_workers": int(args.num_workers),
+            }
+        )
+        write_json(path, result)
+        completed += 1
+        print(json.dumps(result, indent=2, sort_keys=True), flush=True)
+
+    del model, tokenizer, encoded_forward, encoded_swapped
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(
+        "train_worker_done "
+        f"worker_index={args.worker_index}/{args.num_workers} completed={completed} skipped={skipped}",
+        flush=True,
+    )
 
 
 def aggregate_command(args: argparse.Namespace) -> None:
@@ -892,6 +1146,35 @@ def build_parser() -> argparse.ArgumentParser:
         default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
     )
     train.add_argument("--no-gradient-checkpointing", action="store_true")
+    train.add_argument("--validation-limit", type=int, default=0)
+    train.add_argument("--evaluation-limit", type=int, default=0)
+
+    worker = subparsers.add_parser("train-worker")
+    worker.add_argument("--plan-csv", required=True)
+    worker.add_argument("--worker-index", type=int, required=True)
+    worker.add_argument("--num-workers", type=int, required=True)
+    worker.add_argument("--model-name", default=DEFAULT_MODEL)
+    worker.add_argument("--dtype", choices=["auto", "float16", "bfloat16", "float32"], default="bfloat16")
+    worker.add_argument("--no-4bit", action="store_true")
+    worker.add_argument("--trust-remote-code", action="store_true")
+    worker.add_argument("--max-length", type=int, default=768)
+    worker.add_argument("--train-batch-size", type=int, default=4)
+    worker.add_argument("--eval-batch-size", type=int, default=8)
+    worker.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    worker.add_argument("--learning-rate", type=float, default=2e-4)
+    worker.add_argument("--weight-decay", type=float, default=0.01)
+    worker.add_argument("--max-epochs", type=int, default=8)
+    worker.add_argument("--patience", type=int, default=2)
+    worker.add_argument("--lora-r", type=int, default=16)
+    worker.add_argument("--lora-alpha", type=int, default=32)
+    worker.add_argument("--lora-dropout", type=float, default=0.05)
+    worker.add_argument(
+        "--target-modules",
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+    )
+    worker.add_argument("--no-gradient-checkpointing", action="store_true")
+    worker.add_argument("--validation-limit", type=int, default=0)
+    worker.add_argument("--evaluation-limit", type=int, default=0)
 
     subparsers.add_parser("aggregate")
     return parser
@@ -906,6 +1189,8 @@ def main() -> None:
         make_plan_command(args)
     elif args.command == "train-cell":
         train_cell_command(args)
+    elif args.command == "train-worker":
+        train_worker_command(args)
     elif args.command == "aggregate":
         aggregate_command(args)
     else:

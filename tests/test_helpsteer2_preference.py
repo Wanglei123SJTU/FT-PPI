@@ -14,8 +14,10 @@ from src.experiments.helpsteer2_lora_scaling import (
     DEFAULT_METHODS,
     build_pair_texts,
     compute_ols_and_if_weights,
+    limit_indices,
     make_cell_plan,
     normalize_helpsteer_features,
+    plan_for_worker,
 )
 
 
@@ -121,3 +123,22 @@ def test_lora_cell_plan_counts_targets_methods_s_and_reps():
     assert len(plan) == 2 * 2 * 2 * 3
     assert plan["task_index"].tolist() == list(range(len(plan)))
     assert set(plan["method"]) == {"mse_stop_mse", "mse_stop_ifvar"}
+
+
+def test_limit_indices_is_deterministic_and_respects_limit():
+    indices = np.arange(20)
+    limited = limit_indices(indices, limit=5, seed=123)
+    repeated = limit_indices(indices, limit=5, seed=123)
+    assert len(limited) == 5
+    assert np.array_equal(limited, repeated)
+    assert np.all(np.diff(limited) > 0)
+    assert np.array_equal(limit_indices(indices, limit=0, seed=123), indices)
+    assert np.array_equal(limit_indices(indices, limit=99, seed=123), indices)
+
+
+def test_plan_for_worker_partitions_cells_without_overlap():
+    plan = make_cell_plan(targets=["delta_log_length_scale"], methods=DEFAULT_METHODS, s_grid=[50, 100], replications=2)
+    shards = [plan_for_worker(plan, worker_index=i, num_workers=4) for i in range(4)]
+    combined = sorted(int(task) for shard in shards for task in shard["task_index"])
+    assert combined == plan["task_index"].tolist()
+    assert sum(len(shard) for shard in shards) == len(plan)
