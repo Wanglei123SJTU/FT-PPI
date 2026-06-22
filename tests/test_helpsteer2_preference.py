@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -18,7 +21,17 @@ from src.experiments.helpsteer2_lora_scaling import (
     make_cell_plan,
     normalize_helpsteer_features,
     plan_for_worker,
+    _load_or_compute_target_static,
+    _load_or_tokenize_texts,
 )
+
+
+def _workspace_test_cache(name: str) -> Path:
+    path = Path("artifacts") / "test_tmp" / name
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def test_prompt_coverage_uses_prompt_tokens():
@@ -142,3 +155,69 @@ def test_plan_for_worker_partitions_cells_without_overlap():
     combined = sorted(int(task) for shard in shards for task in shard["task_index"])
     assert combined == plan["task_index"].tolist()
     assert sum(len(shard) for shard in shards) == len(plan)
+
+
+def test_tokenization_cache_reuses_saved_tensors():
+    torch = __import__("pytest").importorskip("torch")
+    cache_dir = _workspace_test_cache("tokenization_cache")
+
+    class CountingTokenizer:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, texts, *, padding, truncation, max_length, return_tensors):
+            self.calls += 1
+            assert padding is True
+            assert truncation is True
+            assert return_tensors == "pt"
+            width = min(max_length, 4)
+            values = torch.arange(len(texts) * width, dtype=torch.long).reshape(len(texts), width)
+            return {"input_ids": values, "attention_mask": torch.ones_like(values)}
+
+    tokenizer = CountingTokenizer()
+    texts = ["first response", "second response"]
+    first = _load_or_tokenize_texts(
+        tokenizer,
+        texts,
+        max_length=8,
+        cache_dir=cache_dir,
+        model_name="toy/model",
+        direction="forward",
+    )
+    second = _load_or_tokenize_texts(
+        tokenizer,
+        texts,
+        max_length=8,
+        cache_dir=cache_dir,
+        model_name="toy/model",
+        direction="forward",
+    )
+    assert tokenizer.calls == 1
+    assert torch.equal(first["input_ids"], second["input_ids"])
+    assert len(list(cache_dir.glob("tokenized_forward_*.pt"))) == 1
+    shutil.rmtree(cache_dir)
+
+
+def test_static_cache_reuses_if_weights():
+    cache_dir = _workspace_test_cache("static_cache")
+    raw = pd.DataFrame(
+        {
+            "y_preference_strength": [-1.0, 0.0, 1.0, 2.0, 1.5],
+            "delta_log_length": [-0.8, -0.2, 0.3, 1.1, 0.6],
+            "delta_log_sentences": [-0.6, 0.1, 0.4, 0.9, 0.5],
+        }
+    )
+    frame = normalize_helpsteer_features(raw)
+    kwargs = {
+        "frame": frame,
+        "target": "delta_log_length_scale",
+        "feature_columns": ["delta_log_length_scale", "delta_log_sentences_scale"],
+        "hessian_ridge": 0.0,
+        "cache_dir": cache_dir,
+    }
+    first = _load_or_compute_target_static(**kwargs)
+    second = _load_or_compute_target_static(**kwargs)
+    assert first[:3] == second[:3]
+    assert np.allclose(first[3], second[3])
+    assert len(list(cache_dir.glob("static_delta_log_length_scale_*.npz"))) == 1
+    shutil.rmtree(cache_dir)

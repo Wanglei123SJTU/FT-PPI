@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +22,8 @@ DEFAULT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_FEATURES = ["delta_log_length_scale", "delta_log_sentences_scale"]
 DEFAULT_TARGETS = ["delta_log_length_scale"]
 DEFAULT_S_GRID = [50, 100, 150, 200, 300, 400, 500, 700]
+TOKEN_CACHE_VERSION = "v1"
+STATIC_CACHE_VERSION = "v1"
 
 
 @dataclass(frozen=True)
@@ -317,6 +321,207 @@ def _tokenize_texts(tokenizer, texts: list[str], *, max_length: int):
         max_length=max_length,
         return_tensors="pt",
     )
+
+
+def _safe_cache_name(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in value)
+
+
+def _hash_strings(values: Iterable[str]) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        data = str(value).encode("utf-8", errors="replace")
+        digest.update(len(data).to_bytes(8, byteorder="little", signed=False))
+        digest.update(data)
+    return digest.hexdigest()
+
+
+def _tokenization_cache_path(
+    cache_dir: str | Path | None,
+    *,
+    model_name: str,
+    max_length: int,
+    direction: str,
+    texts: list[str],
+) -> Path | None:
+    if cache_dir is None or str(cache_dir).strip() == "":
+        return None
+    text_hash = _hash_strings(texts)
+    model_key = _safe_cache_name(model_name)
+    name = f"tokenized_{direction}_{model_key}_max{max_length}_{TOKEN_CACHE_VERSION}_{text_hash[:16]}.pt"
+    return Path(cache_dir) / name
+
+
+def _acquire_cache_lock(lock_path: Path) -> bool:
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(f"pid={os.getpid()} time={time.time()}\n")
+    return True
+
+
+def _wait_for_cache_file(path: Path, lock_path: Path, *, timeout_seconds: float = 900.0) -> bool:
+    start = time.time()
+    while time.time() - start < timeout_seconds:
+        if path.exists():
+            return True
+        if not lock_path.exists():
+            return False
+        time.sleep(5.0)
+    return path.exists()
+
+
+def _load_or_tokenize_texts(
+    tokenizer,
+    texts: list[str],
+    *,
+    max_length: int,
+    cache_dir: str | Path | None,
+    model_name: str,
+    direction: str,
+):
+    import torch
+
+    path = _tokenization_cache_path(
+        cache_dir,
+        model_name=model_name,
+        max_length=max_length,
+        direction=direction,
+        texts=texts,
+    )
+    if path is None:
+        return _tokenize_texts(tokenizer, texts, max_length=max_length)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        print(f"tokenization_cache_hit direction={direction} path={path}", flush=True)
+        return torch.load(path, map_location="cpu")
+
+    lock_path = Path(str(path) + ".lock")
+    if _acquire_cache_lock(lock_path):
+        tmp_path = Path(str(path) + f".tmp.{os.getpid()}")
+        try:
+            print(f"tokenization_cache_build direction={direction} path={path}", flush=True)
+            encoded = _tokenize_texts(tokenizer, texts, max_length=max_length)
+            torch.save(encoded, tmp_path)
+            os.replace(tmp_path, path)
+            print(f"tokenization_cache_stored direction={direction} path={path}", flush=True)
+            return encoded
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            if lock_path.exists():
+                lock_path.unlink()
+
+    print(f"tokenization_cache_wait direction={direction} path={path}", flush=True)
+    if _wait_for_cache_file(path, lock_path):
+        print(f"tokenization_cache_hit_after_wait direction={direction} path={path}", flush=True)
+        return torch.load(path, map_location="cpu")
+    print(f"tokenization_cache_miss_after_wait direction={direction} path={path}", flush=True)
+    return _tokenize_texts(tokenizer, texts, max_length=max_length)
+
+
+def _static_cache_key(
+    frame: pd.DataFrame,
+    *,
+    target: str,
+    feature_columns: list[str],
+    hessian_ridge: float,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(STATIC_CACHE_VERSION.encode("utf-8"))
+    digest.update(target.encode("utf-8"))
+    digest.update(str(float(hessian_ridge)).encode("utf-8"))
+    for column in [Y_COL, *feature_columns]:
+        digest.update(column.encode("utf-8"))
+        values = frame[column].astype(float).to_numpy(dtype=np.float64)
+        digest.update(values.shape[0].to_bytes(8, byteorder="little", signed=False))
+        digest.update(np.ascontiguousarray(values).tobytes())
+    return digest.hexdigest()
+
+
+def _target_static_cache_path(
+    cache_dir: str | Path | None,
+    *,
+    frame: pd.DataFrame,
+    target: str,
+    feature_columns: list[str],
+    hessian_ridge: float,
+) -> Path | None:
+    if cache_dir is None or str(cache_dir).strip() == "":
+        return None
+    key = _static_cache_key(
+        frame,
+        target=target,
+        feature_columns=feature_columns,
+        hessian_ridge=hessian_ridge,
+    )
+    target_key = _safe_cache_name(target)
+    return Path(cache_dir) / f"static_{target_key}_{STATIC_CACHE_VERSION}_{key[:16]}.npz"
+
+
+def _load_or_compute_target_static(
+    frame: pd.DataFrame,
+    *,
+    target: str,
+    feature_columns: list[str],
+    hessian_ridge: float,
+    cache_dir: str | Path | None,
+) -> tuple[float, float, float, np.ndarray]:
+    path = _target_static_cache_path(
+        cache_dir,
+        frame=frame,
+        target=target,
+        feature_columns=feature_columns,
+        hessian_ridge=hessian_ridge,
+    )
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            payload = np.load(path, allow_pickle=False)
+            print(f"static_cache_hit target={target} path={path}", flush=True)
+            return (
+                float(payload["beta_intercept"]),
+                float(payload["beta_target"]),
+                float(payload["hessian_condition"]),
+                payload["if_weights"].astype(float),
+            )
+
+    beta, hessian, if_weights = compute_ols_and_if_weights(
+        frame,
+        target=target,
+        feature_columns=feature_columns,
+        hessian_ridge=hessian_ridge,
+    )
+    result = (
+        float(beta[0]),
+        float(beta[feature_columns.index(target) + 1]),
+        float(np.linalg.cond(hessian)),
+        if_weights,
+    )
+    if path is not None:
+        lock_path = Path(str(path) + ".lock")
+        if _acquire_cache_lock(lock_path):
+            tmp_path = Path(str(path) + f".tmp.{os.getpid()}")
+            try:
+                np.savez(
+                    tmp_path,
+                    beta_intercept=np.array(result[0], dtype=np.float64),
+                    beta_target=np.array(result[1], dtype=np.float64),
+                    hessian_condition=np.array(result[2], dtype=np.float64),
+                    if_weights=np.asarray(result[3], dtype=np.float64),
+                )
+                npz_tmp = Path(str(tmp_path) + ".npz")
+                os.replace(npz_tmp if npz_tmp.exists() else tmp_path, path)
+                print(f"static_cache_stored target={target} path={path}", flush=True)
+            finally:
+                for candidate in [tmp_path, Path(str(tmp_path) + ".npz")]:
+                    if candidate.exists():
+                        candidate.unlink()
+                if lock_path.exists():
+                    lock_path.unlink()
+    return result
 
 
 def _batch_iter(indices: np.ndarray, *, batch_size: int, rng: np.random.Generator) -> Iterable[np.ndarray]:
@@ -947,11 +1152,14 @@ def train_worker_command(args: argparse.Namespace) -> None:
     splits = split_indices(len(frame), seed=args.seed)
     y = frame[Y_COL].astype(float).to_numpy(dtype=np.float32)
     forward_texts, swapped_texts = build_pair_texts(frame)
+    cache_dir = Path(args.cache_dir) if str(args.cache_dir).strip() else output_dir / "cache"
+    token_cache_dir = cache_dir / "tokenized"
+    static_cache_dir = cache_dir / "static"
 
     print(
         "train_worker_start "
         f"worker_index={args.worker_index}/{args.num_workers} n_cells={len(worker_plan)} "
-        f"model_name={args.model_name}",
+        f"model_name={args.model_name} cache_dir={cache_dir}",
         flush=True,
     )
     tokenizer, model = _load_tokenizer_and_model(
@@ -967,8 +1175,22 @@ def train_worker_command(args: argparse.Namespace) -> None:
     )
     print(f"worker_model_loaded device={next(model.parameters()).device}", flush=True)
     print(f"worker_tokenizing n_texts={len(forward_texts)} max_length={args.max_length}", flush=True)
-    encoded_forward = _tokenize_texts(tokenizer, forward_texts, max_length=args.max_length)
-    encoded_swapped = _tokenize_texts(tokenizer, swapped_texts, max_length=args.max_length)
+    encoded_forward = _load_or_tokenize_texts(
+        tokenizer,
+        forward_texts,
+        max_length=args.max_length,
+        cache_dir=token_cache_dir,
+        model_name=args.model_name,
+        direction="forward",
+    )
+    encoded_swapped = _load_or_tokenize_texts(
+        tokenizer,
+        swapped_texts,
+        max_length=args.max_length,
+        cache_dir=token_cache_dir,
+        model_name=args.model_name,
+        direction="swapped",
+    )
     print("worker_tokenized", flush=True)
     initial_trainable_state = _trainable_parameter_state(model)
 
@@ -986,18 +1208,14 @@ def train_worker_command(args: argparse.Namespace) -> None:
 
         target = str(cell["target"])
         if target not in target_cache:
-            beta, hessian, if_weights = compute_ols_and_if_weights(
+            beta_intercept, beta_target, hessian_condition, if_weights = _load_or_compute_target_static(
                 frame,
                 target=target,
                 feature_columns=feature_columns,
                 hessian_ridge=args.hessian_ridge,
+                cache_dir=static_cache_dir,
             )
-            target_cache[target] = (
-                float(beta[0]),
-                float(beta[feature_columns.index(target) + 1]),
-                float(np.linalg.cond(hessian)),
-                if_weights,
-            )
+            target_cache[target] = (beta_intercept, beta_target, hessian_condition, if_weights)
         beta_intercept, beta_target, hessian_condition, if_weights = target_cache[target]
         method = MethodSpec(
             method=str(cell["method"]),
@@ -1175,6 +1393,11 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--no-gradient-checkpointing", action="store_true")
     worker.add_argument("--validation-limit", type=int, default=0)
     worker.add_argument("--evaluation-limit", type=int, default=0)
+    worker.add_argument(
+        "--cache-dir",
+        default="",
+        help="Directory for reusable tokenization and static IF/OLS caches. Defaults to OUTPUT_DIR/cache.",
+    )
 
     subparsers.add_parser("aggregate")
     return parser
