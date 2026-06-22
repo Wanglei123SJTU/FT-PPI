@@ -56,22 +56,26 @@ PYTHON_BIN="$VENV_REAL/bin/python"
 echo "PYTHON_BIN=$PYTHON_BIN"
 "$PYTHON_BIN" --version
 
-echo "torch_preflight_start $(date)"
-set +e
-timeout "${TORCH_PREFLIGHT_TIMEOUT:-180}" "$PYTHON_BIN" - <<'PY'
+if [ "${SKIP_TORCH_PREFLIGHT:-0}" = "1" ]; then
+  echo "torch_preflight_skipped $(date)"
+else
+  echo "torch_preflight_start $(date)"
+  set +e
+  timeout "${TORCH_PREFLIGHT_TIMEOUT:-180}" "$PYTHON_BIN" - <<'PY'
 import torch
 print("torch", torch.__version__)
 print("cuda_available", torch.cuda.is_available())
 print("device", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")
 print("bf16_supported", torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False)
 PY
-code="$?"
-set -e
-if [ "$code" -ne 0 ]; then
-  echo "torch_preflight_failed_or_timed_out code=$code timeout=${TORCH_PREFLIGHT_TIMEOUT:-180} $(date)"
-  exit "$code"
+  code="$?"
+  set -e
+  if [ "$code" -ne 0 ]; then
+    echo "torch_preflight_failed_or_timed_out code=$code timeout=${TORCH_PREFLIGHT_TIMEOUT:-180} $(date)"
+    exit "$code"
+  fi
+  echo "torch_preflight_done $(date)"
 fi
-echo "torch_preflight_done $(date)"
 
 WORKER_INDEX="${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID is required}"
 NUM_WORKERS="${NUM_WORKERS:?NUM_WORKERS is required}"
