@@ -32,6 +32,7 @@ export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-$CACHE_ROOT/conda_pkgs}"
 export WANDB_DISABLED="${WANDB_DISABLED:-true}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 if [ ! -x "$VENV_DIR/bin/python" ]; then
   echo "Missing $VENV_DIR. Run: bash scripts/setup_hyak_env.sh"
@@ -74,7 +75,7 @@ MAX_EPOCHS="${MAX_EPOCHS:-8}"
 PATIENCE="${PATIENCE:-2}"
 
 echo "helpsteer2_lora_cell_start task_index=${TASK_INDEX} output_dir=${OUTPUT_DIR}"
-"$PYTHON_BIN" -m src.experiments.helpsteer2_lora_scaling \
+"$PYTHON_BIN" -u -m src.experiments.helpsteer2_lora_scaling \
   --input-csv "$INPUT_CSV" \
   --output-dir "$OUTPUT_DIR" \
   --features "$FEATURES" \

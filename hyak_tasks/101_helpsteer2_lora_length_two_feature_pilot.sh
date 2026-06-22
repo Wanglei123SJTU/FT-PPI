@@ -44,6 +44,7 @@ export TORCH_HOME="${TORCH_HOME:-$CACHE_ROOT/torch}"
 export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-$CACHE_ROOT/conda_pkgs}"
 export WANDB_DISABLED="${WANDB_DISABLED:-true}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 
 if [ -d "$VENV_DIR/conda-meta" ] && command -v conda >/dev/null 2>&1; then
   source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -62,7 +63,7 @@ if [ ! -s "$INPUT_CSV" ]; then
     --summary-json "Data/helpsteer2_preference_pairs.summary.json"
 fi
 
-OUTPUT_DIR="/gscratch/scrubbed/${USER}/ft-ppi/artifacts/helpsteer2_lora_length_two_feature_pilot"
+OUTPUT_DIR="${OUTPUT_DIR:-/gscratch/scrubbed/${USER}/ft-ppi/artifacts/helpsteer2_lora_length_two_feature_pilot}"
 mkdir -p "$OUTPUT_DIR/cells"
 FEATURES="delta_log_length_scale,delta_log_sentences_scale"
 TARGETS="delta_log_length_scale"
@@ -70,6 +71,28 @@ S_GRID="50,100,150,200,300,400,500,700"
 REPLICATIONS="3"
 METHODS="mse_stop_mse,mse_stop_ifvar,ifvar_stop_ifvar"
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen2.5-1.5B-Instruct}"
+
+echo "prewarming_huggingface_cache model_name=$MODEL_NAME hf_home=$HF_HOME"
+MODEL_NAME="$MODEL_NAME" python - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+
+model_name = os.environ["MODEL_NAME"]
+path = snapshot_download(
+    repo_id=model_name,
+    ignore_patterns=[
+        "*.msgpack",
+        "*.h5",
+        "*.ot",
+        "tf_model*",
+        "flax_model*",
+        "onnx/*",
+    ],
+)
+print(f"snapshot_downloaded path={path}", flush=True)
+PY
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
 python -m src.experiments.helpsteer2_lora_scaling \
   --input-csv "$INPUT_CSV" \
@@ -106,7 +129,7 @@ SBATCH_CMD=(
   sbatch
   $GPU_ARGS
   --array=0-"$LAST_INDEX"%"$ARRAY_CONCURRENCY"
-  --export=ALL,HYAK_VENV_DIR="$VENV_REAL",INPUT_CSV="$INPUT_CSV",OUTPUT_DIR="$OUTPUT_DIR",PLAN_CSV="$PLAN_CSV",FEATURES="$FEATURES",MODEL_NAME="$MODEL_NAME"
+  --export=ALL,HYAK_VENV_DIR="$VENV_REAL",INPUT_CSV="$INPUT_CSV",OUTPUT_DIR="$OUTPUT_DIR",PLAN_CSV="$PLAN_CSV",FEATURES="$FEATURES",MODEL_NAME="$MODEL_NAME",TRANSFORMERS_OFFLINE="$TRANSFORMERS_OFFLINE",HF_HUB_OFFLINE="$HF_HUB_OFFLINE"
   slurm/run_helpsteer2_lora_scaling.sbatch
 )
 echo "submitting: ${SBATCH_CMD[*]}"

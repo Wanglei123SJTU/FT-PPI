@@ -360,6 +360,11 @@ def train_lora_cell(
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    print(
+        "train_lora_cell_start "
+        f"target={target} method={method.method} seed={seed} train_size={len(train_idx)}",
+        flush=True,
+    )
 
     beta, hessian, if_weights = compute_ols_and_if_weights(
         frame,
@@ -367,8 +372,15 @@ def train_lora_cell(
         feature_columns=feature_columns,
         hessian_ridge=hessian_ridge,
     )
+    print(
+        "computed_if_weights "
+        f"hessian_condition={np.linalg.cond(hessian):.4f} baseline_eval_ifvar="
+        f"{baseline_metrics(frame, if_weights, evaluation_idx)['ifvar']:.6f}",
+        flush=True,
+    )
     baseline_eval = baseline_metrics(frame, if_weights, evaluation_idx)
     forward_texts, swapped_texts = build_pair_texts(frame)
+    print(f"loading_model model_name={model_name}", flush=True)
     tokenizer, model = _load_tokenizer_and_model(
         model_name=model_name,
         load_in_4bit=load_in_4bit,
@@ -381,8 +393,11 @@ def train_lora_cell(
         gradient_checkpointing=gradient_checkpointing,
     )
     device = next(model.parameters()).device
+    print(f"model_loaded device={device}", flush=True)
+    print(f"tokenizing n_texts={len(forward_texts)} max_length={max_length}", flush=True)
     encoded_forward = _tokenize_texts(tokenizer, forward_texts, max_length=max_length)
     encoded_swapped = _tokenize_texts(tokenizer, swapped_texts, max_length=max_length)
+    print("tokenized", flush=True)
 
     y = frame[Y_COL].astype(float).to_numpy(dtype=np.float32)
     y_tensor = torch.from_numpy(y).to(device)
@@ -396,6 +411,7 @@ def train_lora_cell(
     rng = np.random.default_rng(seed)
 
     for epoch in range(max_epochs):
+        print(f"epoch_start epoch={epoch + 1}/{max_epochs}", flush=True)
         model.train()
         optimizer.zero_grad(set_to_none=True)
         step_count = 0
@@ -435,6 +451,12 @@ def train_lora_cell(
         )
         val_metrics = evaluate_predictions(y[validation_idx], val_pred, if_weights[validation_idx])
         metric = val_metrics["mse"] if method.stop_metric == "mse" else val_metrics["ifvar"]
+        print(
+            "epoch_done "
+            f"epoch={epoch + 1} val_mse={val_metrics['mse']:.6f} "
+            f"val_ifvar={val_metrics['ifvar']:.6f} stop_metric={metric:.6f}",
+            flush=True,
+        )
         if metric < best_metric - 1e-7:
             best_metric = metric
             best_epoch = epoch
@@ -466,6 +488,12 @@ def train_lora_cell(
     )
     eval_metrics = evaluate_predictions(y[evaluation_idx], eval_pred, if_weights[evaluation_idx])
     val_metrics = evaluate_predictions(y[validation_idx], val_pred, if_weights[validation_idx])
+    print(
+        "train_lora_cell_done "
+        f"target={target} method={method.method} train_size={len(train_idx)} "
+        f"eval_ifvar={eval_metrics['ifvar']:.6f} eval_mse={eval_metrics['mse']:.6f}",
+        flush=True,
+    )
 
     result = {
         "target": target,
