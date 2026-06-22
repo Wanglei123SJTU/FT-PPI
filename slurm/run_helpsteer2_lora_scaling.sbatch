@@ -73,6 +73,13 @@ EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
 MAX_EPOCHS="${MAX_EPOCHS:-8}"
 PATIENCE="${PATIENCE:-2}"
+EXTRA_ARGS=()
+if [ "${NO_GRADIENT_CHECKPOINTING:-0}" = "1" ]; then
+  EXTRA_ARGS+=(--no-gradient-checkpointing)
+fi
+if [ "${NO_4BIT:-0}" = "1" ]; then
+  EXTRA_ARGS+=(--no-4bit)
+fi
 
 echo "helpsteer2_lora_cell_start task_index=${TASK_INDEX} output_dir=${OUTPUT_DIR}"
 "$PYTHON_BIN" -u -m src.experiments.helpsteer2_lora_scaling \
@@ -88,5 +95,6 @@ echo "helpsteer2_lora_cell_start task_index=${TASK_INDEX} output_dir=${OUTPUT_DI
   --eval-batch-size "$EVAL_BATCH_SIZE" \
   --gradient-accumulation-steps "$GRAD_ACCUM" \
   --max-epochs "$MAX_EPOCHS" \
-  --patience "$PATIENCE"
+  --patience "$PATIENCE" \
+  "${EXTRA_ARGS[@]}"
 echo "helpsteer2_lora_cell_done task_index=${TASK_INDEX}"

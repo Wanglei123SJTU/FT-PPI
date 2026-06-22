@@ -468,7 +468,10 @@ def train_lora_cell(
                 break
 
     if best_state is not None:
-        model.load_state_dict(best_state)
+        # bitsandbytes 4-bit modules may expose non-parameter quantization
+        # state in state_dict; PEFT can ignore those keys when restoring the
+        # best trainable checkpoint for pilot evaluation.
+        model.load_state_dict(best_state, strict=False)
     model.eval()
     eval_pred = _predict_indices(
         model,
