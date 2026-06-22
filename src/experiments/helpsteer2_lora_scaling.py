@@ -37,6 +37,7 @@ class MethodSpec:
 DEFAULT_METHODS = [
     MethodSpec("mse_stop_mse", "mse", "mse", "MSE loss, stop by MSE"),
     MethodSpec("mse_stop_ifvar", "mse", "ifvar", "MSE loss, stop by Var"),
+    MethodSpec("ifmse_stop_ifvar", "if_mse", "ifvar", "IF-weighted MSE loss, stop by Var"),
     MethodSpec("ifvar_stop_ifvar", "ifvar", "ifvar", "Var loss, stop by Var"),
 ]
 
@@ -637,6 +638,9 @@ def train_lora_cell_cached(
             residual = y_tensor[torch.as_tensor(batch_idx, dtype=torch.long, device=device)] - pred
             if method.objective == "mse":
                 loss = torch.mean(residual**2)
+            elif method.objective == "if_mse":
+                a_batch = if_tensor[torch.as_tensor(batch_idx, dtype=torch.long, device=device)]
+                loss = torch.mean((a_batch * residual) ** 2)
             elif method.objective == "ifvar":
                 a_batch = if_tensor[torch.as_tensor(batch_idx, dtype=torch.long, device=device)]
                 if_residual = a_batch * residual
@@ -1075,12 +1079,12 @@ def train_cell_command(args: argparse.Namespace) -> None:
     validation_idx = limit_indices(
         splits["validation"],
         limit=args.validation_limit,
-        seed=args.seed + 20_001 + int(cell["task_index"]),
+        seed=args.seed + 20_001,
     )
     evaluation_idx = limit_indices(
         splits["evaluation"],
         limit=args.evaluation_limit,
-        seed=args.seed + 40_001 + int(cell["task_index"]),
+        seed=args.seed + 40_001,
     )
     start = time.time()
     result = train_lora_cell(
@@ -1232,12 +1236,12 @@ def train_worker_command(args: argparse.Namespace) -> None:
         validation_idx = limit_indices(
             splits["validation"],
             limit=args.validation_limit,
-            seed=args.seed + 20_001 + task_index,
+            seed=args.seed + 20_001,
         )
         evaluation_idx = limit_indices(
             splits["evaluation"],
             limit=args.evaluation_limit,
-            seed=args.seed + 40_001 + task_index,
+            seed=args.seed + 40_001,
         )
         start = time.time()
         result = train_lora_cell_cached(
@@ -1349,9 +1353,9 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--no-4bit", action="store_true")
     train.add_argument("--trust-remote-code", action="store_true")
     train.add_argument("--max-length", type=int, default=768)
-    train.add_argument("--train-batch-size", type=int, default=4)
-    train.add_argument("--eval-batch-size", type=int, default=8)
-    train.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    train.add_argument("--train-batch-size", type=int, default=32)
+    train.add_argument("--eval-batch-size", type=int, default=128)
+    train.add_argument("--gradient-accumulation-steps", type=int, default=1)
     train.add_argument("--learning-rate", type=float, default=2e-4)
     train.add_argument("--weight-decay", type=float, default=0.01)
     train.add_argument("--max-epochs", type=int, default=8)
@@ -1376,9 +1380,9 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--no-4bit", action="store_true")
     worker.add_argument("--trust-remote-code", action="store_true")
     worker.add_argument("--max-length", type=int, default=768)
-    worker.add_argument("--train-batch-size", type=int, default=4)
-    worker.add_argument("--eval-batch-size", type=int, default=8)
-    worker.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    worker.add_argument("--train-batch-size", type=int, default=32)
+    worker.add_argument("--eval-batch-size", type=int, default=128)
+    worker.add_argument("--gradient-accumulation-steps", type=int, default=1)
     worker.add_argument("--learning-rate", type=float, default=2e-4)
     worker.add_argument("--weight-decay", type=float, default=0.01)
     worker.add_argument("--max-epochs", type=int, default=8)
