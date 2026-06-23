@@ -31,6 +31,9 @@ The stable workflow is a persistent Hyak runner. The user logs in once and compl
 
 - Codex should operate Hyak through the runner workflow, not by asking the user to type PowerShell, SSH, `sbatch`, `squeue`, or log-inspection commands manually.
 - The user is responsible only for the interactive authentication step: entering the UW password and completing Duo when the runner window asks for it.
+- Start Hyak through `scripts\start_hyak_runner.bat` unless there is a specific reason not to. The launcher first tries to establish a reusable SSH ControlMaster connection, but Windows OpenSSH may reject mux with `getsockname failed: Not a socket`. If that happens, the launcher falls back to one normal SSH login and starts the detached remote runner.
+- After the first successful login, Codex should primarily drive Hyak through the remote runner by committing/pushing new `hyak_tasks/*.sh` files. Do not create ad hoc workflows that require a fresh `ssh` or `scp` authentication for each status check, upload, or monitor loop.
+- If mux is available, Codex may use `scripts\hyak_mux_exec.ps1` for remote commands and `scripts\hyak_mux_scp.ps1` for uploads. If a mux command reports that no active master exists, do not repeatedly ask for new logins; use the already-started remote runner workflow, or restart `scripts\start_hyak_runner.bat` only when authentication is genuinely required.
 - After that first login succeeds, Codex should handle the loop end to end:
   1. edit local code/config/task files;
   2. run local checks where feasible;
@@ -54,7 +57,7 @@ A new Codex conversation should be able to use Hyak immediately from this reposi
 git status --short --branch
 ```
 
-3. Start or reconnect the persistent runner from Windows:
+3. Start or reconnect the persistent scratch runner from Windows. `scripts\start_hyak_runner.bat` is the compatibility entrypoint and delegates to the scratch runner to avoid home-directory quota problems:
 
 ```powershell
 scripts\start_hyak_runner.bat
@@ -92,7 +95,19 @@ echo "example_task_done $(date)"
 scripts\start_hyak_runner.bat
 ```
 
-- The PowerShell launcher defaults to `lei0603@klone.hyak.uw.edu`, remote repo `~/FT-PPI`, branch `main`, and writes the local stream to `artifacts/hyak/hyak_runner.log`.
+- The compatibility launcher `scripts\start_hyak_runner.bat` starts the scratch runner. The scratch runner defaults to `lei0603@klone.hyak.uw.edu`, remote repo `/gscratch/scrubbed/$USER/ft-ppi/FT-PPI-runner`, branch `main`, and writes the local stream to `artifacts/hyak/hyak_runner.log`.
+- The launcher attempts to establish an SSH ControlMaster connection by default, using an 8-hour `ControlPersist`. On Windows, mux may be unavailable; in that case the same launcher falls back to a normal SSH connection and starts the detached remote runner. If mux succeeds, Codex can inspect remote status without asking the user to authenticate again:
+
+```powershell
+scripts\hyak_mux_exec.ps1 -Command "squeue -u $USER"
+```
+
+- Uploads after the first login should also reuse the same SSH master:
+
+```powershell
+scripts\hyak_mux_scp.ps1 -LocalPath artifacts\payload.tgz -RemotePath /gscratch/scrubbed/$USER/ft-ppi/payload.tgz
+```
+
 - The current launcher starts a detached remote runner by default. After login, the remote runner continues polling even if the local tail window disconnects.
 - If interactive foreground behavior is needed, use `scripts\start_hyak_runner.ps1 -Foreground`.
 
@@ -144,6 +159,7 @@ If a task discovers that a previous job actually completed after a runner discon
 - Slurm scripts should write logs to a predictable `logs/` path and artifacts to a predictable `artifacts/<run_name>/` path.
 - If the local runner tail disconnects, do not assume the job failed. Reconnect or inspect remote `.hyak_runner/runner.out`, `.hyak_runner/logs/`, Slurm logs, `squeue`, and `sacct`.
 - Before submitting GPU jobs, first inspect currently idle GPU resources and choose the best idle type rather than waiting indefinitely for one preferred model. Use `scripts/choose_hyak_gpu.sh` when possible. The default priority is `H200 > A100 > L40S > L40 > A40 > RTX6000 > 2080Ti/P100`; use a bare `--gres=gpu:1` only as a last-resort fallback.
+- For small numbers of independent GPU jobs, do not lock every job to the first idle GPU class. Submit each job independently against the best current idle candidate, watch `squeue` briefly for `PD`/`Priority`, and cancel/fallback to the next idle candidate class when the job remains pending. Keep the same committed config, seeds, optimizer, batch policy, stopping rule, and evaluation protocol across GPU types.
 - For array-style experiments, request as many suitable idle GPUs as is practical so independent cells can run in parallel. Prefer a single homogeneous GPU type for a controlled comparison when enough devices are idle. If Slurm runs cells on different suitable GPU types, the experiment must still use the same committed config, seeds, model, optimizer, batch policy, stopping rule, and evaluation protocol across all methods; do not let GPU-specific adjustments create an unfair comparison.
 - Operational default: when work is naturally parallel, parallelize it. Use Slurm arrays or equivalent batching for independent cells/replications, set array concurrency to the highest practical value supported by available suitable GPUs, and choose the strongest idle GPU class first before falling back for throughput. For small to medium array experiments, prefer 8-way parallelism when resources allow; only reduce concurrency when queue limits, account constraints, or GPU availability make it impractical.
 

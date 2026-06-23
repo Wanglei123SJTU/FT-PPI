@@ -73,7 +73,7 @@ mkdir -p .hyak_runner/done .hyak_runner/failed .hyak_runner/running
 rm -f .hyak_runner/running/*
 for task in hyak_tasks/*.sh; do
   task_id="$(basename "$task" .sh)"
-  if [[ "$task_id" < "072_" ]]; then
+  if [[ "$task_id" < "149_" ]]; then
     {
       echo "task_id=$task_id"
       echo "status=skipped_by_scratch_launcher"
@@ -82,7 +82,7 @@ for task in hyak_tasks/*.sh; do
     } > ".hyak_runner/done/$task_id"
   fi
 done
-echo "marked older task files before 072 as skipped"
+echo "marked older task files before 149 as skipped"
 export HYAK_RUNNER_REPO_DIR="$RUN_REPO"
 bash scripts/start_hyak_runner_remote.sh __BRANCH__ __POLL_SECONDS__ 0
 '@
@@ -109,7 +109,7 @@ Write-Host ""
 $PreviousErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
-  & $SshExe -n -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target $RemoteCommand 2>&1 |
+  & $SshExe -o ServerAliveInterval=60 -o ServerAliveCountMax=10 $Target $RemoteCommand 2>&1 |
     ForEach-Object { $_.ToString() } |
     Tee-Object -FilePath $LogPath -Append
   $ExitCode = $LASTEXITCODE
